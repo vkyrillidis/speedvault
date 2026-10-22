@@ -1,0 +1,34 @@
+# Helm values for the Prometheus adapter (prometheus-community's
+# prometheus-adapter chart): the rules that make the custom metrics the
+# HPA (../../components/autoscaling/hpa.yaml) reads from the nodes'
+# /metrics. Not a Kubernetes object:
+#
+#   helm install prometheus-adapter prometheus-community/prometheus-adapter \
+#     -n monitoring -f deploy/kubernetes/overlays/autoscaling/prometheus-adapter.yaml \
+#     --set prometheus.url=http://prometheus-server.monitoring.svc
+#
+# The series need the namespace and pod labels, which the prometheus
+# chart's kubernetes-pods scrape job adds.
+rules:
+  default: false
+  custom:
+    # Its busy seconds per second: the share of its core the node works.
+    - seriesQuery: 'speedvault_busy_seconds_total{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace: {resource: namespace}
+          pod: {resource: pod}
+      name:
+        matches: "^speedvault_busy_seconds_total$"
+        as: "speedvault_busy_cores"
+      metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[1m])) by (<<.GroupBy>>)'
+    # used_memory / maxmemory (0 without a limit).
+    - seriesQuery: 'speedvault_memory_used_ratio{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace: {resource: namespace}
+          pod: {resource: pod}
+      name:
+        matches: "^speedvault_memory_used_ratio$"
+        as: "speedvault_memory_used_ratio"
+      metricsQuery: 'max(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'

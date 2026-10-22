@@ -1,0 +1,98 @@
+# stuart, the steward: one replica (two would fight over the slots; a
+# replicated stuart is phase 7), its state file on a volume. It's never in
+# the data path: if its pod is rescheduled, clients go on, and joins,
+# drains and moves wait for it.
+#
+# Headless: its name resolves to stuart's pod. When the name goes (the
+# Service deleted along with the nodes, by kubectl delete -k or with the
+# namespace), a leaving node tries the address stuart was last seen at:
+# where it answered, or where its tables came from (its pod's address,
+# which works either way; a cluster IP stops working with its Service).
+apiVersion: v1
+kind: Service
+metadata:
+  name: stuart
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: stuart
+  ports:
+    - name: stuart
+      port: 7600
+    - name: metrics
+      port: 9121
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: stuart
+spec:
+  serviceName: stuart
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: stuart
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: stuart
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9121"
+    spec:
+      # On SIGTERM stuart serves on up to 15 s, for the nodes stopping with
+      # it (a namespace deleted): they exit once it tells them to.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: stuart
+          image: speedvault
+          command: ["stuart"]
+          # --auto: slots even over the nodes, by itself; the table is made
+          # when the first node joins.
+          args: ["7600", "--state", "/var/lib/stuart/state", "--auto", "--metrics", "9121"]
+          ports:
+            - name: stuart
+              containerPort: 7600
+            - name: metrics
+              containerPort: 9121
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: metrics
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/stuart
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

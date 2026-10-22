@@ -1,0 +1,8 @@
+# Only the crates are needed to build the server.
+target
+.git
+tools
+*.md
+Dockerfile
+.dockerignore
+.gitlab-ci.yml

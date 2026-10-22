@@ -1,0 +1,167 @@
+# CI for speedvault: tests and lints on Linux, the differential test
+# against a real Redis 7.0.15, and the Docker image. macOS isn't covered
+# (GitLab's macOS runners are a paid tier): run `cargo test` on a Mac before
+# pushing changes to the reactor's kqueue code.
+
+stages:
+  - test
+  - image
+
+variables:
+  # Inside the project dir, so the cache can keep the downloaded crates.
+  CARGO_HOME: $CI_PROJECT_DIR/.cargo
+  RUST_IMAGE: rust:1.92
+
+.rust:
+  image: $RUST_IMAGE
+  cache:
+    key: cargo-$CI_JOB_NAME
+    paths:
+      - .cargo/registry
+      - target
+
+test:
+  extends: .rust
+  stage: test
+  script:
+    - cargo test --workspace --locked
+
+clippy:
+  extends: .rust
+  stage: test
+  script:
+    - rustup component add clippy
+    - cargo clippy --workspace --all-targets --locked -- -D warnings
+
+# Our node against Redis 7.0.15, byte for byte (tools/compat/README.md).
+# Fails on any difference not in tools/compat/allowlist.py.
+compat:
+  extends: .rust
+  stage: test
+  services:
+    - name: redis:7.0.15
+      alias: redis
+      command: ["redis-server", "--save", "", "--appendonly", "no"]
+  script:
+    - cargo build --release --locked -p dbnode
+    - ./target/release/dbnode 127.0.0.1:7000 --loglevel warning &
+    - |
+      python3 - <<'PY'
+      import socket, time
+      for _ in range(50):  # up to 10 s for the server to listen
+          try:
+              socket.create_connection(("127.0.0.1", 7000)).close()
+              break
+          except OSError:
+              time.sleep(0.2)
+      PY
+    - python3 tools/compat/difftest.py --ref redis:6379 --target 127.0.0.1:7000 --json compat.json
+  artifacts:
+    when: always
+    paths:
+      - compat.json
+
+# The cluster (tools/compat/README.md): the cluster crate and our node in
+# cluster mode against a real Redis Cluster, stuart with three nodes end to
+# end, our cluster beside a Redis Cluster (requests, redis-py,
+# redis-cli -c, redis-benchmark --cluster, a stuart restart under load),
+# and slots moving under load (migrate_check: no write lost or doubled
+# through redis-py and redis-cli -c during REBALANCE, DRAIN, and with
+# stuart or a node killed mid-move). Redis 7.0.15 from Debian bookworm,
+# the same version as the compat job.
+cluster-compat:
+  extends: .rust
+  stage: test
+  image: rust:1.92-bookworm
+  script:
+    - apt-get update -qq && apt-get install -y -qq redis-server redis-tools python3-pip iproute2 >/dev/null
+    - redis-server --version | grep -q 'v=7\.0\.15'
+    - pip3 install --quiet --break-system-packages redis==8.1.0 prometheus-client==0.21.1
+    - export CARGO_TARGET_DIR=$CI_PROJECT_DIR/target
+    - bash tools/compat/cluster_compat.sh
+    - bash tools/compat/stuart_cluster.sh
+    - bash tools/compat/cluster_difftest.sh
+    - bash tools/compat/migrate_check.sh --filler 100000
+
+# migrate_check with Lettuce 7.8.0 writers besides redis-py and redis-cli
+# (tools/compat/lettuce: jars from Maven Central, SHA-256 pinned, cached),
+# and the redirects each client gets after a rebalance in each Lettuce
+# refresh mode.
+cluster-clients:
+  extends: .rust
+  stage: test
+  image: rust:1.92-bookworm
+  cache:
+    key: cargo-$CI_JOB_NAME
+    paths:
+      - .cargo/registry
+      - target
+      - .lettuce
+  script:
+    - apt-get update -qq && apt-get install -y -qq redis-tools python3-pip iproute2 openjdk-17-jdk-headless >/dev/null
+    - pip3 install --quiet --break-system-packages redis==8.1.0 prometheus-client==0.21.1
+    - export CARGO_TARGET_DIR=$CI_PROJECT_DIR/target LETTUCE_DIR=$CI_PROJECT_DIR/.lettuce
+    - bash tools/compat/migrate_check.sh --lettuce --filler 100000
+
+# Builds the image (dbnode and stuart) on every pipeline and runs the
+# Compose cluster on it (tools/compat/compose_smoke.sh); pushes it to the
+# project's registry from main only, as :latest and :<short sha>.
+docker-image:
+  stage: image
+  image: docker:27
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  script:
+    - docker build -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" .
+    # The image as docker-compose.yml runs it: stuart and three nodes.
+    - apk add --no-cache bash
+    - SPEEDVAULT_IMAGE="$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" bash tools/compat/compose_smoke.sh
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+        echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+        docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY_IMAGE:latest"
+        docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+        docker push "$CI_REGISTRY_IMAGE:latest"
+      fi
+
+# The Kubernetes manifests in kind (tools/k8s/kind_check.sh): the cluster
+# forms, scales up and down, rolls, loses pods and stuart, and is deleted,
+# while a checker writes; no write lost or doubled. kind's API server
+# listens on the dind service's address ("docker"), named in its
+# certificate (KIND_API_HOST).
+kind-check:
+  stage: image
+  image: docker:27
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    KIND_API_HOST: docker
+  script:
+    - apk add --no-cache bash curl >/dev/null
+    - curl -sSfLo /usr/local/bin/kind https://github.com/kubernetes-sigs/kind/releases/download/v0.29.0/kind-linux-amd64
+    - curl -sSfLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.33.1/bin/linux/amd64/kubectl
+    - chmod +x /usr/local/bin/kind /usr/local/bin/kubectl
+    - bash tools/k8s/kind_check.sh
+
+# The HPA end to end (kind_check.sh --autoscale: Prometheus, the adapter, a
+# load generator; minutes, a few GB): by hand, from the pipeline's page.
+autoscale-check:
+  extends: kind-check
+  when: manual
+  allow_failure: true
+  script:
+    - apk add --no-cache bash curl >/dev/null
+    - curl -sSfLo /usr/local/bin/kind https://github.com/kubernetes-sigs/kind/releases/download/v0.29.0/kind-linux-amd64
+    - curl -sSfLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.33.1/bin/linux/amd64/kubectl
+    - curl -sSfLo /tmp/helm.tgz https://get.helm.sh/helm-v3.18.4-linux-amd64.tar.gz
+    - echo "f8180838c23d7c7d797b208861fecb591d9ce1690d8704ed1e4cb8e2add966c1  /tmp/helm.tgz" | sha256sum -c -
+    - tar -xzf /tmp/helm.tgz -C /tmp && mv /tmp/linux-amd64/helm /usr/local/bin/helm
+    - chmod +x /usr/local/bin/kind /usr/local/bin/kubectl /usr/local/bin/helm
+    - bash tools/k8s/kind_check.sh --autoscale --out autoscale
+  artifacts:
+    when: always
+    paths:
+      - autoscale/

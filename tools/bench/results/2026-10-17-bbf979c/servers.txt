@@ -1,0 +1,4 @@
+redis-7.0.15: Redis server v=7.0.15 sha=00000000:0 malloc=jemalloc-5.3.0 bits=64 build=d064f9f48c901a92
+speedvault: dbnode bbf979c, stuart
+redis-8.10.2: Redis server v=8.10.2 sha=498ecd0d:0 malloc=jemalloc-5.3.0 bits=64 build=f72da76e36d65b90
+valkey-9.1.2: Valkey server v=9.1.2 sha=7f1dffed:0 malloc=jemalloc-5.3.0 bits=64 build=21213dd3297ac0a2

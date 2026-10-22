@@ -1,0 +1,163 @@
+# The nodes: a StatefulSet of one-core pods. Each announces its pod's
+# address (10.244.0.7:7000), which is where stuart and clients reach it,
+# and joins stuart with its pod's name (speedvault-3). A pod that restarts
+# comes back under its name, at a new address, with a new id and no keys:
+# stuart takes it for the node it replaces and gives it slots again.
+#
+# Addresses, not names, for the clients: a client keeps a connection per
+# node address and reconnects it when it drops. Announced as a name, a
+# restarted pod's would be the old one's, and a client caching DNS (Java
+# clients such as Lettuce do, for the record's TTL: 30 s from CoreDNS by
+# default) would reconnect to the old pod's address, where nothing answers,
+# and its commands time out. Redis Cluster on Kubernetes announces pod
+# addresses too.
+#
+# A node drains on SIGTERM (a scale-down, a rolling update, an eviction,
+# `kubectl delete pod`): its slots move to the others while it serves on,
+# then it exits. With no persistence that's the only way a pod can stop
+# without losing keys, so the grace period is longer than the drain may
+# take (--drain-timeout, 600 s by default), and pods stop one at a time.
+
+# Headless: the StatefulSet's Service, a DNS name per pod (for people:
+# clients and stuart use the pods' addresses), published before the pod is
+# ready and while it drains.
+apiVersion: v1
+kind: Service
+metadata:
+  name: speedvault
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: speedvault
+  ports:
+    - name: redis
+      port: 7000
+    - name: metrics
+      port: 9121
+---
+# The clients' seed: any node that is ready (joined, not leaving). Cluster
+# clients only read the slot map from it, then go to the nodes by name.
+apiVersion: v1
+kind: Service
+metadata:
+  name: speedvault-seed
+spec:
+  selector:
+    app.kubernetes.io/name: speedvault
+  ports:
+    - name: redis
+      port: 7000
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: speedvault
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: speedvault
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: speedvault
+spec:
+  serviceName: speedvault
+  replicas: 3
+  # One pod at a time, so a scale-down drains one node after another.
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: speedvault
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: speedvault
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9121"
+    spec:
+      # Longer than --drain-timeout: the node exits by itself (status 1 if
+      # it ran out of time) before Kubernetes kills it.
+      terminationGracePeriodSeconds: 660
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: speedvault
+      containers:
+        - name: node
+          image: speedvault
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          args:
+            - "7000"
+            - --cluster
+            - --announce
+            - $(POD_IP):7000
+            - --stuart
+            - stuart.$(POD_NAMESPACE).svc:7600
+            - --name
+            - $(POD_NAME)
+            - --drain-timeout
+            - "600"
+            # Of the container's memory limit; the rest is the allocator's
+            # and the connections'. Past it, writes get -OOM, and at 90% of
+            # it stuart moves no more slots here.
+            - --maxmemory
+            - 75%
+            - --metrics
+            - "9121"
+          ports:
+            - name: redis
+              containerPort: 7000
+            - name: metrics
+              containerPort: 9121
+          # Ready once stuart took its join, until it starts leaving.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: metrics
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 10
+            failureThreshold: 3
+          # One core, all of it (the node is one thread); requests = limits.
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

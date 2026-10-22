@@ -1,0 +1,14 @@
+[package]
+name = "stuart"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The SpeedVault cluster's steward: slots, moves, autoscaling"
+publish = false
+
+[dependencies]
+cluster = { path = "../cluster" }
+dbnode = { path = "../dbnode" }
+reactor = { path = "../reactor" }
+resp = { path = "../resp" }

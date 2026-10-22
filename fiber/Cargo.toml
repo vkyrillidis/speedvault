@@ -1,0 +1,15 @@
+[package]
+name = "fiber"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Stackful coroutines with an assembly context switch (x86_64, aarch64)"
+publish = false
+
+[dependencies]
+libc = "0.2"
+
+[[bench]]
+name = "switch"
+harness = false

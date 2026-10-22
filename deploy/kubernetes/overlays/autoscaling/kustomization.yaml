@@ -1,0 +1,27 @@
+# The base with a HorizontalPodAutoscaler: more nodes when they get busy
+# or full, fewer only by hand (kubectl scale). The HPA reads two custom
+# metrics per pod that Prometheus and the Prometheus adapter make from the
+# nodes' /metrics (prometheus-adapter.yaml: the adapter's rules, as Helm
+# values for its chart):
+#
+#   speedvault_busy_cores         the share of its core the node works
+#   speedvault_memory_used_ratio  its memory against its maxmemory
+#
+# Not the container's CPU (busy-polling keeps it near a full core at any
+# load) nor its memory (the allocator keeps pages after keys go).
+#
+#   kubectl apply -k deploy/kubernetes/overlays/autoscaling
+#
+# Needs Prometheus scraping the pods (their prometheus.io/scrape and
+# prometheus.io/port annotations, with the namespace and pod labels, as
+# the prometheus chart's kubernetes-pods job does) and the adapter.
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+# The HPA (components/autoscaling/hpa.yaml).
+components:
+  - ../../components/autoscaling

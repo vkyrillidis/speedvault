@@ -1,0 +1,53 @@
+# kind_check.sh --autoscale: the kind overlay with the HPA, made quicker
+# so that a run takes minutes. The shipped HPA waits a minute of load and
+# adds at most two pods per five minutes; this one waits 15 s and adds two
+# per 30 s, up to six (all a laptop holds), with a lower CPU target (below).
+# And the nodes don't busy-poll:
+# six nodes under load would each spin a core of the laptop's (busy-polling
+# isn't counted as busy, so the HPA sees the same either way).
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../../deploy/kubernetes/overlays/kind
+
+components:
+  - ../../../deploy/kubernetes/components/autoscaling
+
+patches:
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: speedvault
+    patch: |-
+      - op: replace
+        path: /spec/maxReplicas
+        value: 6
+      # Busy CPU at 40%, not 70%: the laptop that runs the nodes also runs
+      # the load, which must stay well below what memtier_benchmark can do
+      # for its latencies to be the nodes' (see kind_check.sh).
+      - op: test
+        path: /spec/metrics/0/pods/metric/name
+        value: speedvault_busy_cores
+      - op: replace
+        path: /spec/metrics/0/pods/target/averageValue
+        value: 400m
+      - op: replace
+        path: /spec/behavior/scaleUp
+        value:
+          stabilizationWindowSeconds: 15
+          selectPolicy: Max
+          policies:
+            - type: Pods
+              value: 2
+              periodSeconds: 30
+  - target:
+      kind: StatefulSet
+      name: speedvault
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --busy-poll
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: "0"

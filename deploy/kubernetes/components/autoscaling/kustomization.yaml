@@ -1,0 +1,14 @@
+# The HorizontalPodAutoscaler, as a component to add to an overlay of the
+# base (overlays/autoscaling is the base with it):
+#
+#   components:
+#     - <path to>/deploy/kubernetes/components/autoscaling
+#
+# It reads two custom metrics per pod that Prometheus and the Prometheus
+# adapter make from the nodes' /metrics (see overlays/autoscaling).
+
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - hpa.yaml

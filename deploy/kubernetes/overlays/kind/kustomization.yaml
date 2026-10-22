@@ -1,0 +1,39 @@
+# The base on kind (Kubernetes in Docker), as tools/k8s/kind_check.sh runs
+# it: the image built here and loaded into kind (`kind load docker-image
+# speedvault:dev`), and nodes small enough for six to fit on a laptop.
+#
+#   kubectl apply -k deploy/kubernetes/overlays/kind
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+images:
+  - name: speedvault
+    newName: speedvault
+    newTag: dev
+
+patches:
+  - target:
+      kind: StatefulSet
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Never
+  # Requests below the limits: a laptop or a CI runner hasn't six spare
+  # cores. 256 MiB each, 192 MiB of it for keys.
+  - target:
+      kind: StatefulSet
+      name: speedvault
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: "1"
+            memory: 256Mi

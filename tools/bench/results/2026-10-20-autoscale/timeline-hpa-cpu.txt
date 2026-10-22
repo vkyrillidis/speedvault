@@ -1,0 +1,31 @@
+22:38:51   +0s HPA wants 5, pods 5/5 (speedvault_busy_cores=73m speedvault_memory_used_ratio=12m )
+22:39:32   +42s HPA wants 6, pods 6/6 (speedvault_busy_cores=507m speedvault_memory_used_ratio=34m )
+22:39:33   +42s 6 pods ready (the HPA asked at +42s)
+22:39:33   +43s 6 nodes hold even shares of the slots
+    from    requests/s   p99 ms (worst second)
+    +0   s      511953      1.319
+    +10  s      567011      2.447
+    +20  s      556387      1.199
+    +30  s      560238      1.031
+    +40  s      549330      2.271
+    +50  s      607324      1.687
+    +60  s      613046      1.727
+    +70  s      614642      1.719
+    +80  s      618260      1.767
+    +90  s      622373      1.975
+    +100 s      619951      1.807
+    +110 s      624275      1.727
+    +120 s      627286      1.831
+    +130 s      619886      2.127
+    +140 s      621687      1.847
+    +150 s      623688      1.735
+    +160 s      612933      1.727
+    +170 s      609300      1.903
+    +180 s      615517      1.823
+    +190 s      601640      2.039
+    +200 s      614678      1.847
+    +210 s      609144      1.863
+    +220 s      609705      1.911
+    +230 s      616951      1.903
+    +240 s          64      0.215
+    in all: 601966 requests/s, p50 0.175 ms, p99 1.575 ms, p99.9 3.983 ms

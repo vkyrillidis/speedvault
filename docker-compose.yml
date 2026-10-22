@@ -1,0 +1,65 @@
+# A speedvault cluster: stuart and three nodes, the slots split over them
+# as soon as all three have joined (--create-when 3); with --auto, stuart
+# gives slots to nodes added later (docker compose up -d --scale is not for
+# these: each node is a service with its own name) and drains a node that
+# is stopped: `docker compose stop node3` moves its slots to the others
+# first, then it exits.
+#
+#   docker compose up -d --build
+#   docker compose run --rm cli redis-cli -c -h node1 -p 7001 SET foo bar
+#   docker compose run --rm cli redis-cli -h stuart -p 7600 STUART NODES
+#   docker compose down -v          # -v also drops stuart's state
+#
+# Each node announces its service name (node1:7001...): stuart reaches it
+# there, and so does any client on this network (the `cli` service, or your
+# own containers). Clients on the host get MOVED to those names, which the
+# host can't resolve; give the nodes host networking or announce addresses
+# the host can reach for that.
+#
+# SPEEDVAULT_IMAGE picks a prebuilt image (CI); by default it's built here.
+
+x-image: &image
+  image: ${SPEEDVAULT_IMAGE:-speedvault}
+  build: .
+  restart: unless-stopped
+
+# A node leaves the cluster on SIGTERM before it exits; the grace period
+# leaves it time to (a full node's slots move in seconds). Nodes stop
+# before stuart, which they need for that; stopping them all (down) shuts
+# the cluster down at once.
+x-node: &node
+  <<: *image
+  depends_on: [stuart]
+  stop_grace_period: 5m
+
+services:
+  stuart:
+    <<: *image
+    entrypoint: ["stuart"]
+    # On SIGTERM stuart serves on up to 15 s for nodes stopping too.
+    stop_grace_period: 20s
+    command: ["7600", "--state", "/var/lib/stuart/state", "--create-when", "3", "--auto"]
+    volumes:
+      - stuart-state:/var/lib/stuart
+    ports:
+      - "7600:7600"
+
+  node1:
+    <<: *node
+    command: ["7001", "--cluster", "--announce", "node1:7001", "--stuart", "stuart:7600"]
+  node2:
+    <<: *node
+    command: ["7002", "--cluster", "--announce", "node2:7002", "--stuart", "stuart:7600"]
+  node3:
+    <<: *node
+    command: ["7003", "--cluster", "--announce", "node3:7003", "--stuart", "stuart:7600"]
+
+  # redis-cli and redis-benchmark (Redis 7.0.15), on the cluster's network.
+  cli:
+    image: redis:7.0.15
+    profiles: ["tools"]
+    entrypoint: []
+    command: ["redis-cli", "-h", "stuart", "-p", "7600", "STUART", "NODES"]
+
+volumes:
+  stuart-state:

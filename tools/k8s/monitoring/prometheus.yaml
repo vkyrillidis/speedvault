@@ -1,0 +1,25 @@
+# Helm values for prometheus-community's prometheus chart, as
+# kind_check.sh --autoscale installs it (namespace monitoring): the server
+# alone, scraping every 5 s, no volume. Its kubernetes-pods job scrapes the
+# nodes (their prometheus.io annotations) with the namespace and pod labels
+# that the adapter's rules (deploy/kubernetes/overlays/autoscaling/
+# prometheus-adapter.yaml) need.
+#
+# The scrape interval matters: the adapter's busy rule takes a rate over
+# 1 minute, which needs two scrapes in it (the chart's default is 1 minute).
+alertmanager:
+  enabled: false
+kube-state-metrics:
+  enabled: false
+prometheus-node-exporter:
+  enabled: false
+prometheus-pushgateway:
+  enabled: false
+server:
+  global:
+    scrape_interval: 5s
+    scrape_timeout: 4s
+    evaluation_interval: 5s
+  persistentVolume:
+    enabled: false
+  retention: 2h

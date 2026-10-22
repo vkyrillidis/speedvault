@@ -1,0 +1,15 @@
+[package]
+name = "dbnode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The SpeedVault node: a Redis-compatible server"
+publish = false
+
+[dependencies]
+cluster = { path = "../cluster" }
+libc = "0.2"
+reactor = { path = "../reactor" }
+resp = { path = "../resp" }
+store = { path = "../store" }

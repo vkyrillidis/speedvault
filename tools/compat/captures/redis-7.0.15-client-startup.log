@@ -1,0 +1,237 @@
+==== redis-cli -p PORT PING
+[1] connected
+[1] C> PING
+[1] S> b'+PONG\r\n'
+[1] C> closed
+[1] S> closed
+==== redis-cli -3 -p PORT PING
+[2] connected
+[2] C> HELLO 3
+[2] S> b'%7\r\n$6\r\nserver\r\n$5\r\nredis\r\n$7\r\nversion\r\n$6\r\n7.0.15\r\n$5\r\nproto\r\n:3\r\n$2\r\nid\r\n:5274\r\n$4\r\nmode\r\n$10\r\nstandalone\r\n$4\r\nrole\r\n$6\r\nmaster\r\n$...(148 bytes)
+[2] C> PING
+[2] C> closed
+[2] S> b'+PONG\r\n'
+[2] S> closed
+==== redis-cli -p PORT SET k v / GET k (one-shot)
+[3] connected
+[3] C> SET k v
+[3] S> b'+OK\r\n'
+[3] C> closed
+[3] S> closed
+==== redis-cli interactive (driven through a pty): PING, SET a b, GET a, quit
+[4] connected
+[4] C> COMMAND DOCS
+[4] C> PING
+[4] S> b"*480\r\n$5\r\nsmove\r\n*10\r\n$7\r\nsummary\r\n$37\r\nMove a member from one set to another\r\n$5\r\nsince\r\n$5\r\n1.0.0\r\n$5\r\ngroup\r\n$3\r\nset\r\n$10\r\ncomplexity\r\n$4\r...(172298 bytes)
+[4] S> b'+PONG\r\n'
+[4] C> SET a b
+[4] S> b'+OK\r\n'
+[4] C> GET a
+[4] S> b'$1\r\nb\r\n'
+[4] C> closed
+[4] S> closed
+==== redis-benchmark -p PORT -n 3 -c 1 -t ping,set,get,incr,mset
+[5] connected
+[5] C> CONFIG GET save
+[5] S> b'*2\r\n$4\r\nsave\r\n$0\r\n\r\n'
+[5] C> CONFIG GET appendonly
+[5] C> closed
+[5] S> b'*2\r\n$10\r\nappendonly\r\n$2\r\nno\r\n'
+[6] connected
+[5] S> closed
+[6] C> <inline> PING
+[6] S> b'+PONG\r\n'
+[6] C> <inline> PING
+[6] S> b'+PONG\r\n'
+[6] C> <inline> PING
+[6] C> closed
+[6] S> b'+PONG\r\n'
+[6] S> closed
+[7] connected
+[7] C> PING
+[7] S> b'+PONG\r\n'
+[7] C> PING
+[7] S> b'+PONG\r\n'
+[7] C> PING
+[7] C> closed
+[7] S> b'+PONG\r\n'
+[8] connected
+[7] S> closed
+[8] C> SET key:__rand_int__ VXK
+[8] S> b'+OK\r\n'
+[8] C> SET key:__rand_int__ VXK
+[8] S> b'+OK\r\n'
+[8] C> SET key:__rand_int__ VXK
+[8] C> closed
+[8] S> b'+OK\r\n'
+[9] connected
+[8] S> closed
+[9] C> GET key:__rand_int__
+[9] S> b'$3\r\nVXK\r\n'
+[9] C> GET key:__rand_int__
+[9] S> b'$3\r\nVXK\r\n'
+[9] C> GET key:__rand_int__
+[9] C> closed
+[9] S> b'$3\r\nVXK\r\n'
+[10] connected
+[9] S> closed
+[10] C> INCR counter:__rand_int__
+[10] S> b':1\r\n'
+[10] C> INCR counter:__rand_int__
+[10] S> b':2\r\n'
+[10] C> INCR counter:__rand_int__
+[10] C> closed
+[10] S> b':3\r\n'
+[11] connected
+[10] S> closed
+[11] C> MSET key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK
+[11] S> b'+OK\r\n'
+[11] C> MSET key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK
+[11] S> b'+OK\r\n'
+[11] C> MSET key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK key:__rand_int__ VXK
+[11] S> b'+OK\r\n'
+[11] C> closed
+[11] S> closed
+==== redis-benchmark -p PORT -n 32 -c 1 -P 16 -t get (pipelined)
+[12] connected
+[12] C> CONFIG GET save
+[12] S> b'*2\r\n$4\r\nsave\r\n$0\r\n\r\n'
+[13] connected
+[12] C> CONFIG GET appendonly
+[12] C> closed
+[12] S> b'*2\r\n$10\r\nappendonly\r\n$2\r\nno\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[12] S> closed
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] S> b'$3\r\nVXK\r\n'
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] S> b'$3\r\nVXK\r\n'
+[13] C> GET key:__rand_int__
+[13] C> GET key:__rand_int__
+[13] C> closed
+[13] S> closed
+==== redis-py 8.1.0: Redis(); ping; set; get; pipeline
+[14] connected
+[14] C> HELLO 3
+[14] S> b'%7\r\n$6\r\nserver\r\n$5\r\nredis\r\n$7\r\nversion\r\n$6\r\n7.0.15\r\n$5\r\nproto\r\n:3\r\n$2\r\nid\r\n:5286\r\n$4\r\nmode\r\n$10\r\nstandalone\r\n$4\r\nrole\r\n$6\r\nmaster\r\n$...(148 bytes)
+[14] C> CLIENT MAINT_NOTIFICATIONS ON moving-endpoint-type internal-fqdn
+[14] S> b"-ERR unknown subcommand 'MAINT_NOTIFICATIONS'. Try CLIENT HELP.\r\n"
+[14] C> CLIENT SETINFO LIB-NAME redis-py
+[14] S> b"-ERR unknown subcommand 'SETINFO'. Try CLIENT HELP.\r\n"
+[14] C> CLIENT SETINFO LIB-VER 8.1.0
+[14] S> b"-ERR unknown subcommand 'SETINFO'. Try CLIENT HELP.\r\n"
+[14] C> PING
+[14] S> b'+PONG\r\n'
+[14] C> SET k v
+[14] S> b'+OK\r\n'
+[14] C> GET k
+[14] S> b'$1\r\nv\r\n'
+[14] C> SET a 1
+[14] S> b'+OK\r\n'
+[14] C> INCRBY a 1
+[14] S> b':2\r\n'
+[14] S> b'$1\r\n2\r\n'
+[14] C> GET a
+[14] C> closed
+[14] S> closed
+==== redis-py: Redis(protocol=3, client_name='x', db=0)
+[15] connected
+[15] C> HELLO 3
+[15] S> b'%7\r\n$6\r\nserver\r\n$5\r\nredis\r\n$7\r\nversion\r\n$6\r\n7.0.15\r\n$5\r\nproto\r\n:3\r\n$2\r\nid\r\n:5287\r\n$4\r\nmode\r\n$10\r\nstandalone\r\n$4\r\nrole\r\n$6\r\nmaster\r\n$...(148 bytes)
+[15] C> CLIENT MAINT_NOTIFICATIONS ON moving-endpoint-type internal-fqdn
+[15] S> b"-ERR unknown subcommand 'MAINT_NOTIFICATIONS'. Try CLIENT HELP.\r\n"
+[15] C> CLIENT SETNAME x
+[15] S> b'+OK\r\n'
+[15] C> CLIENT SETINFO LIB-NAME redis-py
+[15] S> b"-ERR unknown subcommand 'SETINFO'. Try CLIENT HELP.\r\n"
+[15] C> CLIENT SETINFO LIB-VER 8.1.0
+[15] S> b"-ERR unknown subcommand 'SETINFO'. Try CLIENT HELP.\r\n"
+[15] C> PING
+[15] S> b'+PONG\r\n'
+[15] C> GET k
+[15] S> b'$1\r\nv\r\n'
+[15] C> closed
+[15] S> closed
+==== redis-py: Redis(protocol=2)
+[16] connected
+[16] C> CLIENT SETINFO LIB-NAME redis-py
+[16] S> b"-ERR unknown subcommand 'SETINFO'. Try CLIENT HELP.\r\n"
+[16] C> CLIENT SETINFO LIB-VER 8.1.0
+[16] S> b"-ERR unknown subcommand 'SETINFO'. Try CLIENT HELP.\r\n"
+[16] C> PING
+[16] C> closed
+[16] S> b'+PONG\r\n'
+[16] S> closed
+==== redis-py: Redis(db=1)
+[17] connected
+[17] C> HELLO 3
+[17] S> b'%7\r\n$6\r\nserver\r\n$5\r\nredis\r\n$7\r\nversion\r\n$6\r\n7.0.15\r\n$5\r\nproto\r\n:3\r\n$2\r\nid\r\n:5289\r\n$4\r\nmode\r\n$10\r\nstandalone\r\n$4\r\nrole\r\n$6\r\nmaster\r\n$...(148 bytes)
+[17] C> CLIENT MAINT_NOTIFICATIONS ON moving-endpoint-type internal-fqdn
+[17] S> b"-ERR unknown subcommand 'MAINT_NOTIFICATIONS'. Try CLIENT HELP.\r\n"
+[17] C> CLIENT SETINFO LIB-NAME redis-py
+[17] S> b"-ERR unknown subcommand 'SETINFO'. Try CLIENT HELP.\r\n"
+[17] C> CLIENT SETINFO LIB-VER 8.1.0
+[17] S> b"-ERR unknown subcommand 'SETINFO'. Try CLIENT HELP.\r\n"
+[17] C> SELECT 1
+[17] S> b'+OK\r\n'
+[17] C> PING
+[17] C> closed
+[17] S> b'+PONG\r\n'
+[17] S> closed

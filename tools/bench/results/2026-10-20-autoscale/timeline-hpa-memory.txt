@@ -1,0 +1,8 @@
+22:37:09   +4s filled
+22:37:10   +4s HPA wants 3, pods 3/3 (speedvault_busy_cores=12m speedvault_memory_used_ratio=2m )
+22:37:17   +12s HPA wants 5, pods 4/3 (speedvault_busy_cores=28m speedvault_memory_used_ratio=955m )
+22:37:18   +13s HPA wants 5, pods 5/4 (speedvault_busy_cores=28m speedvault_memory_used_ratio=955m )
+22:37:21   +15s HPA wants 5, pods 5/5 (speedvault_busy_cores=28m speedvault_memory_used_ratio=955m )
+22:37:21   +15s 5 pods ready (the HPA asked at +12s)
+22:37:21   +16s 5 nodes hold even shares of the slots
+22:38:27   the HPA added no pod in 60 s (speedvault_busy_cores=83m speedvault_memory_used_ratio=575m )

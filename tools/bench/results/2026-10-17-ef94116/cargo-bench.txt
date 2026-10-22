@@ -1,0 +1,92 @@
+    Finished `bench` profile [optimized] target(s) in 0.14s
+     Running unittests src/lib.rs (target/release/deps/fiber-685135094921d5dd)
+
+running 26 tests
+test arch::x86_64::tests::callee_saved_registers_survive ... ignored
+test arch::x86_64::tests::entry_stack_is_aligned ... ignored
+test arch::x86_64::tests::ping_pong ... ignored
+test fiber::tests::dropping_ready_fiber_drops_closure_without_running_it ... ignored
+test fiber::tests::dropping_suspended_fiber_unwinds_its_stack ... ignored
+test fiber::tests::dropping_suspended_fiber_while_thread_panics ... ignored
+test fiber::tests::in_fiber_is_true_only_inside_a_fiber ... ignored
+test fiber::tests::into_stack_reuses_stack ... ignored
+test fiber::tests::locals_survive_suspension ... ignored
+test fiber::tests::many_fibers_round_robin ... ignored
+test fiber::tests::nested_fibers ... ignored
+test fiber::tests::panic_is_returned_from_resume ... ignored
+test fiber::tests::resume_after_finish_panics - should panic ... ignored
+test fiber::tests::runs_to_completion ... ignored
+test fiber::tests::suspend_and_resume_interleave ... ignored
+test fiber::tests::suspend_outside_fiber_panics - should panic ... ignored
+test fiber::tests::swallowed_cancellation_cannot_suspend_again ... ignored
+test pool::tests::get_on_empty_pool_allocates ... ignored
+test pool::tests::new_pool_is_empty ... ignored
+test pool::tests::put_beyond_max_free_drops_the_stack ... ignored
+test pool::tests::put_of_a_different_size_drops_the_stack ... ignored
+test pool::tests::put_then_get_reuses_the_same_stack ... ignored
+test pool::tests::size_that_is_not_a_page_multiple_is_still_reused ... ignored
+test pool::tests::stack_survives_a_round_trip_through_a_fiber ... ignored
+test stack::tests::rounds_up_to_pages_and_is_aligned ... ignored
+test stack::tests::usable_region_is_writable ... ignored
+
+test result: ok. 0 passed; 0 failed; 26 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running benches/switch.rs (target/release/deps/switch-0262ebc27e291fc4)
+10000000 round trips each, best of 5
+
+arch::switch (raw)                       6.81 ns/switch
+Fiber::resume + suspend                 14.20 ns/switch
+
+Fiber::new + run, reused stack             44 ns/fiber
+Fiber::new + run, StackPool                54 ns/fiber
+Fiber::new + run, new mmap'd stack       1502 ns/fiber
+    Finished `bench` profile [optimized] target(s) in 0.15s
+     Running unittests src/lib.rs (target/release/deps/reactor-d4a7e02f3265b1a3)
+
+running 29 tests
+test epoll::tests::timeout_rounds_up_to_whole_milliseconds ... ignored
+test poller_tests::adding_a_bad_fd_fails ... ignored
+test poller_tests::closed_writer_wakes_the_reader ... ignored
+test poller_tests::deleted_fd_reports_nothing ... ignored
+test poller_tests::empty_pipe_is_not_readable ... ignored
+test poller_tests::is_edge_triggered ... ignored
+test poller_tests::wait_honours_the_timeout ... ignored
+test poller_tests::write_end_is_writable_right_away ... ignored
+test poller_tests::written_pipe_is_readable_with_its_token ... ignored
+test reactor::tests::event_without_waiter_is_remembered ... ignored
+test reactor::tests::finished_fibers_give_their_stacks_back ... ignored
+test reactor::tests::stale_event_is_ignored ... ignored
+test slab::tests::double_remove_is_harmless ... ignored
+test slab::tests::drain_empties_and_invalidates ... ignored
+test slab::tests::insert_get_remove ... ignored
+test slab::tests::reused_slot_rejects_the_old_token ... ignored
+test slab::tests::unknown_index_is_none ... ignored
+test tcp::tests::sockaddr_v4_layout ... ignored
+test tcp::tests::sockaddr_v6_layout ... ignored
+test timer::tests::a_reused_slot_does_not_revive_a_cancelled_entry ... ignored
+test timer::tests::cancelled_timers_never_fire ... ignored
+test timer::tests::fire_in_deadline_order_then_insertion_order ... ignored
+test timer::tests::heap_is_compacted_when_mostly_cancelled ... ignored
+test token::tests::a_new_generation_is_a_different_token ... ignored
+test token::tests::extreme_values_survive ... ignored
+test token::tests::fields_do_not_bleed_into_each_other ... ignored
+test token::tests::layout_is_generation_high_index_low ... ignored
+test token::tests::raw_value_round_trips ... ignored
+test token::tests::round_trips_index_and_generation ... ignored
+
+test result: ok. 0 passed; 0 failed; 29 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running benches/pingpong.rs (target/release/deps/pingpong-523d77041ac95ef5)
+200000 round trips, best of 5
+
+ping-pong over a socket pair      1146 ns/round trip
+                                872807 round trips/s
+  with a deadline per read        1440 ns/round trip
+                                694409 round trips/s
+ping-pong over TCP loopback       2511 ns/round trip
+                                398251 round trips/s
+     Running benches/timers.rs (target/release/deps/timers-e91420f7d00eb06c)
+best of 5
+
+sleep(0) in a loop                148 ns/sleep
+10000 fibers sleeping at once     185 ns/timer (armed, ordered, fired, fiber resumed)

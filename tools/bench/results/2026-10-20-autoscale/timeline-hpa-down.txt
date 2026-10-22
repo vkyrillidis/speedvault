@@ -1,0 +1,2 @@
+22:44:16   scaled down in 40 s
+22:45:06   the HPA added no pod in 45 s (speedvault_busy_cores=127m speedvault_memory_used_ratio=20m )

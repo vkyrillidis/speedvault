@@ -1,0 +1,14 @@
+[package]
+name = "resp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Incremental RESP2/RESP3 request parser and reply encoder"
+publish = false
+
+[dependencies]
+
+[[bench]]
+name = "parse"
+harness = false

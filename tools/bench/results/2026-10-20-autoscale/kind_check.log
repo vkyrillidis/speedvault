@@ -1,0 +1,119 @@
+22:36:25 reusing kind cluster speedvault-check
+22:36:25 building the images
+Image: "speedvault:dev" with ID "sha256:16476d8c29641b4dc565f89d84f27fc3d562e56275481b8ec21d637c56961be5" not yet present on node "speedvault-check-control-plane", loading...
+Image: "speedvault-checker:dev" with ID "sha256:1c3d17813262adda85193612d06e9764fcaf8cb82d31661ddca38f753c08065f" not yet present on node "speedvault-check-control-plane", loading...
+22:36:42 installing Prometheus (29.37.0) and the adapter (5.3.0)
+22:36:46 == hpa-memory
+    34200 keys of 16 KiB: 10.244.0.179 0.970, 10.244.0.182 0.949, 10.244.0.183 0.950
+22:37:09   +4s filled
+22:37:10   +4s HPA wants 3, pods 3/3 (speedvault_busy_cores=12m speedvault_memory_used_ratio=2m )
+22:37:17   +12s HPA wants 5, pods 4/3 (speedvault_busy_cores=28m speedvault_memory_used_ratio=955m )
+22:37:18   +13s HPA wants 5, pods 5/4 (speedvault_busy_cores=28m speedvault_memory_used_ratio=955m )
+22:37:21   +15s HPA wants 5, pods 5/5 (speedvault_busy_cores=28m speedvault_memory_used_ratio=955m )
+22:37:21   +15s 5 pods ready (the HPA asked at +12s)
+22:37:21   +16s 5 nodes hold even shares of the slots
+22:38:27   the HPA added no pod in 60 s (speedvault_busy_cores=83m speedvault_memory_used_ratio=575m )
+    writing
+    5 nodes even 0.1 s after stop: 10.244.0.179, 10.244.0.182, 10.244.0.183, 10.244.0.185, 10.244.0.186
+      redis-py: 77343 INCRs, 0 failed
+      redis-py: 77151 INCRs, 0 failed, 2 failed on -ASK to a node it didn't know (the redis-py bug)
+      redis-cli: 98765 INCRs, 0 failed, 85826 redirects followed
+      redis-py (hot keys): 77386 INCRs, 0 failed, 5 failed on -ASK to a node it didn't know (the redis-py bug)
+      lettuce-default: 502372 INCRs, 0 failed
+      checked: 56240 keys on 5 nodes, 0 twice; 2032 counters, 833010 INCRs acknowledged, 7 in doubt
+    OK
+22:38:32 ok   hpa-memory (106 s)
+22:38:32 == hpa-cpu
+22:38:50   load: memtier_benchmark, 64 clients at 2000 requests a second to each node, for 240 s
+22:38:51   +0s HPA wants 5, pods 5/5 (speedvault_busy_cores=73m speedvault_memory_used_ratio=12m )
+22:39:32   +42s HPA wants 6, pods 6/6 (speedvault_busy_cores=507m speedvault_memory_used_ratio=34m )
+22:39:33   +42s 6 pods ready (the HPA asked at +42s)
+22:39:33   +43s 6 nodes hold even shares of the slots
+    y[RUN #1 96%, 230 secs]  8 threads  8 conns:   138884046 ops,  618984 (avg:  601389) ops/sec, 43.03MB/sec (avg: 41.75MB/sec),  0.24 (avg: 30.61) msec latency[RUN #1 97%, 231 secs]  8 threads  8 conns:   139509829 ops,  625672 (avg:  601494) ops/sec, 43.49MB/sec (avg: 41.76MB/sec),  0.24 (avg: 30.47) msec latency[RUN #1 97%, 232 secs]  8 threads  8 conns:   140129068 ops,  619149 (avg:  601570) ops/sec, 43.04MB/sec (avg: 41.76MB/sec),  0.24 (avg: 30.34) msec latency[RUN #1 97%, 233 secs]  8 threads  8 conns:   140732576 ops,  603102 (avg:  601576) ops/sec, 41.92MB/sec (avg: 41.76MB/sec),  0.25 (avg: 30.21) msec latency[RUN #1 98%, 234 secs]  8 threads  8 conns:   141344882 ops,  612227 (avg:  601622) ops/sec, 42.56MB/sec (avg: 41.76MB/sec),  0.25 (avg: 30.08) msec latency[RUN #1 98%, 235 secs]  8 threads  8 conns:   141964438 ops,  619446 (avg:  601697) ops/sec, 43.06MB/sec (avg: 41.77MB/sec),  0.25 (avg: 29.95) msec latency[RUN #1 99%, 236 secs]  8 threads  8 conns:   142577548 ops,  613051 (avg:  601745) ops/sec, 42.61MB/sec (avg: 41.77MB/sec),  0.25 (avg: 29.82) msec latency[RUN #1 99%, 237 secs]  8 threads  8 conns:   143197119 ops,  619402 (avg:  601819) ops/sec, 43.06MB/sec (avg: 41.78MB/sec),  0.24 (avg: 29.69) msec latency[RUN #1 100%, 238 secs]  8 threads  8 conns:   143815026 ops,  617818 (avg:  601886) ops/sec, 42.95MB/sec (avg: 41.78MB/sec),  0.24 (avg: 29.56) msec latency[RUN #1 100%, 239 secs]  8 threads  8 conns:   144433776 ops,  618680 (avg:  601956) ops/sec, 43.01MB/sec (avg: 41.79MB/sec),  0.24 (avg: 29.44) msec latency[RUN #1 100%, 240 secs]  0 threads  8 conns:   144472218 ops,  618680 (avg:  601965) ops/sec, 43.01MB/sec (avg: 41.79MB/sec),  0.24 (avg: 29.43) msec latency
+    
+    
+    CPU Utilization Summary
+      Total CPU time:   1492.827s  (user 453.194s, sys 1039.633s)
+      Wall time:        240.120s
+      Cores used:       6.217   (avg 77.7% across 8 worker threads)
+      Peak utilization: 7943.5%
+    Saving JSON output file: /tmp/load.json
+    Json file closed.
+    Sets       120393.35          ---          ---         1.36         2.18         3.98927         0.17500         1.58300         3.98300      9040.03 
+    Gets       481572.89    479895.86      1663.28         5.27         8.48         4.41562         0.17500         1.57500         3.98300     33752.94 
+    Totals     601966.24    479895.86      1663.28         6.63        10.66         4.33035         0.17500         1.57500         3.98300     42792.97 
+    from    requests/s   p99 ms (worst second)
+    +0   s      511953      1.319
+    +10  s      567011      2.447
+    +20  s      556387      1.199
+    +30  s      560238      1.031
+    +40  s      549330      2.271
+    +50  s      607324      1.687
+    +60  s      613046      1.727
+    +70  s      614642      1.719
+    +80  s      618260      1.767
+    +90  s      622373      1.975
+    +100 s      619951      1.807
+    +110 s      624275      1.727
+    +120 s      627286      1.831
+    +130 s      619886      2.127
+    +140 s      621687      1.847
+    +150 s      623688      1.735
+    +160 s      612933      1.727
+    +170 s      609300      1.903
+    +180 s      615517      1.823
+    +190 s      601640      2.039
+    +200 s      614678      1.847
+    +210 s      609144      1.863
+    +220 s      609705      1.911
+    +230 s      616951      1.903
+    +240 s          64      0.215
+    in all: 601966 requests/s, p50 0.175 ms, p99 1.575 ms, p99.9 3.983 ms
+    writing
+    6 nodes even 0.1 s after stop: 10.244.0.179, 10.244.0.182, 10.244.0.183, 10.244.0.185, 10.244.0.186, 10.244.0.189
+      redis-py: 267383 INCRs, 0 failed, 2 failed on -ASK to a node it didn't know (the redis-py bug)
+      redis-py: 267000 INCRs, 0 failed, 1 failed on -ASK to a node it didn't know (the redis-py bug)
+      redis-cli: 239644 INCRs, 0 failed, 218970 redirects followed
+      redis-py (hot keys): 296919 INCRs, 0 failed, 6 failed on -ASK to a node it didn't know (the redis-py bug)
+      lettuce-default: 633023 INCRs, 0 failed
+      checked: 122041 keys on 6 nodes, 0 twice; 2032 counters, 1703960 INCRs acknowledged, 9 in doubt
+    OK
+22:43:00 ok   hpa-cpu (268 s)
+22:43:00 == hpa-down
+22:44:16   scaled down in 40 s
+22:45:06   the HPA added no pod in 45 s (speedvault_busy_cores=127m speedvault_memory_used_ratio=20m )
+    writing
+    3 nodes even 0.1 s after stop: 10.244.0.179, 10.244.0.182, 10.244.0.183
+      redis-py: 86675 INCRs, 0 failed
+      redis-py: 86692 INCRs, 0 failed
+      redis-cli: 105197 INCRs, 0 failed, 83676 redirects followed
+      redis-py (hot keys): 86747 INCRs, 0 failed
+      lettuce-default: 555528 INCRs, 0 failed
+      checked: 22040 keys on 3 nodes, 0 twice; 2032 counters, 920839 INCRs acknowledged, 0 in doubt
+    OK
+22:45:10 ok   hpa-down (130 s)
+22:45:11 == rollout
+22:45:57 rolled out in 47 s
+    writing
+    3 nodes even 0.4 s after stop: 10.244.0.192, 10.244.0.193, 10.244.0.194
+      redis-py: 46843 INCRs, 0 failed
+      redis-py: 46688 INCRs, 0 failed, 1 failed on -ASK to a node it didn't know (the redis-py bug)
+      redis-cli: 63343 INCRs, 0 failed, 41908 redirects followed
+      redis-py (hot keys): 38076 INCRs, 0 failed, 1 failed on -ASK to a node it didn't know (the redis-py bug)
+      lettuce-default: 261259 INCRs, 0 failed
+      checked: 22040 keys on 3 nodes, 0 twice; 2032 counters, 456207 INCRs acknowledged, 2 in doubt
+    OK
+22:46:02 ok   rollout (52 s)
+22:46:02 == delete
+    writing
+    3 nodes even 0.1 s after stop: 10.244.0.192, 10.244.0.194, 10.244.0.196
+      redis-py: 12951 INCRs, 0 failed, 1 failed on -ASK to a node it didn't know (the redis-py bug)
+      redis-py: 22407 INCRs, 0 failed
+      redis-cli: 28072 INCRs, 0 failed, 21070 redirects followed
+      redis-py (hot keys): 22642 INCRs, 0 failed
+      lettuce-default: 101547 INCRs, 0 failed
+      checked: 22040 keys on 3 nodes, 0 twice; 2032 counters, 187618 INCRs acknowledged, 1 in doubt
+    OK
+22:46:28 ok   delete (26 s)
+22:46:28 OK
+22:46:28 kind cluster speedvault-check kept: kubectl --context kind-speedvault-check -n speedvault-check get pods
