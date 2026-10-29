@@ -87,17 +87,19 @@ value 8 bytes each):
 | set, 10000 × 100 (not integers) | 65 | 13 (was 68) | 13 | 13 |
 | set, 10000 × 100 (integers) | 2.9 | 6.1 | 2.7 | 2.6 |
 | list, 10000 × 100 | 12 | 13 (was 47) | 11 | 11 |
-| hash, 1 × 1M | 72 | 99 | 38 | 51 |
-| set, 1 × 1M | 56 | 58 | 30 | 43 |
+| hash, 1 × 1M | 72 | 41 (was 99) | 38 | 51 |
+| set, 1 × 1M | 56 | 41 (was 58) | 30 | 43 |
 | list, 1 × 1M | 10 | 10 (was 41) | 10 | 10 |
 
 Small collections and lists are packed as Redis packs them (see the phase
 7 plan, compact encodings; `tools/bench/results/2026-10-22-compact/`), and
 are now at Redis's size or near it; small sets of strings at Redis 8's.
-What's left is large hashes and sets: a table entry and a heap allocation
-per element, 1.3× Redis 7.0.15 and 2.6× Redis 8 for a hash. A hash of ~1M
-fields also stalls ~3 ms when its table doubles (Redis rehashes
-incrementally).
+Large hashes and sets keep an 8-byte pointer per element to one heap
+block holding its hash, key and value (step 4): below Redis 7.0.15 and
+Valkey 9, 1.1–1.4× Redis 8. A hash of ~1M fields stalls ~12 ms when its
+table doubles (median of 7 at 2^20 fields; 6 ms before step 4, when the
+hashes sat in the table's `Vec`): Redis rehashes incrementally, which
+would remove it (open).
 
 How we got there. The first run was 0.84–0.94× Redis without
 pipelining. Per request our user time was equal or lower (MSET: half of
@@ -287,3 +289,103 @@ three pods in 47 s, a deleted pod back in 25 s, Lettuce without a failure
 in each. Before the nodes announced their pods' addresses (they announced
 names), Lettuce lost 4–7 commands to timeouts in each rolling update: see
 "Run on Kubernetes".
+
+**With replicas** (phase 8 milestone 10, 2026-10-26/27; `ack_bench.sh`,
+`sync_bench.sh`, `failover_bench.sh`, `memory_bench.sh`, each with
+`--also redis-8.10.2=... --also valkey-9.1.2=...`; results in
+`tools/bench/results/2026-10-27-d114045/` (throughput, sync),
+`-4103e02/` (failover) and `-ea5d41b/` (memory); the method in
+`tools/bench/README.md`). Ours runs in cluster mode under stuart
+(`--replicas 1`); theirs with their defaults but diskless sync without
+its delay, standalone and in cluster mode (one primary owning every slot,
+the replica by `CLUSTER REPLICATE`), which costs them 10–20% with `-P 16`.
+Each figure is the median of 5 runs on a quiet host (a busy one, on the
+first try, took up to a quarter off ours with `-P 16`).
+
+Throughput with a replica (redis-benchmark `-c 50 -r 1000000`, 16 B
+values), requests/s, and ours against theirs in cluster mode with a
+replica:
+
+| | SET `-P 1` | GET | INCR | HSET | SET `-P 16` | GET | INCR | HSET |
+|---|---|---|---|---|---|---|---|---|
+| ours with a replica | 281k | 390k | 275k | 263k | 1.64M | 2.20M | 1.64M | 1.43M |
+| ours ÷ Redis 7.0.15 cluster | 1.17× | 1.09× | 1.13× | 1.02× | 1.76× | 1.70× | 1.63× | 1.28× |
+| ours ÷ Redis 8.10.2 cluster | 1.14× | 1.06× | 1.10× | 1.04× | 1.25× | 1.14× | 1.11× | 1.18× |
+| ours ÷ Valkey 9.1.2 cluster | 1.22× | 1.09× | 1.11× | 1.10× | 1.47× | 1.24× | 1.25× | 1.40× |
+
+A replica costs every server about the same share of its writes (ours
+0.65–0.80× of alone, theirs 0.62–0.83×; reads 0.94–1.04×). Against their
+standalone servers with a replica we are 1.01–1.21× unpipelined and
+0.95–1.53× with `-P 16`: Redis 8 and Valkey 9 standalone are a little
+ahead on GET and INCR with `-P 16` (0.95–1.04×), which cluster mode, ours
+too, pays for.
+
+A replica's sync (1M and 10M keys of 16 B, with and without
+redis-benchmark SETting meanwhile; the primary's and the replica's Pss
+every 50 ms):
+
+| 10M keys | ours | Redis 7.0.15 | Redis 8.10.2 | Valkey 9.1.2 |
+|---|---|---|---|---|
+| sync, idle | 8.3 s | 8.0 s | 6.6 s | 6.3 s |
+| sync, under SETs | 9.6 s | 11.3 s | 9.2 s | 7.1 s |
+| primary's peak ÷ before, under SETs | 1.02× | 1.82× | 1.93× | 1.84× |
+| primary before | 2.0 GB | 1.36 GB | 0.84 GB | 0.66 GB |
+
+We never fork, so a sync costs the primary nothing; theirs copy pages
+on write and almost double. Ours copies more bytes (the string memory
+below), hence the longer idle sync. A 1 s cut of the replica's link
+(through a proxy, 1M keys): with no writes every server carries on from
+its backlog, ours at once (0.00 s after the link is back), theirs after
+0.41–0.80 s (their reconnect waits for a once-a-second timer); with SETs
+going on, ~23 MB pile up, past the 1 MiB backlog everyone keeps by
+default, and every server syncs again in full (ours 1.76 s, Redis 7 1.47,
+Redis 8 1.21, Valkey 2.02).
+
+Failover (three primaries with a replica each, a redis-py writer INCRing
+one primary's keys; median of 3):
+
+| | ours | Redis 7.0.15 | Redis 8.10.2 | Valkey 9.1.2 |
+|---|---|---|---|---|
+| SIGKILL, timeout 2 s: serving again | 5.9 s | 3.7 s | 3.7 s | 3.7 s |
+| SIGKILL, timeout 5 s | 8.9 s | 8.5 s | 8.0 s | 8.9 s |
+| leaving (ours SIGTERM, theirs `CLUSTER FAILOVER`): promoted | 0.03 s | 0.05 s | 0.06 s | 0.07 s |
+| leaving: the client's longest wait | 9 ms | 48 ms | 56 ms | 67 ms |
+
+No acknowledged write was lost by any server in any run. Ours adds the
+3 s lease to the detection (a cut-off primary must have stopped writing
+before its replica takes over; theirs write on until gossip tells them),
+which shows with a short timeout; a pod leaving on purpose, as in every
+rolling update, hands over 5–7× more gently.
+
+Memory (`used_memory` once the replica is synced; a replica holds what
+its primary does, for every server):
+
+| | ours | Redis 7.0.15 | Redis 8.10.2 | Valkey 9.1.2 |
+|---|---|---|---|---|
+| 1M strings, bytes a key | 64 (was 207) | 122 (cluster 138) | 71 (78) | 76 (76) |
+| 5M elements of hashes, sets, lists, bytes an element | 27 | 47 (48) | 26 (26) | 24 (25) |
+
+Collections are at the newer servers' size. Small strings took 2.6–2.9×
+theirs until the keyspace became a table of one-block keys per slot
+(2026-10-29, `tools/bench/results/2026-10-29-*/memory.md`): now less than
+any of them.
+
+Stalls while the keyspace grows (`tools/bench/stall_bench.sh`: 10M new
+keys from one connection, 100 `SET`s a batch, each batch's round trip
+timed; `old` is the build before the per-slot tables):
+
+| server | keys/s | batch p50 | p99.9 | max | batches > 10 ms |
+|---|---:|---:|---:|---:|---:|
+| ours | 638,890 | 0.09 ms | 0.51 ms | 1.4 ms | 0 |
+| ours, old | 537,352 | 0.10 ms | 0.53 ms | 1416 ms | 10 |
+| Redis 7.0.15 | 486,333 | 0.12 ms | 0.75 ms | 29.5 ms | 2 |
+| Redis 8.10.2 | 528,018 | 0.13 ms | 1.17 ms | 4.3 ms | 0 |
+| Valkey 9.1.2 | 531,759 | 0.12 ms | 0.63 ms | 36.4 ms | 3 |
+
+The one `HashMap` of every key stopped the node each time it doubled,
+for 327 ms at 1.8M keys, 701 ms at 3.7M and 1.4 s at 7.3M. A table per
+slot doubles 1/16384 of the keys at a time, so no incremental rehash is
+needed (Redis rehashes incrementally; Redis 8 also keeps a dict per slot).
+Pipelined `SET` with random keys went from 0.8–1.3× Redis 7.0.15 to
+1.45–1.5×, as the doublings no longer pause it; the other commands kept
+their speed.

@@ -13,7 +13,7 @@ what each step found; they explain why things are the way they are.
 | 5 | Live migration of slots between nodes | [slot-migration.md](slot-migration.md) |
 | 6 | Kubernetes autoscaling (the HPA) | [autoscaling.md](autoscaling.md) |
 | 7 | Hashes, sets, lists, `SCAN`; compact encodings | [data-types.md](data-types.md) |
-| 8 | Replicas and failover | planned |
+| 8 | Replicas and failover | [replicas.md](replicas.md) |
 
 Multi-core nodes were considered and dropped: on Kubernetes, more one-core
 pods scale out instead.

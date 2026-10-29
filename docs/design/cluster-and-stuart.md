@@ -76,7 +76,8 @@ new id and no slots; stuart reports its slots as lost. Replicas and
 failover are phase 8.
 
 Node commands in cluster mode: `CLUSTER MYID SLOTS SHARDS NODES INFO KEYSLOT
-COUNTKEYSINSLOT`, `READONLY` / `READWRITE` (accepted, no replicas yet),
+COUNTKEYSINSLOT`, `READONLY` / `READWRITE` (accepted; replicas hold no
+data yet, phase 8),
 `INFO cluster` (`cluster_enabled:1`), and `CLUSTER SETTABLE epoch ...`, the
 command stuart pushes the table with (ours; Redis has none).
 

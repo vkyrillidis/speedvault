@@ -119,7 +119,7 @@ let table = SlotTable::new(epoch, nodes, &[
     (SlotRange::new(8192, 16383), None), // unassigned, explicitly
 ])?;
 let owner = table.owner(key_hash_slot(key));  // Option<&Node>
-reply::slots(&table, &mut out);                // CLUSTER SLOTS, RESP2 or RESP3
+reply::slots(&table, &[], &mut out);           // CLUSTER SLOTS, RESP2 or RESP3; offsets 0
 ```
 
 - `slot.rs`: `key_hash_slot` is Redis's `keyHashSlot`: CRC16-XMODEM mod
@@ -135,16 +135,22 @@ reply::slots(&table, &mut out);                // CLUSTER SLOTS, RESP2 or RESP3
   replies are built from, so adjacent ranges merge as in Redis. A table
   may also hold slots migrating (`with_migrations`: from the owner to
   another node, each slot once), which `NODES` shows on the node's own
-  line.
+  line, replicas (`with_replicas`, phase 8: of a node that is no
+  replica, owning no slots, none migrating to them, in the order given),
+  and nodes marked failed (`with_failed`, phase 8: stuart found them down).
 - `reply.rs`: `CLUSTER SLOTS`, `SHARDS` and `NODES` as Redis 7.0.15 sends
-  them, RESP2 and RESP3. What a table doesn't know is fixed: every node a
-  connected, online master, replication offset 0, ping and pong times 0,
-  config epoch = the table's epoch, cluster bus port = the client port.
+  them, RESP2 and RESP3. The nodes' replication offsets are passed in: a
+  replica at 0 is left out of `SLOTS` and `loading` in `SHARDS`, as in
+  Redis. A node marked failed is shown as Redis shows one in `FAIL`:
+  `fail` in its `NODES` flags and its link `disconnected`, `health fail`
+  in `SHARDS`, and a failed replica left out of `SLOTS`. What a table
+  doesn't know is fixed: every other node connected, ping and pong times
+  0, config epoch = the table's epoch, cluster bus port = the client port.
 
 `tools/compat/cluster_compat.sh` checks the crate against a real 3-node
 Redis Cluster: `CLUSTER KEYSLOT` on 20,000 random keys (binary, many with
 braces), and the three replies byte for byte in both protocols for several
-layouts (only the `NODES` fields above are masked).
+layouts, two with replicas (only the `NODES` fields above are masked).
 
 # `dbnode`
 
@@ -170,7 +176,10 @@ KEYS] [--migrate-pause USEC]]` listens on
   doesn't wait. A node that joined stuart (`--stuart`) leaves the cluster
   on the first SIGTERM instead (phase 6): a thread sends `STUART LEAVE id`
   once a second while the node serves on, stuart moves its slots to the
-  others and removes it, and once stuart answers `0` the node serves on
+  others (a primary with a replica that can take over hands them to it
+  instead, phase 8: its writes wait a few milliseconds, and no key moves;
+  a replica has none and just goes; see `STUART LEAVE`) and removes it,
+  and once stuart answers `0` the node serves on
   for `--leave-linger` (default 10 s), redirecting every command to the
   slots' new owners, then exits (status 0); it logs the slots left every
   5 s, and `INFO cluster` says `cluster_leaving:1`. The linger is for
@@ -193,8 +202,8 @@ KEYS] [--migrate-pause USEC]]` listens on
   address; before, the nodes then drained until `--drain-timeout`.
 - `--maxmemory` (phase 6): past this much memory, the commands Redis
   flags `denyoom` (`SET`, `SETNX`, `MSET`, `APPEND`, `INCR`, `DECR`,
-  `INCRBY`, `DECRBY`; since phase 7 also `HSET`, `HMSET`, `HSETNX`,
-  `HINCRBY`, `SADD`, the `STORE` set commands, `LPUSH`, `RPUSH`, `LPUSHX`,
+  `INCRBY`, `DECRBY`, `INCRBYFLOAT`; since phase 7 also `HSET`, `HMSET`,
+  `HSETNX`, `HINCRBY`, `HINCRBYFLOAT`, `SADD`, the `STORE` set commands, `LPUSH`, `RPUSH`, `LPUSHX`,
   `RPUSHX`, `LSET`, `LINSERT`, `LMOVE`, `RPOPLPUSH`) get Redis's `-OOM command not allowed when used
   memory > 'maxmemory'.`, after the arity and cluster checks and without
   counting as processed; reads, `DEL`, `GETDEL`, `EXPIRE`, `FLUSHALL` still
@@ -209,12 +218,14 @@ KEYS] [--migrate-pause USEC]]` listens on
   memory` has Redis's main fields (`used_memory`, `used_memory_rss`,
   `used_memory_peak` sampled every 100 ms, `used_memory_startup`,
   `used_memory_dataset`, `maxmemory`, `maxmemory_policy`,
-  `mem_fragmentation_ratio`, each size also `_human`; and ours, `mem_map_growth`: what the next new key would allocate at once if the map must double). A write is also
-  refused, below the limit, when the key it may add would make the map
-  double past it (the whole new table is allocated at once: 114 MB at 1M
-  keys); Redis likewise refuses to expand a dict past `maxmemory`. In
-  cluster mode a node refuses keys moving in (`CLUSTER IMPORT`) that would
-  take it past its limit, and stuart moves nothing to a node at 90%.
+  `mem_fragmentation_ratio`, each size also `_human`; and ours, `mem_map_growth`: the most the next new key may allocate at once, a table of keys growing). A write is also
+  refused, below the limit, when the key it may add could make a table
+  grow past it (a few kB: the keys sit in 16384 tables; the expiry index,
+  one `Vec`, doubles by 8 bytes a key with a TTL); Redis likewise refuses
+  to expand a dict past `maxmemory`. In
+  cluster mode a node copying slots moving in waits, reading nothing more,
+  while the copy would take it past its limit, and stuart moves nothing to
+  a node at 90%.
 - `--metrics PORT | HOST:PORT` (phase 6): serves HTTP there, for
   Prometheus and Kubernetes' probes (off by default; the manifests use
   9121, redis_exporter's port). `GET /metrics` is Prometheus's text format:
@@ -230,32 +241,35 @@ KEYS] [--migrate-pause USEC]]` listens on
   `speedvault_info{version,mode,node_id}`, and in cluster mode
   `speedvault_cluster_slots`, `speedvault_cluster_slots_migrating{direction="out|in"}`,
   `speedvault_cluster_epoch`, `speedvault_cluster_leaving`,
-  `speedvault_migrate_{keys_sent,batches_sent,bytes_sent,keys_imported,imports_refused}_total`
+  `speedvault_migrate_{keys_sent,keys_imported,imports_refused}_total`
   and `speedvault_redirects_total{kind="moved|ask|tryagain"}`. `GET
   /healthz` answers `200` while the reactor runs (liveness); `GET /ready`
   `200` when the node should get traffic (readiness): standalone always,
   in cluster mode once stuart took its join (without `--stuart`: once it
-  has a table), never while leaving (`503` and the reason).
+  has a table), and a replica only while synced with its primary, never
+  while leaving (`503` and the reason).
 - `--cluster` is cluster mode, Redis Cluster's protocol (see "Cluster
   mode" below). `--announce` is the address clients reach the node at, as
   Redis's `cluster-announce-ip` and `-port` (default: where it listens;
   required when it listens on all interfaces, since `0.0.0.0` reaches
   nobody). `--stuart HOST:PORT` joins stuart: a thread of its own sends
-  `STUART JOIN id host port [NAME name]` every second until stuart
+  `STUART JOIN id host port [NAME name] [ZONE zone]` every second until stuart
   answers `+OK` (resolving the name again each time, so a Kubernetes
   Service that doesn't resolve yet is fine); stuart then pushes the table.
   `--name` is a name that stays when the node restarts at another address
   (on Kubernetes, the pod's name, while it announces its pod's address):
   stuart takes a node joining with another's name for its replacement, as
-  one at its address. Without `--cluster` the node is standalone, as
+  one at its address. `--zone` is the machine the node runs on (on
+  Kubernetes its node's name): stuart puts a replica on another zone than
+  its primary where it can (phase 8). Without `--cluster` the node is standalone, as
   before.
 - `--migrate-batch` (default 100) and `--migrate-pause` (default 50 µs):
-  how a slot migrating away is sent, see [cluster mode](#cluster-mode). The pause follows
-  a batch only if clients were served since the one before: on a busy
-  node it halves what a move takes from the clients, an idle one moves at
-  full speed (see [performance](performance.md)). `--migrate-chunk` (default 4096): the
-  elements a batch holds at most; a larger hash, set or list moves in
-  parts of that many.
+  how the copy of slots moving away is sent, see [cluster mode](#cluster-mode): batches
+  of that many keys, the pause after each only if clients were served
+  since the one before, so that a busy source keeps most of its
+  throughput while an idle one copies at full speed (see [performance](performance.md)).
+  `--migrate-chunk` (default 4096): the elements a batch holds at most; a
+  larger hash, set or list goes in parts of that many.
 
 ```sh
 cargo run --release -p dbnode
@@ -298,13 +312,27 @@ redis-cli -p 7000 SET k v
   are fixed: zero memory counters in `CLIENT LIST`, no flags, ACL categories
   or docs in `COMMAND`.
 - `cluster_mode.rs`: cluster mode: the slot table, the slot check, and
-  `CLUSTER`, `READONLY`, `READWRITE`, `ASKING`.
+  `CLUSTER`, `READONLY`, `READWRITE`, `ASKING`. `admin.rs` has `ROLE` and
+  `INFO replication` (phase 8), which say what the table makes the node.
+- `repl.rs` (phase 8): the replication stream, every write's effect as
+  RESP commands (the store's `Effect`s, keys reclaimed as expired as
+  `DEL`, else a write that didn't fail as sent), with its id, offset and
+  backlog (a 1 MiB ring). Nothing is recorded until it starts (the first
+  replica). `repl/primary.rs`: `REPLSYNC`, the copy in batches and the
+  fiber sending a replica its feed, with a `REPLPING seq` (outside the
+  stream) every second and after each batch of a copy; a copy queues its
+  next batch only while what it queued unacknowledged is within what the
+  link drains in 250 ms. `repl/replica.rs`: the replica's fiber, following
+  its primary, the stream applied, and `REPLACK offset|- seq` (the offset
+  applied, `-` during a copy, and the last ping) at once for a ping, at
+  most every millisecond for the stream, and every second. The lease
+  runs 3 s from the sending of the newest ping a replica in it answered.
 - `migrate.rs`: the fiber that sends the keys of slots migrating away.
 - `client.rs`: the registry of connections behind `CLIENT LIST`.
 - `log.rs`: the logger; `main.rs`: arguments and signals.
 - `lib.rs`: the accept loop, a panic handler that logs and keeps serving,
-  and active expiry every 100 ms, which also gives the map's room back
-  after many deletions (`store` docs) and samples the memory peak.
+  and active expiry every 100 ms, which also gives the expiry index's room
+  back after many deletions (`store` docs) and samples the memory peak.
 
 `dbnode/tests/server.rs` runs a server per test over real TCP and checks
 the exact reply bytes; `dbnode/tests/cluster.rs` does the same in cluster
@@ -319,13 +347,26 @@ does. stuart (phase 4 milestone 3) gives it the whole layout:
 
 ```
 CLUSTER SETTABLE <epoch> NODES <n> <id> <host> <port> ... RANGES <m> <start> <end> <id | -> ...
-                 [MIGRATING <k> <slot> <from> <to> ...]
+                 [MIGRATING <k> <slot> <from> <to> ...] [REPLICAS <r> <id> <primary> ...]
+                 [FAILED <f> <id> ...]
 ```
 
 The ranges must name every slot once (`-`: unassigned), and the nodes
-must include this one. A migration (phase 5) moves a slot from its owner
-to another node, as Redis's `CLUSTER SETSLOT slot MIGRATING` on the one
-and `IMPORTING` on the other do. A table is taken only if its epoch is newer than
+must include this one. `SYNCING slot from to` moves a slot by snapshot
+(below). `MIGRATING slot from to` is the state Redis's `CLUSTER SETSLOT
+slot MIGRATING` on the one and `IMPORTING` on the other leave, with
+Redis's replies (below); nothing moves such a slot's keys (phase 5 did;
+stuart makes no such table since phase 8). A replica (phase 8) names its primary;
+`FAILED` lists the nodes stuart found down for 5 s: a primary takes
+writes without a replica marked failed (the lease ignores it), and clients
+aren't sent to it. `CLUSTER FENCE seconds` (ours, stuart's failover) makes
+a replica acknowledge nothing for that long (0 lifts it; a table making
+it a primary ends it), so its primary's lease runs out; it replies
+`[offset, 1 if its copy is complete]`. `CLUSTER PAUSEWRITES ms` (ours,
+stuart's handover) makes a primary's writes wait for `ms` (at most 10 s; 0
+ends it, and a new pause replaces the one before), or until a table leaves
+it no slots, when they are redirected; reads go on, and the reply is its
+replication offset. A table is taken only if its epoch is newer than
 the current one; the same table again with the same epoch is `+OK` (stuart
 may push twice), a different one with the same epoch or an older one is an
 error, and so is a malformed one, which changes nothing.
@@ -340,7 +381,7 @@ command table's key positions) are checked as Redis 7.0.15 checks them with
    one slot).
 3. Another node owns the slot: `-MOVED <slot> <host>:<port>`.
 
-While a slot migrates, the source (still its owner) serves a request whose
+While a slot is `MIGRATING`, the source (still its owner) serves a request whose
 keys it all has, sends one with none of them to the target (`-ASK <slot>
 <host>:<port>`), and refuses one with some (`-TRYAGAIN Multiple keys
 request during rehashing of slot`). The target serves the slot only to a
@@ -351,49 +392,39 @@ counts as missing, and isn't reclaimed by the check. `CLUSTER NODES` shows
 `[slot->-<to>]` and `[slot-<-<from>]` on the node's own line. Redis 7.0.15
 in the same state answers the same (`cluster_difftest.py migrating`).
 
-A fiber sends the keys of a slot migrating away to the target, one slot
-after the other: `CLUSTER IMPORT slot n key ttl value ...` (ours; `ttl` in
-ms left, 0 for none, -1 to delete), at most `--migrate-batch` keys and
-1 MiB of values a batch, after the target's `CLUSTER MYID` was checked,
-then `--migrate-pause` if commands with keys were served meanwhile.
-Keys are deleted here once the target acknowledges them; meanwhile
-commands touching them wait. After a failed connection the batch's keys
-are dirty until sent again (see the phase 5 plan, step 3). A target that
-can't be reached or refuses is left alone for a second, while the
-slots migrating to other nodes go on (a connection per target). `CLUSTER
-PENDING slot` (ours) counts what the node still answers for in a slot;
-stuart ends a move at 0. `INFO cluster` adds `migrate_keys_sent`,
-`migrate_batches_sent`, `migrate_bytes_sent`, `migrate_keys_imported` and
-`migrate_imports_refused` (batches refused past `maxmemory`: the source
-keeps the keys and serves them, and tries again a second later; deletes
-alone always pass), and the redirects the node has sent clients, `cluster_redirects_moved`,
-`cluster_redirects_ask` and `cluster_redirects_tryagain` (Redis has no
-such counters; `migrate_check.py redirects` reads them).
-
-A batch also stops at `--migrate-chunk` elements (a string counts one). A
-hash, set or list with more goes alone, in parts of that many elements
-(and at most 1 MiB), with `CLUSTER IMPORTPART slot key type total offset
-payload ttl` (ours), one a round trip, pausing between them as between
-batches. The key is in flight from the first part to the acknowledgement
-of the last: commands touching it wait. The target builds it outside its
-store, so no command sees it before the last part puts it in whole; offset
-0 starts it again, a part that doesn't follow the one before is refused,
-and a delete of the key or a table that no longer imports its slot drops
-what was staged. The source then frees it a part's worth at a time. The
-first part is refused (`-OOM`) if the whole collection, estimated from
-it, wouldn't fit under `maxmemory`; a part refused later gives up the move
-of the key: it's no longer in flight (writable at the source at once) but
-dirty, and it is sent again from the start later. `INFO cluster` adds
-`migrate_parts_sent`, `migrate_parts_aborted` and
-`migrate_parts_imported`.
+A slot moving by snapshot (`SYNCING`, phase 8) is served by its owner
+alone until the cutover: the target copies it (`SLOTSYNC`, ours: the
+slots' keys in batches of `--migrate-batch` keys and at most 1 MiB, a
+larger collection in parts of `--migrate-chunk` elements, the source
+pausing `--migrate-pause` after each batch if commands with keys were
+served meanwhile; then the writes to them) and serves none of it
+(`-MOVED` to the owner). stuart then pauses the slots' writes at the
+owner (`CLUSTER PAUSESLOTS`, ours: they wait, reads go on) and gives the
+target the slots once it has every write; there they wait until the
+owner's last frame. `CLUSTER SLOTSYNCS` (ours) lists a node's copies. The
+owner deletes the slots' keys in the background afterwards. `INFO
+cluster` adds `migrate_keys_sent` and `migrate_keys_imported` (the keys
+the slots held at their cutovers), `migrate_imports_refused` (times a copy
+waited for room under `maxmemory`), and the redirects the node has sent
+clients, `cluster_redirects_moved`, `cluster_redirects_ask` and
+`cluster_redirects_tryagain` (Redis has no such counters;
+`migrate_check.py redirects` reads them).
 
 A refused command doesn't count in `total_commands_processed`. Commands
 without keys (`PING`, `DBSIZE`, `FLUSHDB`, `INFO`...) act on the node they
 are sent to. `SELECT` takes only 0. `CLUSTER MYID SLOTS SHARDS NODES INFO
 KEYSLOT COUNTKEYSINSLOT GETKEYSINSLOT` answer from the table and the
-store, which in cluster mode lists its keys by slot (`COUNTKEYSINSLOT` is
-O(1); a list per slot, see the `store` docs); `READONLY` and `READWRITE`
-are accepted, `ASKING` as above. `HELLO` and `INFO` say `cluster` mode; `INFO
+store, which in cluster mode keeps its keys by slot (`COUNTKEYSINSLOT` is
+O(1); a table per slot, see the `store` docs); `READONLY` and `READWRITE`
+are accepted, `ASKING` as above.
+
+A table may make the node a replica (phase 8): it owns no slots, so it
+redirects every key to its primary with `-MOVED`, writes and reads, also
+after `READONLY` until replicas copy their primaries (milestone 3). `ROLE`
+is `slave host port connect -1` and `INFO replication` has
+`master_link_status:down`, as for a Redis replica that never reached its
+primary; a primary's is `master 0 []`, no replica attached, no backlog,
+and `master_replid` is random at each start. `HELLO` says `role replica`. `HELLO` and `INFO` say `cluster` mode; `INFO
 cluster` has `cluster_enabled:1`. Without `--cluster`, these commands
 answer `-ERR This instance has cluster support disabled`, as Redis does.
 
@@ -404,8 +435,8 @@ stuart can reach.
 # `stuart`
 
 The steward: `stuart [PORT | HOST:PORT] --state FILE [--auto] [--create-when N]
-[--moves-per-source N] [--max-moves N] [--loglevel LEVEL] [--metrics PORT |
-HOST:PORT]` listens on
+[--replicas N] [--fail-after SECONDS] [--moves-per-source N] [--max-moves N]
+[--loglevel LEVEL] [--metrics PORT | HOST:PORT]` listens on
 `127.0.0.1:7600` by default. It holds the layout of a cluster of dbnodes,
 moves slots between them, and is never in the data path.
 
@@ -417,8 +448,8 @@ redis-cli -p 7600 STUART CREATE     # 0-5460, 5461-10922, 10923-16383, in join o
 redis-cli -c -p 7600 SET foo bar    # MOVED to the owner of slot 12182, then OK
 ```
 
-- `STUART JOIN id host port [NAME name]` (from the nodes): stuart
-  remembers the node (and its name, in the state file) and starts a keeper
+- `STUART JOIN id host port [NAME name] [ZONE zone]` (from the nodes): stuart
+  remembers the node (and its name and zone, in the state file) and starts a keeper
   for it. A known node at a new address moves; a new id at an address
   another node announced, or with the name another node joined with,
   replaces that node (it restarted, without its keys; on Kubernetes a pod
@@ -426,7 +457,26 @@ redis-cli -c -p 7600 SET foo bar    # MOVED to the owner of slot 12182, then OK
   become unassigned: lost, as
   `STUART NODES` reports (`STUART ASSIGN` gives them out again). After
   `CREATE` a joining node is added to the table without slots (`STUART
-  REBALANCE` gives it some).
+  REBALANCE` gives it some), or with `--replicas N` as a replica of a
+  primary that has fewer than N.
+- `--replicas N` (phase 8, default 0): `CREATE` makes the first
+  `ceil(k / (1 + N))` of the k joined nodes primaries and splits the slots
+  over them; each other node becomes the replica of a primary with fewer
+  than N, one on another zone first (`ZONE`), then the one with the
+  fewest, then the first joined. Only primaries get slots (`MOVE` and
+  `ASSIGN` refuse a replica). A replica whose primary is removed goes to
+  another primary that lacks one, or becomes a primary. Raising N later
+  demotes primaries with `--auto` (see there); lowering it changes
+  nobody's role, only what nodes joining become.
+- `--fail-after SECONDS` (phase 8, default 5): a replica stuart can't reach
+  this long is marked failed (its primary writes without it) until it
+  answers; a primary is failed over to its replica. stuart fences the
+  replicas (`CLUSTER FENCE`), waits the primary's 3 s lease, and promotes
+  the most advanced one with a complete copy; the old primary is a
+  failed master without slots until it answers, then its successor's
+  replica. A pod that joins under a primary's name or address is a new
+  process: its replica is promoted at once, and the pod joins as that
+  one's replica. A primary answering during the wait isn't failed over.
 - `STUART CREATE` splits the 16384 slots over the joined nodes in join
   order, as `redis-cli --cluster create` does (contiguous ranges, the same
   rounding), epoch 1. Once only: after that slots change hands with
@@ -441,22 +491,20 @@ redis-cli -c -p 7600 SET foo bar    # MOVED to the owner of slot 12182, then OK
 - `STUART MOVE start end id` (phase 5): moves the range's slots to node
   `id` with their keys, while clients use them; replies how many slots
   were queued (those `id` owns don't move). Every slot must be owned and
-  not moving yet. stuart moves a slot in two tables: one where it
-  migrates (the source sends its keys over, see the dbnode's "Cluster
-  mode"), then, once the source has nothing pending, one where the target
-  owns it. A table that starts or ends moves goes to their targets before
-  the other nodes, so clients aren't sent back and forth. At most
-  `--moves-per-source` slots (default 32) move out of one node at once,
-  and `--max-moves` (default 128) in all; a node is a source or a target at
-  a time. The defaults come from `tools/bench/migrate_bench.py` (see
-  Performance): beyond 32 per source a move gets little faster. No move
-  starts to or from a node that is down. While a target is down its moves
-  under way can't end, but they stop counting against the limits, and a
-  table that must reach it first reaches the other nodes once it has been
-  down 2 s (the order only spares clients a bounce, and its slots can't be
-  served meanwhile anyway); the sources go on with their slots to other
-  targets (`migrate_check.sh drain-target-kill`: the drain goes on while
-  a target is down 5 s).
+  not moving yet. stuart moves a slot by snapshot (phase 8; phase 5 moved
+  it key by key), in two tables: one where the target copies it while the
+  source serves it, then, once stuart has paused its writes at the source
+  (`CLUSTER PAUSESLOTS`) and the target has them all, one where the target
+  owns it (see "Phase 8 plan"). The first goes to the source before the
+  other nodes, the second to the target, so clients aren't sent back and
+  forth. At most `--moves-per-source` slots (default 128) move out of one
+  node at once, and `--max-moves` (default 512) in all; a node is a source
+  or a target at a time. The slots moving from one node to another share
+  one copy and one cutover, and each table costs stuart an `fsync`: a
+  drain of 4096 slots takes 0.5 s at 128 per source against 1.7 s at 32
+  (`tools/bench/results/2026-10-25-0b36234`). No move starts to or from a
+  node that is down, and a move whose source or target goes down is
+  called off and queued again (the source still has the slots).
 - `STUART REBALANCE`: plans the moves again (the queue is replaced) so
   that, once the moves under way and the queued ones end, the slots are
   even over the joined nodes that aren't leaving, moving as few as it can:
@@ -486,6 +534,18 @@ redis-cli -c -p 7600 SET foo bar    # MOVED to the owner of slot 12182, then OK
   M ...`, logged): a node stopping then exits at once, its keys lost,
   rather than drain until Kubernetes kills it. Nodes without a limit, or
   whose memory stuart hasn't read, have room for anything.
+  A primary with a replica that can take over (phase 8: up, not marked
+  failed nor leaving) isn't drained, and its keys need no room: stuart
+  pauses its writes (`CLUSTER PAUSEWRITES`, 10 s at most), waits up to
+  1 s for its most advanced replica with a complete copy to reach the
+  offset the primary answered (`CLUSTER FENCE 0`), and gives that replica
+  the slots in a table that reaches it first; the old primary redirects
+  the writes that waited, and is removed once it took that table. A
+  replica that missed is paused for again 100 ms later; after 5 misses,
+  with no replica left that can take over, or with one still copying from
+  scratch after 60 s, the slots are drained instead. No move starts from
+  or to a primary handing over. A replica leaving just goes (its keys are
+  copies).
 - `STUART FORGET id`: the node is gone for good (its pod was removed
   without leaving, its machine died). It is removed as a replaced node is:
   its slots become unassigned (lost), but a slot migrating from it goes to
@@ -501,25 +561,37 @@ redis-cli -c -p 7600 SET foo bar    # MOVED to the owner of slot 12182, then OK
   moves as `REBALANCE` does. Nobody types a `STUART` command: nodes join
   and get slots, nodes leaving are drained and removed. Without `--auto`
   nothing moves unless asked, as before (`LEAVE` still drains and
-  removes). With it, `MOVE` works but the next plan may undo it.
-- `STUART MIGRATIONS`: a line per slot moving, `slot from -> to pending=N
-  for=Ns`, and `queued: N`; empty when nothing moves.
+  removes). With it, `MOVE` works but the next plan may undo it. With
+  `--replicas N` (phase 8) it plans the roles first: with no node leaving
+  and no primary failed, a primary beyond the `ceil(k / (1 + N))` that
+  the k nodes need (so another lacks a replica), if the others have room
+  for its keys, is demoted: the one with the fewest replicas, then the
+  fewest slots, then the last joined, one at a time. It gets no slots and
+  no new replica (`MOVE` to it is refused), its slots move away by
+  snapshot, and once it took a table in which it holds nothing (at once
+  if it's down) it becomes the replica of a primary lacking one, its own
+  replicas going to other primaries first. A join calls the demotion off;
+  a failover or a `LEAVE` of it ends it.
+- `STUART MIGRATIONS`: a line per slot moving, `slot from -> to for=Ns`,
+  and `queued: N`; empty when nothing moves.
 - Full nodes (phase 6): a node using 90% of its `maxmemory` or more is
-  full, counting as used what its next new key would allocate at once
-  when the map must double (`INFO memory`'s `mem_map_growth`): past the
+  full, counting as used what its next new key may allocate at once
+  (`INFO memory`'s `mem_map_growth`): past the
   limit with it the node refuses new keys, however far below it is. The plans (`REBALANCE`, `DRAIN`, `LEAVE`, `--auto`) give it
   nothing (it may still give), its share going to the other nodes, and a
   queued move to it doesn't start; while queued moves wait for full nodes
   stuart plans again every second. A move under way to a node that fills
-  up waits: the node refuses the keys past its limit (`CLUSTER IMPORT`
-  `-OOM`), and moves only go forward, so the slot stays migrating, served
-  by both through `-ASK`, until the node has room (keys deleted or
-  expired, a higher limit). No slot moves to a node before stuart has read
+  up waits: its copy stops reading past the limit, and moves only go
+  forward, so the slot stays with its source, which serves it, until the
+  node has room (keys deleted or expired, a higher limit). No slot moves to a node before stuart has read
   its memory. stuart logs when a node becomes full and when it has room
   again; the remaining 10% is room for writes while moves under way end.
 - `STUART NODES`: a line per node, `id host:port up|down since=Ns acked=E
-  slots=N [name=NAME] [used=B max=B] [full] [leaving] [error="..."]` (`acked`: the
-  newest table epoch the node took; `used` and `max` its memory),
+  slots=N [replica-of=ID] [name=NAME] [zone=ZONE] [used=B max=B] [full] [leaving] [demoting] [failed] [error="..."]` (`acked`: the
+  newest table epoch the node took; `used` and `max` its memory; `failed`:
+  the table marks it so, a replica stuart couldn't reach for 5 s, until
+  it answers again; `demoting`: a primary being made a replica, see
+  `--auto`),
   and `unassigned slots: N` when some are. `STUART TABLE`: `epoch N` and
   the table as `CLUSTER NODES` prints it, or nil before `CREATE`.
 - `CLUSTER SLOTS SHARDS NODES INFO KEYSLOT` answer from the table (before
@@ -530,10 +602,10 @@ redis-cli -c -p 7600 SET foo bar    # MOVED to the owner of slot 12182, then OK
   answered as clients expect on connect; `CLUSTER MYID` is an error
   (stuart is no node).
 - `--metrics PORT | HOST:PORT` (phase 6): `/metrics`, `/healthz` and
-  `/ready` over HTTP, as the node serves them: `stuart_nodes{state="up|down|leaving|full"}`,
+  `/ready` over HTTP, as the node serves them: `stuart_nodes{state="up|down|leaving|demoting|full|failed"}`,
   `stuart_table_epoch`, `stuart_slots_moving`, `stuart_slots_queued`,
-  `stuart_slots_unassigned`, `stuart_slots_moved_total`,
-  `stuart_info{version,auto}`, `stuart_uptime_seconds`, and per node
+  `stuart_slots_unassigned`, `stuart_slots_moved_total`, `stuart_failovers_total`,
+  `stuart_handovers_total`, `stuart_demotions_total`, `stuart_info{version,auto}`, `stuart_uptime_seconds`, and per node
   (labels `node` and `addr`) `stuart_node_up`, `stuart_node_slots`,
   `stuart_node_leaving`, `stuart_node_memory_used_bytes` and
   `_max_bytes` (as its keeper last read them: a scrape asks the nodes
@@ -568,8 +640,10 @@ A keeper fiber per node connects to it (2 s timeout, `connect_timeout`),
 checks that `CLUSTER MYID` is the node that joined (a restarted node at
 the same address is another node), pushes the table with `CLUSTER
 SETTABLE` until the node took it (and again after every reconnect: the
-same table is `+OK`), and reads its `INFO memory` on connect and every
-second, which also says it's up. A node that refuses a
+same table is `+OK`), and reads its `INFO memory replication` on connect
+and every second, which also says it's up; then it gives the node every
+node's replication offset as last read (`CLUSTER SETOFFSETS`, when they
+changed), for `CLUSTER SLOTS` and `SHARDS`. A node that refuses a
 table is logged and reported, and gets it again with the next table or
 reconnect. Host names are looked up on a thread of their own (as the
 nodes do: `dbnode::resolve`), so that a name that is slow to fail (a
