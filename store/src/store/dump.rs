@@ -330,6 +330,7 @@ impl Staged {
                 let items = decode(payload).expect("checked");
                 self.count += items.len();
                 for item in items {
+                    l.grow([item]);
                     l.push_back(item);
                 }
             }

@@ -46,8 +46,11 @@ pub(crate) const NEVER: i64 = i64::MAX;
 /// moving a large value in (a `RESTORE`, a replica's copy) costs no copy,
 /// and an overwrite of another length doesn't copy the key along.
 pub(crate) const EMBED_MAX: usize = 4096;
-/// Redis's `OBJECT ENCODING` of a string: `embstr` up to this length.
-const EMBSTR_MAX: usize = 44;
+/// Redis 8's `OBJECT ENCODING` of a string: `embstr` while the key and the
+/// value together take at most this many bytes. Redis 8 embeds a short
+/// value with its key in one 64-byte cache line: a 16-byte header, the key
+/// with 3 bytes of its own and the value with 4 (`kvobjSet`).
+const EMBSTR_KEY_AND_VALUE: usize = 64 - 16 - 3 - 4;
 
 /// The kind of value, in the low bits of the flags.
 const KIND: u8 = 0b11;
@@ -59,6 +62,9 @@ const LIST: u8 = 3;
 const RAW: u8 = 1 << 2;
 /// The expiry is in the header.
 const TTL: u8 = 1 << 3;
+/// A string `INCRBYFLOAT` wrote: never `int` to `OBJECT ENCODING`, even if
+/// it reads as one, as in Redis. A string written otherwise loses it.
+const FLOAT: u8 = 1 << 4;
 
 const HASH_AT: usize = 1;
 const EXPIRE_AT: usize = 5;
@@ -370,14 +376,15 @@ impl Kv {
         }
     }
 
-    /// `OBJECT ENCODING`, as Redis 7.0.15 would say it: a string is `int`
-    /// if it reads as one, `embstr` up to 44 bytes, `raw` past that or once
-    /// `APPEND` grew it (Redis makes it `raw` too, whatever it holds).
+    /// `OBJECT ENCODING`, as Redis 8.10 would say it: a string is `int` if
+    /// it reads as one (not after `INCRBYFLOAT`), `embstr` while it fits a
+    /// cache line with its key ([`EMBSTR_KEY_AND_VALUE`]), `raw` past that or
+    /// once `APPEND` grew it (Redis makes it `raw` too, whatever it holds).
     pub fn encoding(&self) -> &'static str {
         match self.value() {
             Val::Str(_) if self.flags() & RAW != 0 => "raw",
-            Val::Str(s) if s.len() <= 20 && parse_i64(s).is_some() => "int",
-            Val::Str(s) if s.len() <= EMBSTR_MAX => "embstr",
+            Val::Str(s) if self.flags() & FLOAT == 0 && s.len() <= 20 && parse_i64(s).is_some() => "int",
+            Val::Str(s) if self.key().len() + s.len() <= EMBSTR_KEY_AND_VALUE => "embstr",
             Val::Str(_) => "raw",
             Val::Hash(h) => h.encoding(),
             Val::Set(s) => s.encoding(),
@@ -437,6 +444,7 @@ impl Kv {
                 let (at, k, v) = self.header();
                 if v == value.len() {
                     self.write(at + k, value);
+                    self.write(0, &[self.flags() & !FLOAT]);
                     return;
                 }
             }
@@ -453,6 +461,11 @@ impl Kv {
         }
         let new = Kv::new_str(self.hash(), self.key(), value, self.ttl_of());
         *self = new;
+    }
+
+    /// Marks the string as `INCRBYFLOAT`'s (see [`FLOAT`]).
+    pub fn mark_float(&mut self) {
+        self.write(0, &[self.flags() | FLOAT]);
     }
 
     /// The `ttl` of a new block keeping this one's expiry.

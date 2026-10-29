@@ -32,10 +32,11 @@ impl Store {
         match self.live(key) {
             Some(e) => {
                 let s = e.as_set_mut()?;
+                s.expect(members.len());
                 Ok(members.iter().filter(|m| s.insert(m)).count())
             }
             None => {
-                let mut s = Set::default();
+                let mut s = Set::with_hint(members[0], members.len());
                 let added = members.iter().filter(|m| s.insert(m)).count();
                 self.insert_value(key, Value::Set(Box::new(s)), None);
                 Ok(added)
@@ -266,7 +267,7 @@ mod tests {
         assert_eq!(members(&mut s, b"s"), ["1", "2", "3"]);
         assert_eq!(s.encoding(b"s"), Some("intset"));
         assert_eq!(s.sadd(b"s", &[b"a", b"3"]), Ok(1));
-        assert_eq!(s.encoding(b"s"), Some("hashtable"));
+        assert_eq!(s.encoding(b"s"), Some("listpack"));
         assert_eq!(s.srem(b"s", &[b"a", b"x"]), Ok(1));
         assert_eq!(s.srem(b"s", &[b"1", b"2", b"3"]), Ok(3));
         assert!(!s.exists(b"s"));

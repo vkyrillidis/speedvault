@@ -1,18 +1,26 @@
 //! `SCAN`, `HSCAN`, `SSCAN`, `KEYS` (Redis 7.0's `db.c`: `scanGenericCommand`):
 //! parsing and replies; the store walks.
 
-use super::{store_error, syntax_error, Flow};
+use super::{c_str, store_error, syntax_error, Flow};
 use resp::{Args, Encoder};
 use store::{parse_i64, Store};
 
-/// A cursor as Redis's `strtoul` reads it: decimal, an optional sign (a
-/// negative one wraps), no spaces; the empty string is 0.
+/// A cursor as Redis 8's `string2ull` reads it (a C string, so up to a
+/// NUL): an integer as `string2ll` takes it, refused if negative; else as
+/// `strtoull` reads it, whitespace first, an optional sign (a negative one
+/// wraps), then digits to the end.
 fn cursor(arg: &[u8]) -> Option<u64> {
-    let (negative, digits) = match arg.split_first() {
-        None => return Some(0),
+    let arg = c_str(arg, usize::MAX);
+    if let Some(n) = parse_i64(arg) {
+        return u64::try_from(n).ok();
+    }
+    // C's isspace: Rust's ASCII whitespace and the vertical tab.
+    let skip = arg.iter().take_while(|&&b| b.is_ascii_whitespace() || b == 0x0b).count();
+    let trimmed = &arg[skip..];
+    let (negative, digits) = match trimmed.split_first() {
         Some((b'-', rest)) => (true, rest),
         Some((b'+', rest)) => (false, rest),
-        Some(_) => (false, arg),
+        _ => (false, trimmed),
     };
     if digits.is_empty() {
         return None;
@@ -146,15 +154,25 @@ mod tests {
     use super::cursor;
 
     #[test]
-    fn cursors_as_strtoul_reads_them() {
+    fn cursors_as_redis_8_reads_them() {
+        // Redis 8.10.2: string2ll, negatives refused; else strtoull.
         assert_eq!(cursor(b"0"), Some(0));
-        assert_eq!(cursor(b""), Some(0));
+        assert_eq!(cursor(b"00"), Some(0));
+        assert_eq!(cursor(b"-0"), Some(0));
+        assert_eq!(cursor(b""), None);
         assert_eq!(cursor(b"+7"), Some(7));
-        assert_eq!(cursor(b"-1"), Some(u64::MAX));
+        assert_eq!(cursor(b"-1"), None);
+        assert_eq!(cursor(b"-9223372036854775808"), None);
+        assert_eq!(cursor(b"9223372036854775808"), Some(1 << 63));
         assert_eq!(cursor(b"18446744073709551615"), Some(u64::MAX));
         assert_eq!(cursor(b"18446744073709551616"), None);
-        assert_eq!(cursor(b" 1"), None);
+        assert_eq!(cursor(b" 1"), Some(1));
+        assert_eq!(cursor(b"\t\x0b\n1"), Some(1));
+        assert_eq!(cursor(b" -5"), Some(5u64.wrapping_neg()));
+        assert_eq!(cursor(b"- 5"), None);
+        assert_eq!(cursor(b"5\0abc"), Some(5));
         assert_eq!(cursor(b"1 "), None);
+        assert_eq!(cursor(b"0x10"), None);
         assert_eq!(cursor(b"x"), None);
         assert_eq!(cursor(b"-"), None);
     }

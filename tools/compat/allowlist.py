@@ -10,14 +10,16 @@ Sets are selected by name with --allowlist (default: "rust").
 """
 
 ALLOW = {
-    # Differences we accept for the Rust dbnode compared with Redis 7.0.15.
+    # Differences we accept for SpeedVault compared with Redis 8.10.2.
     "rust": {
         "inline_binary_zero": "a NUL in an inline request is an ordinary byte, not the end of a C string "
                               "(resp crate docs: the one Redis parser quirk not copied)",
         "select_1": "only database 0 exists (README: SELECT 0)",
         "pipeline_select_midway": "only database 0 exists",
-        # Example (uncomment once decided):
-        # "client_setinfo": "we reply +OK like Redis 7.2 instead of 7.0's error",
+        "proto_star1_X_waits": "Redis 8.10.2 never answers '*1\\r\\nX' once the line ends in a later read (the "
+                               "same bytes at once get the error and a close): we reply the error, as Redis 7 did",
+        "proto_too_big_bulk_count": "Redis 8.10.2 waits forever for a bulk count of 70000 digits (even a million); "
+                                    "we refuse it past 64 KiB, as Redis 7 did",
     },
     # Redis vs Redis must be identical: nothing allowed.
     "none": {},

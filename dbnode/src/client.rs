@@ -39,9 +39,52 @@ pub(crate) struct Client {
     /// into it (Redis's `woff`): what `WAIT` waits for the replicas to
     /// acknowledge.
     pub(crate) woff: Cell<u64>,
+    /// `CLIENT SETINFO lib-name` and `lib-ver`; never empty.
+    pub(crate) lib_name: RefCell<Option<Vec<u8>>>,
+    pub(crate) lib_ver: RefCell<Option<Vec<u8>>>,
+    /// `CLIENT NO-TOUCH on` (flag `T`). The store keeps no access times,
+    /// so it changes nothing else.
+    pub(crate) no_touch: Cell<bool>,
+    /// Bytes read and written, commands run, reads that brought requests
+    /// and the commands they brought (Redis 8's `tot-net-in`, `tot-net-out`,
+    /// `tot-cmds`, `read-events`, `avg-pipeline-len-sum` and `-cnt`).
+    pub(crate) net_in: Cell<u64>,
+    pub(crate) net_out: Cell<u64>,
+    pub(crate) cmds: Cell<u64>,
+    pub(crate) read_events: Cell<u64>,
+    pub(crate) pipelined: Cell<u64>,
+    pub(crate) pipelines: Cell<u64>,
 }
 
 impl Client {
+    /// A client just connected, with id `id`.
+    pub(crate) fn new(id: u64, addr: Option<SocketAddr>, laddr: Option<SocketAddr>, fd: RawFd) -> Client {
+        let now = Instant::now();
+        Client {
+            id,
+            addr,
+            laddr,
+            fd,
+            created: now,
+            last_active: Cell::new(now),
+            name: RefCell::new(None),
+            last_cmd: Cell::new("NULL"),
+            resp: Cell::new(2),
+            asking: Cell::new(false),
+            readonly: Cell::new(false),
+            woff: Cell::new(0),
+            lib_name: RefCell::new(None),
+            lib_ver: RefCell::new(None),
+            no_touch: Cell::new(false),
+            net_in: Cell::new(0),
+            net_out: Cell::new(0),
+            cmds: Cell::new(0),
+            read_events: Cell::new(0),
+            pipelined: Cell::new(0),
+            pipelines: Cell::new(0),
+        }
+    }
+
     /// The name, after checking it as Redis does: "" removes it, and only
     /// printable ASCII without spaces is allowed. Returns false (and
     /// changes nothing) if the name is invalid.
@@ -53,26 +96,43 @@ impl Client {
         true
     }
 
-    /// One `CLIENT LIST` line, newline included, in Redis 7.0's field order.
-    /// The memory and buffer fields Redis tracks per client are 0 here.
+    /// One `CLIENT LIST` line, newline included, in Redis 8.10's field
+    /// order. The memory and buffer fields Redis tracks per client are 0
+    /// here; there are no I/O threads.
     pub(crate) fn info_line(&self, now: Instant, out: &mut String) {
         let addr = |a: Option<SocketAddr>| a.map_or_else(|| "?:0".to_string(), |a| a.to_string());
-        let name = self.name.borrow();
-        let name = name.as_deref().map_or("", |n| std::str::from_utf8(n).unwrap_or(""));
+        // Names and library attributes are printable ASCII (checked).
+        let text = |v: &RefCell<Option<Vec<u8>>>| v.borrow().as_deref().map_or(String::new(), |n| String::from_utf8_lossy(n).into_owned());
         let _ = writeln!(
             out,
-            "id={} addr={} laddr={} fd={} name={name} age={} idle={} flags=N db=0 sub=0 psub=0 ssub=0 multi=-1 \
-             qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 rbs=0 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r \
-             cmd={} user=default redir=-1 resp={}",
+            "id={} addr={} laddr={} fd={} name={} age={} idle={} flags={} db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 \
+             qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 rbs=0 rbp=0 obl=0 oll=0 omem=0 omem-shared=0 omem-unshared=0 \
+             tot-mem=0 events=r cmd={} user=default redir=-1 resp={} lib-name={} lib-ver={} io-thread=0 \
+             tot-net-in={} tot-net-out={} tot-cmds={} read-events={} avg-pipeline-len-sum={} avg-pipeline-len-cnt={}",
             self.id,
             addr(self.addr),
             addr(self.laddr),
             self.fd,
+            text(&self.name),
             now.duration_since(self.created).as_secs(),
             now.duration_since(self.last_active.get()).as_secs(),
+            if self.no_touch.get() { "T" } else { "N" },
             self.last_cmd.get(),
             self.resp.get(),
+            text(&self.lib_name),
+            text(&self.lib_ver),
+            self.net_in.get(),
+            self.net_out.get(),
+            self.cmds.get(),
+            self.read_events.get(),
+            self.pipelined.get(),
+            self.pipelines.get(),
         );
+    }
+
+    /// `n` more bytes written to the client.
+    pub(crate) fn wrote(&self, n: usize) {
+        self.net_out.set(self.net_out.get() + n as u64);
     }
 }
 
@@ -87,21 +147,7 @@ impl Clients {
     pub(crate) fn register(&self, addr: Option<SocketAddr>, laddr: Option<SocketAddr>, fd: RawFd) -> Registration<'_> {
         let id = self.last_id.get() + 1;
         self.last_id.set(id);
-        let now = Instant::now();
-        let client = Rc::new(Client {
-            id,
-            addr,
-            laddr,
-            fd,
-            created: now,
-            last_active: Cell::new(now),
-            name: RefCell::new(None),
-            last_cmd: Cell::new("NULL"),
-            resp: Cell::new(2),
-            asking: Cell::new(false),
-            readonly: Cell::new(false),
-            woff: Cell::new(0),
-        });
+        let client = Rc::new(Client::new(id, addr, laddr, fd));
         self.by_id.borrow_mut().insert(id, client.clone());
         Registration { clients: self, client }
     }

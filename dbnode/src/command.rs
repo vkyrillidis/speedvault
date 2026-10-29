@@ -375,11 +375,16 @@ fn unknown_subcommand(container: &str, sub: &[u8], out: &mut Encoder) {
 /// `-ERR unknown command 'FOO', with args beginning with: 'a' 'b' `: the
 /// name and the arguments are cut to 128 bytes (C strings in Redis, so also
 /// at a NUL), and arguments are listed until 128 bytes of them were.
+/// Without arguments, the name alone (Redis 7.2 and later).
 fn unknown_command(args: &Args, out: &mut Encoder) {
     let mut msg = Vec::with_capacity(64);
     msg.extend_from_slice(b"ERR unknown command '");
     msg.extend_from_slice(c_str(&args[0], 128));
-    msg.extend_from_slice(b"', with args beginning with: ");
+    msg.push(b'\'');
+    if args.len() < 2 {
+        return out.error(&msg);
+    }
+    msg.extend_from_slice(b", with args beginning with: ");
     let listed_from = msg.len();
     for arg in args.iter().skip(1) {
         let listed = msg.len() - listed_from;

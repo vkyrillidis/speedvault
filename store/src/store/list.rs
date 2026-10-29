@@ -71,6 +71,7 @@ impl Store {
             self.insert_value(key, Value::List(Box::default()), None);
         }
         let l = self.list_mut(key)?.expect("made above");
+        l.grow(elements.iter().copied());
         for e in elements {
             match end {
                 End::Left => l.push_front(e),
@@ -89,6 +90,7 @@ impl Store {
             End::Left => (0..n).map(|_| l.pop_front().expect("counted")).collect(),
             End::Right => (0..n).map(|_| l.pop_back().expect("counted")).collect(),
         };
+        l.shrink();
         self.drop_if_empty(key);
         Ok(Some(popped))
     }
@@ -108,8 +110,11 @@ impl Store {
     /// `LSET`.
     pub fn lset(&mut self, key: &[u8], index: i64, value: &[u8]) -> Result<(), Error> {
         let l = self.list_mut(key)?.ok_or(Error::NoSuchKey)?;
+        // As Redis: the encoding converts first, even out of range.
+        l.grow([value]);
         let i = l.resolve(index).ok_or(Error::IndexOutOfRange)?;
         l.set(i, value);
+        l.shrink();
         Ok(())
     }
 
@@ -117,8 +122,10 @@ impl Store {
     /// -1 without the pivot, 0 without the list.
     pub fn linsert(&mut self, key: &[u8], after: bool, pivot: &[u8], element: &[u8]) -> Result<i64, Error> {
         let Some(l) = self.list_mut(key)? else { return Ok(0) };
+        // As Redis: the encoding converts first, even without the pivot.
+        l.grow([element]);
         let Some(i) = l.iter().position(|e| e == pivot) else { return Ok(-1) };
-        l.insert(i + usize::from(after), element);
+        l.insert_by(i, after, element);
         Ok(l.len() as i64)
     }
 
@@ -128,6 +135,9 @@ impl Store {
         let Some(l) = self.list_mut(key)? else { return Ok(0) };
         let limit = if count == 0 { usize::MAX } else { count.unsigned_abs().try_into().unwrap_or(usize::MAX) };
         let removed = l.remove_matching(element, limit, count < 0);
+        if removed > 0 {
+            l.shrink();
+        }
         self.drop_if_empty(key);
         Ok(removed)
     }
@@ -139,6 +149,7 @@ impl Store {
             Some((from, to)) => l.trim(from, to),
             None => l.clear(),
         }
+        l.shrink();
         self.drop_if_empty(key);
         Ok(())
     }
@@ -188,10 +199,12 @@ impl Store {
             }
             .expect("a list is never empty");
             let copy = e.to_vec();
+            l.grow([&e[..]]);
             match to {
                 End::Left => l.push_front(&e),
                 End::Right => l.push_back(&e),
             }
+            l.shrink();
             return Ok(Some(copy));
         }
         let mut popped = self.pop(src, from, 1)?.expect("checked above");

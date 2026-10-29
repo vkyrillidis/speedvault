@@ -67,6 +67,7 @@ fn serve(mut conn: &TcpStream, node: &Node) -> io::Result<Closed> {
         node.store.borrow_mut().set_now(unix_ms());
         client.last_active.set(Instant::now());
         let mut closed = None;
+        let mut commands = 0;
         while closed.is_none() {
             match parser.parse(&buf[start..end]) {
                 Ok(Parsed::Complete { consumed }) => {
@@ -94,12 +95,17 @@ fn serve(mut conn: &TcpStream, node: &Node) -> io::Result<Closed> {
                         continue;
                     }
                     // No arguments (`*0`, a blank line): nothing to run, no reply.
-                    if !args.is_empty() && command::execute(&args, node, client, &mut out) == Flow::Close {
-                        closed = Some(Closed::Quit);
+                    if !args.is_empty() {
+                        client.cmds.set(client.cmds.get() + 1);
+                        commands += 1;
+                        if command::execute(&args, node, client, &mut out) == Flow::Close {
+                            closed = Some(Closed::Quit);
+                        }
                     }
                     start += consumed;
                     if out.len() >= FLUSH_AT {
                         conn.write_all(out.as_bytes())?;
+                        client.wrote(out.len());
                         out.clear();
                     }
                 }
@@ -120,7 +126,12 @@ fn serve(mut conn: &TcpStream, node: &Node) -> io::Result<Closed> {
             // clients took 4.7 us of kernel time per request instead of 3.7.
             reactor::yield_now();
             conn.write_all(out.as_bytes())?;
+            client.wrote(out.len());
             out.clear();
+        }
+        if commands > 0 {
+            client.pipelined.set(client.pipelined.get() + commands);
+            client.pipelines.set(client.pipelines.get() + 1);
         }
         if let Some(closed) = closed {
             return Ok(closed);
@@ -151,6 +162,8 @@ fn serve(mut conn: &TcpStream, node: &Node) -> io::Result<Closed> {
         if n == 0 {
             return Ok(Closed::ByClient);
         }
+        client.net_in.set(client.net_in.get() + n as u64);
+        client.read_events.set(client.read_events.get() + 1);
         end += n;
     }
 }

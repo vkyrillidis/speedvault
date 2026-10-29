@@ -39,20 +39,7 @@ fn node_with(backlog: usize, store: store::Store, config: Config) -> Node {
 }
 
 fn client() -> Client {
-    Client {
-        id: 1,
-        addr: None,
-        laddr: None,
-        fd: -1,
-        created: Instant::now(),
-        last_active: Cell::new(Instant::now()),
-        name: RefCell::new(None),
-        last_cmd: Cell::new(""),
-        resp: Cell::new(2),
-        asking: Cell::new(false),
-        readonly: Cell::new(false),
-        woff: Cell::new(0),
-    }
+    Client::new(1, None, None, -1)
 }
 
 /// Runs each request of `bytes` (RESP) at `node`; the replies.
@@ -409,7 +396,16 @@ fn view(node: &Node, key: &[u8]) -> Option<View> {
 fn compare(a: &Node, b: &Node, step: usize) {
     let keys: BTreeSet<Vec<u8>> = a.store.borrow().keys().chain(b.store.borrow().keys()).map(<[u8]>::to_vec).collect();
     for key in keys {
-        assert_eq!(view(a, &key), view(b, &key), "step {step}: key {:?}", key.escape_ascii().to_string());
+        let (mut va, vb) = (view(a, &key), view(b, &key));
+        // INCRBYFLOAT goes to the replica as a SET of its result, which
+        // a replica of Redis 8.10.2 too calls `int` if it reads as one,
+        // where its primary says `embstr`.
+        if let (Some(x), Some(y)) = (&mut va, &vb) {
+            if (x.2, y.2) == ("embstr", "int") {
+                x.2 = "int";
+            }
+        }
+        assert_eq!(va, vb, "step {step}: key {:?}", key.escape_ascii().to_string());
     }
 }
 

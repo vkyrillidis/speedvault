@@ -221,11 +221,9 @@ impl<'a> Iterator for HashIter<'a> {
 impl ExactSizeIterator for HashIter<'_> {}
 
 /// Small sets of other members are packed too while they have at most this
-/// many (Redis 7.2's `set-max-listpack-entries`; 7.0.15 has no listpack
-/// sets, so they say `hashtable` as 7.0.15 would).
+/// many (Redis's `set-max-listpack-entries`, since 7.2).
 pub const SET_MAX_PACKED_ENTRIES: usize = 128;
-/// ... of at most this many bytes each (Redis 7.2's
-/// `set-max-listpack-value`).
+/// ... of at most this many bytes each (`set-max-listpack-value`).
 pub const SET_MAX_PACKED_VALUE: usize = 64;
 
 /// A set: an intset while Redis would keep one (canonical integers, read out
@@ -277,14 +275,42 @@ impl Set {
     /// Whether Redis would have converted it to a hashtable (which it
     /// scans incrementally, in no order).
     pub fn is_big(&self) -> bool {
-        !matches!(self.repr, SetRepr::Ints(_))
+        matches!(self.repr, SetRepr::Table(_))
     }
 
     pub fn encoding(&self) -> &'static str {
-        if self.is_big() {
-            "hashtable"
+        match self.repr {
+            SetRepr::Ints(_) => "intset",
+            SetRepr::Small(_) => "listpack",
+            SetRepr::Table(_) => "hashtable",
+        }
+    }
+
+    /// An empty set for `hint` members, the first of them `first`, as
+    /// Redis 8's `setTypeCreate` makes it: an intset if `first` is an
+    /// integer and they'd fit one, packed if they'd fit that, else a table.
+    pub(crate) fn with_hint(first: &[u8], hint: usize) -> Set {
+        let repr = if parse_i64(first).is_some() && hint <= SET_MAX_INTSET_ENTRIES {
+            SetRepr::Ints(Packed::default())
+        } else if hint <= SET_MAX_PACKED_ENTRIES {
+            SetRepr::Small(Packed::default())
         } else {
-            "intset"
+            SetRepr::Table(Table::default())
+        };
+        Set { repr }
+    }
+
+    /// Converts to a table ahead of `hint` more members if they couldn't
+    /// all fit what it is now (Redis 8's `setTypeMaybeConvert`: `SADD`
+    /// counts its arguments, new or not).
+    pub(crate) fn expect(&mut self, hint: usize) {
+        let full = match self.repr {
+            SetRepr::Ints(_) => hint > SET_MAX_INTSET_ENTRIES,
+            SetRepr::Small(_) => hint > SET_MAX_PACKED_ENTRIES,
+            SetRepr::Table(_) => false,
+        };
+        if full {
+            self.convert(false);
         }
     }
 
@@ -467,19 +493,167 @@ impl<'a> Iterator for SetIter<'a> {
 
 impl ExactSizeIterator for SetIter<'_> {}
 
-/// The bytes a list node holds before the next element starts a new one:
-/// Redis's default `list-max-listpack-size -2`, 8 KiB. An element larger
-/// than that has a node of its own.
+/// Redis's default `list-max-listpack-size -2`: a list node's listpack
+/// holds at most 8 KiB, and an element larger than that gets a node of its
+/// own (a "plain" node).
 pub const LIST_NODE_BYTES: usize = 8192;
+/// What Redis adds to a node's size before it checks that an element fits
+/// (`SIZE_ESTIMATE_OVERHEAD`).
+const SIZE_ESTIMATE_OVERHEAD: usize = 8;
+/// An empty listpack: its 6-byte header and its end byte.
+const LP_EMPTY: usize = 7;
 
-/// A list: packed nodes of up to [`LIST_NODE_BYTES`], as Redis's quicklist
-/// (Redis 7.0.15 always calls a list that). Pushing and popping at either
-/// end is O(1) (a node's bytes move, as in a listpack); reaching an
-/// element by its position walks the nodes from the nearer end.
+/// The bytes `item` takes in a Redis listpack: a canonical integer in 1 to
+/// 9 bytes, a string after a header of 1, 2 or 5 bytes; then the entry's
+/// length again, backwards, in 1 to 5 bytes (`lpEncodeGetType`,
+/// `lpEncodeBacklen`). Lists count their nodes in these bytes, so that they
+/// split and change encoding where Redis's do.
+fn lp_entry_size(item: &[u8]) -> usize {
+    let encoded = match parse_i64(item) {
+        Some(0..=127) => 1,
+        Some(-4096..=4095) => 2,
+        Some(-32_768..=32_767) => 3,
+        Some(-8_388_608..=8_388_607) => 4,
+        Some(-2_147_483_648..=2_147_483_647) => 5,
+        Some(_) => 9,
+        None if item.len() < 64 => 1 + item.len(),
+        None if item.len() < 4096 => 2 + item.len(),
+        None => 5 + item.len(),
+    };
+    let backlen = match encoded {
+        0..=127 => 1,
+        128..=16_383 => 2,
+        16_384..=2_097_151 => 3,
+        2_097_152..=268_435_455 => 4,
+        _ => 5,
+    };
+    encoded + backlen
+}
+
+/// A node of a list, as Redis's quicklist has them: a listpack of up to
+/// [`LIST_NODE_BYTES`], or one element larger than that (plain).
+#[derive(Debug)]
+struct Node {
+    items: Packed,
+    /// Redis's `node->sz`: its listpack's bytes, or a plain node's
+    /// element's.
+    sz: usize,
+    plain: bool,
+}
+
+impl Node {
+    fn packed() -> Node {
+        Node { items: Packed::default(), sz: LP_EMPTY, plain: false }
+    }
+
+    fn plain(item: &[u8]) -> Node {
+        let mut items = Packed::default();
+        items.push(item);
+        Node { items, sz: item.len(), plain: true }
+    }
+
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn push(&mut self, item: &[u8]) {
+        self.items.push(item);
+        self.sz += lp_entry_size(item);
+    }
+
+    fn push_front(&mut self, item: &[u8]) {
+        self.insert_at(0, item);
+    }
+
+    /// Inserts `item` at byte offset `at` (an element's start, or the end).
+    fn insert_at(&mut self, at: usize, item: &[u8]) {
+        self.items.insert_at(at, item);
+        self.sz += lp_entry_size(item);
+    }
+
+    /// The place of the element at `offset` (below the length).
+    fn place(&self, offset: usize) -> At {
+        let at = if offset < self.len() / 2 {
+            self.items.iter().nth(offset)
+        } else {
+            self.items.iter().nth_back(self.len() - 1 - offset)
+        };
+        at.expect("within the node").0
+    }
+
+    /// Removes the element at `at` and returns it.
+    fn remove(&mut self, at: At) -> Box<[u8]> {
+        let e: Box<[u8]> = Box::from(self.items.get(at));
+        self.items.remove_range(at.whole(), 1);
+        self.sz -= if self.plain { e.len() } else { lp_entry_size(&e) };
+        e
+    }
+
+    fn replace(&mut self, at: At, item: &[u8]) {
+        let old = self.items.get(at);
+        self.sz = if self.plain { item.len() } else { self.sz - lp_entry_size(old) + lp_entry_size(item) };
+        self.items.replace(at, item);
+    }
+
+    /// Redis's `_quicklistNodeAllowInsert`: whether an element of `size`
+    /// bytes goes into this node.
+    fn allows(&self, size: usize) -> bool {
+        !self.plain && size <= LIST_NODE_BYTES && self.sz + size + SIZE_ESTIMATE_OVERHEAD <= LIST_NODE_BYTES
+    }
+
+    /// Redis's `_quicklistNodeAllowMerge`: whether the two listpacks fit
+    /// one node.
+    fn merges_with(&self, other: &Node) -> bool {
+        !self.plain && !other.plain && self.sz + other.sz - LP_EMPTY <= LIST_NODE_BYTES
+    }
+
+    /// Redis's `_quicklistSplitNode`: with `after`, the new node takes the
+    /// elements after `offset` and this one keeps the rest; without, the
+    /// new node takes those before `offset`.
+    fn split(&mut self, offset: usize, after: bool) -> Node {
+        let (mut keep, mut new) = (Node::packed(), Node::packed());
+        for (k, (_, e)) in self.items.iter().enumerate() {
+            if (after && k > offset) || (!after && k < offset) {
+                new.push(e);
+            } else {
+                keep.push(e);
+            }
+        }
+        *self = keep;
+        new
+    }
+
+    /// The node holding only the elements for which `keep` is true.
+    fn retained(&self, mut keep: impl FnMut(usize, &[u8]) -> bool) -> Node {
+        if self.plain {
+            return Node::plain(self.items.iter().next().expect("one element").1);
+        }
+        let mut node = Node::packed();
+        for (k, (_, e)) in self.items.iter().enumerate() {
+            if keep(k, e) {
+                node.push(e);
+            }
+        }
+        node
+    }
+}
+
+/// A list, kept as Redis 8 keeps it: a listpack (one node) while it fits
+/// one, a quicklist past that, whose nodes split and merge where Redis's do
+/// (its rules are ported in the methods here, sizes counted in listpack
+/// bytes), so `OBJECT ENCODING` says what Redis would. Pushing and popping
+/// at either end is O(1) (a node's bytes move, as in a listpack); reaching
+/// an element by its position walks the nodes from the nearer end.
+///
+/// The store calls [`grow`](Self::grow) before it adds elements and
+/// [`shrink`](Self::shrink) after it removed some, where Redis's commands
+/// try to convert the encoding.
 #[derive(Debug, Default)]
 pub struct List {
-    nodes: VecDeque<Packed>,
+    nodes: VecDeque<Node>,
     len: usize,
+    /// A quicklist to Redis; while not, at most one node.
+    quick: bool,
 }
 
 impl List {
@@ -493,14 +667,43 @@ impl List {
     }
 
     pub fn encoding(&self) -> &'static str {
-        "quicklist"
+        if self.quick {
+            "quicklist"
+        } else {
+            "listpack"
+        }
+    }
+
+    /// Redis's `listTypeTryConversionAppend`, before `adding` goes in: a
+    /// listpack whose bytes and theirs (counted bare) pass a node's size
+    /// becomes a quicklist, the listpack its first node. Redis does it even
+    /// when nothing goes in after all (`LINSERT` without the pivot, `LSET`
+    /// out of range).
+    pub(crate) fn grow<'a>(&mut self, adding: impl IntoIterator<Item = &'a [u8]>) {
+        if self.quick {
+            return;
+        }
+        let bytes = self.nodes.front().map_or(LP_EMPTY, |n| n.sz);
+        if bytes + adding.into_iter().map(<[u8]>::len).sum::<usize>() > LIST_NODE_BYTES {
+            self.quick = true;
+        }
+    }
+
+    /// Redis's `listTypeTryConversion(SHRINKING)`, after elements went: a
+    /// quicklist down to one listpack node of at most half a node's size is
+    /// a listpack again (half, so that it doesn't flip back and forth).
+    pub(crate) fn shrink(&mut self) {
+        if self.quick && self.nodes.len() == 1 && !self.nodes[0].plain && self.nodes[0].sz <= LIST_NODE_BYTES / 2 {
+            self.quick = false;
+        }
     }
 
     /// The element at `index`, counted from the end if negative (as
     /// `LINDEX` takes it).
     pub fn get(&self, index: i64) -> Option<&[u8]> {
-        let (n, at) = self.locate(self.resolve(index)?);
-        Some(self.nodes[n].get(at))
+        let (n, within) = self.node_of(self.resolve(index)?);
+        let node = &self.nodes[n];
+        Some(node.items.get(node.place(within)))
     }
 
     /// `index` as a position, if it's in the list.
@@ -537,7 +740,7 @@ impl List {
             return ListIter { nodes: &self.nodes, node: self.nodes.len(), inner: None, left: 0 };
         }
         let (n, within) = self.node_of(from);
-        let mut inner = self.nodes[n].iter();
+        let mut inner = self.nodes[n].items.iter();
         if within > 0 {
             inner.nth(within - 1);
         }
@@ -546,7 +749,7 @@ impl List {
 
     /// The elements from the last to the first.
     pub fn iter_rev(&self) -> impl Iterator<Item = &[u8]> {
-        self.nodes.iter().rev().flat_map(|node| node.iter().rev().map(|(_, e)| e))
+        self.nodes.iter().rev().flat_map(|node| node.items.iter().rev().map(|(_, e)| e))
     }
 
     /// The node holding position `i` (below the length), and `i` within
@@ -572,52 +775,54 @@ impl List {
         unreachable!("a position below the length")
     }
 
-    /// The node and place of position `i` (below the length).
-    fn locate(&self, i: usize) -> (usize, At) {
-        let (n, within) = self.node_of(i);
-        let node = &self.nodes[n];
-        let at = if within < node.len() / 2 {
-            node.iter().nth(within)
-        } else {
-            node.iter().nth_back(node.len() - 1 - within)
-        };
-        (n, at.expect("within the node").0)
-    }
-
-    /// Whether `node` has room for an element of `size` bytes.
-    fn room(node: &Packed, size: usize) -> bool {
-        node.len() == 0 || node.bytes() + size + 2 <= LIST_NODE_BYTES
-    }
-
+    /// Redis's `quicklistPushTail` (or a listpack's append).
     pub(crate) fn push_back(&mut self, item: &[u8]) {
+        self.len += 1;
+        if !self.quick {
+            if self.nodes.is_empty() {
+                self.nodes.push_back(Node::packed());
+            }
+            return self.nodes[0].push(item);
+        }
+        if item.len() > LIST_NODE_BYTES {
+            return self.nodes.push_back(Node::plain(item));
+        }
         match self.nodes.back_mut() {
-            Some(node) if List::room(node, item.len()) => node.push(item),
+            Some(node) if node.allows(item.len()) => node.push(item),
             _ => {
-                let mut node = Packed::default();
+                let mut node = Node::packed();
                 node.push(item);
                 self.nodes.push_back(node);
             }
         }
-        self.len += 1;
     }
 
+    /// Redis's `quicklistPushHead` (or a listpack's prepend).
     pub(crate) fn push_front(&mut self, item: &[u8]) {
+        self.len += 1;
+        if !self.quick {
+            if self.nodes.is_empty() {
+                self.nodes.push_back(Node::packed());
+            }
+            return self.nodes[0].push_front(item);
+        }
+        if item.len() > LIST_NODE_BYTES {
+            return self.nodes.push_front(Node::plain(item));
+        }
         match self.nodes.front_mut() {
-            Some(node) if List::room(node, item.len()) => node.insert_at(0, item),
+            Some(node) if node.allows(item.len()) => node.push_front(item),
             _ => {
-                let mut node = Packed::default();
+                let mut node = Node::packed();
                 node.push(item);
                 self.nodes.push_front(node);
             }
         }
-        self.len += 1;
     }
 
     pub(crate) fn pop_front(&mut self) -> Option<Box<[u8]>> {
         let node = self.nodes.front_mut()?;
-        let (at, e) = node.iter().next().expect("no empty node");
-        let e = Box::from(e);
-        node.remove_range(at.whole(), 1);
+        let at = node.place(0);
+        let e = node.remove(at);
         if node.len() == 0 {
             self.nodes.pop_front();
         }
@@ -627,9 +832,8 @@ impl List {
 
     pub(crate) fn pop_back(&mut self) -> Option<Box<[u8]>> {
         let node = self.nodes.back_mut()?;
-        let (at, e) = node.iter().next_back().expect("no empty node");
-        let e = Box::from(e);
-        node.remove_range(at.whole(), 1);
+        let at = node.place(node.len() - 1);
+        let e = node.remove(at);
         if node.len() == 0 {
             self.nodes.pop_back();
         }
@@ -637,42 +841,155 @@ impl List {
         Some(e)
     }
 
-    /// Sets position `i` (below the length) to `value`.
+    /// Sets position `i` (below the length) to `value`: Redis's
+    /// `quicklistReplaceEntry`. In place in a listpack node, however large
+    /// it gets; a large value in a listpack node gets a plain node of its
+    /// own, the node split around it; a plain node gives way to a listpack
+    /// one unless the value is large too.
     pub(crate) fn set(&mut self, i: usize, value: &[u8]) {
-        let (n, at) = self.locate(i);
-        self.nodes[n].replace(at, value);
-        self.split_if_large(n);
-    }
-
-    /// Inserts `item` before position `i` (the length: at the end).
-    pub(crate) fn insert(&mut self, i: usize, item: &[u8]) {
-        if i == self.len {
-            return self.push_back(item);
+        let (n, offset) = self.node_of(i);
+        let large = value.len() > LIST_NODE_BYTES;
+        let node = &mut self.nodes[n];
+        let at = node.place(offset);
+        if !self.quick || (!node.plain && !large) || (node.plain && large) {
+            return node.replace(at, value);
         }
-        let (n, at) = self.locate(i);
-        self.nodes[n].insert_at(at.whole().start, item);
-        self.len += 1;
-        self.split_if_large(n);
-    }
-
-    /// Cuts node `n` in two halves if it has grown past twice a node's size
-    /// (an insertion or a longer element in its middle).
-    fn split_if_large(&mut self, n: usize) {
-        let node = &self.nodes[n];
-        if node.bytes() <= 2 * LIST_NODE_BYTES || node.len() < 2 {
+        if node.plain {
+            // Inserted after it, then the plain node goes.
+            self.insert_at_node(n, 0, true, value);
+            self.nodes.remove(n);
+            self.len -= 1;
             return;
         }
-        let half = node.len() / 2;
-        let (mut first, mut second) = (Packed::default(), Packed::default());
-        for (k, (_, e)) in node.iter().enumerate() {
-            if k < half { first.push(e) } else { second.push(e) }
+        // A large value in a listpack node: split after the element unless
+        // it's the last, the plain node between, the element removed.
+        let count = node.len();
+        let rest = (offset != count - 1).then(|| node.split(offset, true));
+        self.nodes.insert(n + 1, Node::plain(value));
+        if let Some(rest) = rest {
+            self.nodes.insert(n + 2, rest);
         }
-        self.nodes[n] = first;
-        self.nodes.insert(n + 1, second);
+        if self.nodes[n].len() == 1 {
+            self.nodes.remove(n);
+        } else {
+            let node = &mut self.nodes[n];
+            let last = node.place(node.len() - 1);
+            node.remove(last);
+            self.merge_around(n + 1);
+        }
+    }
+
+    /// Inserts `item` before position `i`, or at the end if `i` is the
+    /// length.
+    #[cfg(test)]
+    pub(crate) fn insert(&mut self, i: usize, item: &[u8]) {
+        match i.checked_sub(1) {
+            _ if i < self.len => self.insert_by(i, false, item),
+            Some(last) => self.insert_by(last, true, item),
+            None => self.push_back(item),
+        }
+    }
+
+    /// `LINSERT`: inserts `item` after (or before) the element at position
+    /// `pivot` (below the length).
+    pub(crate) fn insert_by(&mut self, pivot: usize, after: bool, item: &[u8]) {
+        let (n, offset) = self.node_of(pivot);
+        self.insert_at_node(n, offset, after, item);
+    }
+
+    /// Redis's `_quicklistInsert`: `item` after (or before) the element at
+    /// `offset` of node `n`. Into that node if it has room, else at the head
+    /// of the next node or the tail of the previous one when at the edge
+    /// and they have room, else a new node at the edge, else the node split
+    /// and the pieces around merged where they fit.
+    fn insert_at_node(&mut self, n: usize, offset: usize, after: bool, item: &[u8]) {
+        self.len += 1;
+        let node = &self.nodes[n];
+        if !self.quick {
+            let at = node.place(offset);
+            let byte = if after { at.whole().end } else { at.whole().start };
+            return self.nodes[n].insert_at(byte, item);
+        }
+        let large = item.len() > LIST_NODE_BYTES;
+        let full = !node.allows(item.len());
+        let at_tail = after && offset == node.len() - 1;
+        let at_head = !after && offset == 0;
+        let room_next = at_tail && self.nodes.get(n + 1).is_some_and(|next| next.allows(item.len()));
+        let room_prev = at_head && n > 0 && self.nodes[n - 1].allows(item.len());
+        if large {
+            if node.plain || at_tail || at_head {
+                self.nodes.insert(if after { n + 1 } else { n }, Node::plain(item));
+            } else {
+                let new = self.nodes[n].split(offset, after);
+                if after {
+                    self.nodes.insert(n + 1, Node::plain(item));
+                    self.nodes.insert(n + 2, new);
+                } else {
+                    self.nodes.insert(n, Node::plain(item));
+                    self.nodes.insert(n, new);
+                }
+            }
+            return;
+        }
+        if !full {
+            let node = &mut self.nodes[n];
+            let at = node.place(offset);
+            let byte = if after { at.whole().end } else { at.whole().start };
+            node.insert_at(byte, item);
+        } else if room_next {
+            self.nodes[n + 1].push_front(item);
+        } else if room_prev {
+            self.nodes[n - 1].push(item);
+        } else if at_tail || at_head {
+            let mut node = Node::packed();
+            node.push(item);
+            self.nodes.insert(if after { n + 1 } else { n }, node);
+        } else {
+            let mut new = self.nodes[n].split(offset, after);
+            let center = if after {
+                new.push_front(item);
+                self.nodes.insert(n + 1, new);
+                n
+            } else {
+                new.push(item);
+                self.nodes.insert(n, new);
+                n + 1
+            };
+            self.merge_around(center);
+        }
+    }
+
+    /// Redis's `_quicklistMergeNodes`: merges the two nodes before
+    /// `center`, the two after it, then `center` with the one before and
+    /// with the one after, each pair if it fits one node.
+    fn merge_around(&mut self, mut center: usize) {
+        if center >= 2 && self.nodes[center - 1].merges_with(&self.nodes[center - 2]) {
+            self.merge(center - 2);
+            center -= 1;
+        }
+        if center + 2 < self.nodes.len() && self.nodes[center + 1].merges_with(&self.nodes[center + 2]) {
+            self.merge(center + 1);
+        }
+        if center >= 1 && self.nodes[center].merges_with(&self.nodes[center - 1]) {
+            self.merge(center - 1);
+            center -= 1;
+        }
+        if center + 1 < self.nodes.len() && self.nodes[center].merges_with(&self.nodes[center + 1]) {
+            self.merge(center);
+        }
+    }
+
+    /// Node `a` takes the elements of the node after it, which goes.
+    fn merge(&mut self, a: usize) {
+        let b = self.nodes.remove(a + 1).expect("a node after");
+        for (_, e) in b.items.iter() {
+            self.nodes[a].push(e);
+        }
     }
 
     /// Removes the elements equal to `element`, at most `limit`, the first
-    /// ones or (`from_tail`) the last ones: how many.
+    /// ones or (`from_tail`) the last ones: how many. Nodes left empty go;
+    /// none merge (Redis's `LREM`).
     pub(crate) fn remove_matching(&mut self, element: &[u8], limit: usize, from_tail: bool) -> usize {
         let mut removed = 0;
         let order: Vec<usize> = if from_tail { (0..self.nodes.len()).rev().collect() } else { (0..self.nodes.len()).collect() };
@@ -681,7 +998,7 @@ impl List {
                 break;
             }
             let node = &self.nodes[n];
-            let mut hits: Vec<usize> = node.iter().enumerate().filter(|(_, (_, e))| *e == element).map(|(k, _)| k).collect();
+            let mut hits: Vec<usize> = node.items.iter().enumerate().filter(|(_, (_, e))| *e == element).map(|(k, _)| k).collect();
             if hits.is_empty() {
                 continue;
             }
@@ -691,16 +1008,7 @@ impl List {
             } else {
                 hits.truncate(take);
             }
-            let mut kept = Packed::default();
-            let mut next = hits.iter().peekable();
-            for (k, (_, e)) in node.iter().enumerate() {
-                if next.peek() == Some(&&k) {
-                    next.next();
-                } else {
-                    kept.push(e);
-                }
-            }
-            self.nodes[n] = kept;
+            self.nodes[n] = if take == node.len() { Node::packed() } else { node.retained(|k, _| hits.binary_search(&k).is_err()) };
             removed += take;
         }
         self.nodes.retain(|node| node.len() > 0);
@@ -729,8 +1037,7 @@ impl List {
                 n -= node.len();
                 self.nodes.pop_front();
             } else {
-                let (at, _) = node.iter().nth(n).expect("within the node");
-                node.remove_range(0..at.whole().start, n);
+                *node = node.retained(|k, _| k >= n);
                 n = 0;
             }
         }
@@ -745,9 +1052,8 @@ impl List {
                 n -= node.len();
                 self.nodes.pop_back();
             } else {
-                let (at, _) = node.iter().nth_back(n - 1).expect("within the node");
-                let end = node.bytes();
-                node.remove_range(at.whole().start..end, n);
+                let keep = node.len() - n;
+                *node = node.retained(|k, _| k < keep);
                 n = 0;
             }
         }
@@ -772,7 +1078,7 @@ impl List {
 
 /// [`List::iter`], [`List::slice`]: the elements in order.
 pub struct ListIter<'a> {
-    nodes: &'a VecDeque<Packed>,
+    nodes: &'a VecDeque<Node>,
     node: usize,
     inner: Option<crate::packed::Iter<'a>>,
     left: usize,
@@ -791,7 +1097,7 @@ impl<'a> Iterator for ListIter<'a> {
                 return Some(e);
             }
             self.node += 1;
-            self.inner = Some(self.nodes.get(self.node)?.iter());
+            self.inner = Some(self.nodes.get(self.node)?.items.iter());
         }
     }
 
@@ -854,7 +1160,7 @@ mod tests {
             let mut s = Set::default();
             s.insert(b"1");
             s.insert(m);
-            assert_eq!(s.encoding(), "hashtable", "{m:?}");
+            assert_eq!(s.encoding(), "listpack", "{m:?}");
         }
     }
 
@@ -909,13 +1215,13 @@ mod tests {
         assert!(sorted.windows(2).all(|w| w[0] < w[1]), "numeric order");
         s.insert(b"5000");
         assert_eq!((repr(&s), s.encoding()), ("table", "hashtable"));
-        // A few integers, then a string: packed, called a hashtable.
+        // A few integers, then a string: packed, a listpack.
         let mut s = Set::default();
         for m in [&b"3"[..], b"1", b"2"] {
             s.insert(m);
         }
         s.insert(b"x");
-        assert_eq!((repr(&s), s.encoding()), ("small", "hashtable"));
+        assert_eq!((repr(&s), s.encoding()), ("small", "listpack"));
         assert_eq!(s.members(), [&b"1"[..], b"2", b"3", b"x"], "the intset's order, then the new one");
         assert!(s.contains(b"2") && s.contains(b"x") && !s.contains(b"02"));
         // Up to 128 members of up to 64 bytes.
@@ -965,7 +1271,7 @@ mod tests {
                 assert_eq!(s.len(), m.len());
             }
             let mut got: Vec<Vec<u8>> = s.members().iter().map(|m| m.to_vec()).collect();
-            if !s.is_big() {
+            if s.encoding() == "intset" {
                 let nums: Vec<i64> = got.iter().map(|m| std::str::from_utf8(m).unwrap().parse().unwrap()).collect();
                 assert!(nums.windows(2).all(|w| w[0] < w[1]), "an intset in numeric order");
             }
@@ -979,10 +1285,21 @@ mod tests {
         }
     }
 
-    /// The list's nodes: none empty, the counts adding up.
+    /// The list's nodes: none empty, the counts adding up, each one's size
+    /// Redis's for its elements, a plain node one large element, a listpack
+    /// one node.
     fn check_nodes(l: &List) {
         assert!(l.nodes.iter().all(|n| n.len() > 0), "an empty node");
-        assert_eq!(l.nodes.iter().map(Packed::len).sum::<usize>(), l.len());
+        assert_eq!(l.nodes.iter().map(Node::len).sum::<usize>(), l.len());
+        for node in &l.nodes {
+            if node.plain {
+                assert_eq!(node.len(), 1);
+                assert!(node.sz > LIST_NODE_BYTES);
+            } else {
+                assert_eq!(node.sz, LP_EMPTY + node.items.iter().map(|(_, e)| lp_entry_size(e)).sum::<usize>());
+            }
+        }
+        assert!(l.quick || l.nodes.len() <= 1, "a listpack is one node");
     }
 
     /// Random operations on a list against a `VecDeque`, with elements
@@ -1010,23 +1327,36 @@ mod tests {
             let e: Vec<u8> = vec![b'a' + (r >> 20) as u8 % 4; size];
             let pos = |len: usize| if len == 0 { 0 } else { (r >> 32) as usize % len };
             match (r >> 40) % 16 {
+                // As the store calls them: grow before adding, shrink after
+                // removing, so that the list goes through both encodings.
                 0..=3 => {
+                    l.grow([&e[..]]);
                     l.push_back(&e);
                     m.push_back(e);
                 }
                 4..=6 => {
+                    l.grow([&e[..]]);
                     l.push_front(&e);
                     m.push_front(e);
                 }
-                7 => assert_eq!(l.pop_front().map(Vec::from), m.pop_front()),
-                8 => assert_eq!(l.pop_back().map(Vec::from), m.pop_back()),
+                7 => {
+                    assert_eq!(l.pop_front().map(Vec::from), m.pop_front());
+                    l.shrink();
+                }
+                8 => {
+                    assert_eq!(l.pop_back().map(Vec::from), m.pop_back());
+                    l.shrink();
+                }
                 9 if !m.is_empty() => {
                     let i = pos(m.len());
+                    l.grow([&e[..]]);
                     l.set(i, &e);
+                    l.shrink();
                     m[i] = e;
                 }
                 10 => {
                     let i = pos(m.len() + 1);
+                    l.grow([&e[..]]);
                     l.insert(i, &e);
                     m.insert(i, e);
                 }
@@ -1055,10 +1385,12 @@ mod tests {
                         }
                     }
                     assert_eq!(l.remove_matching(&e, limit, from_tail), removed);
+                    l.shrink();
                 }
                 12 if m.len() > 200 => {
                     let (from, to) = (pos(m.len() / 4), m.len() - 1 - pos(m.len() / 4));
                     l.trim(from, to);
+                    l.shrink();
                     m.truncate(to + 1);
                     m.drain(..from);
                 }
@@ -1081,7 +1413,7 @@ mod tests {
             }
         }
         check_nodes(&l);
-        assert!(most > 20, "the list had {most} nodes at most");
+        assert!(most > 10, "the list had {most} nodes at most");
         assert!(l.iter().eq(m.iter().map(|e| &e[..])));
     }
 }

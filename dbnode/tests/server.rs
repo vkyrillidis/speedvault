@@ -222,11 +222,12 @@ fn cluster_support_disabled() {
     c.call(&[b"MGET", b"foo", b"bar"], b"*2\r\n$1\r\n1\r\n$1\r\n2\r\n");
 }
 
-/// HELLO's reply for connection `id`, as Redis 7.0.15 sends it.
+/// HELLO's reply for connection `id`, as Redis 8.10.2 sends it (without
+/// its built-in module, see `tools/compat`).
 fn hello_reply(proto: u8, id: &str) -> Vec<u8> {
     let head = if proto == 3 { "%7".to_string() } else { "*14".to_string() };
     format!(
-        "{head}\r\n$6\r\nserver\r\n$5\r\nredis\r\n$7\r\nversion\r\n$6\r\n7.0.15\r\n$5\r\nproto\r\n:{proto}\r\n\
+        "{head}\r\n$6\r\nserver\r\n$5\r\nredis\r\n$7\r\nversion\r\n$6\r\n8.10.2\r\n$5\r\nproto\r\n:{proto}\r\n\
          $2\r\nid\r\n:{id}\r\n$4\r\nmode\r\n$10\r\nstandalone\r\n$4\r\nrole\r\n$6\r\nmaster\r\n$7\r\nmodules\r\n*0\r\n"
     )
     .into_bytes()
@@ -297,7 +298,20 @@ fn client_list_and_info() {
     assert!(lines[0].starts_with(&format!("id={id_a} addr=127.0.0.1:")), "{}", lines[0]);
     assert!(lines[0].contains(" name= ") && lines[0].contains(" cmd=client|list "), "{}", lines[0]);
     assert!(lines[1].starts_with(&format!("id={id_b} ")) && lines[1].contains(" name=bee "), "{}", lines[1]);
-    assert!(lines[1].contains(" cmd=client|setname ") && lines[1].ends_with(" resp=2"), "{}", lines[1]);
+    assert!(lines[1].contains(" cmd=client|setname ") && lines[1].contains(" resp=2 lib-name= lib-ver= "), "{}", lines[1]);
+    assert!(lines[1].contains(" tot-cmds=2 ") && lines[1].ends_with(" avg-pipeline-len-cnt=2"), "{}", lines[1]);
+    // Redis 7.2's CLIENT SETINFO, 7.4's NO-TOUCH (flag T).
+    b.call(&[b"CLIENT", b"SETINFO", b"lib-name", b"redis-py"], OK);
+    b.call(&[b"CLIENT", b"SETINFO", b"LIB-VER", b"5.0.1"], OK);
+    b.call(&[b"CLIENT", b"NO-TOUCH", b"on"], OK);
+    b.cmd(&[b"CLIENT", b"INFO"]);
+    let info = b.read_text();
+    assert!(info.contains(" flags=T ") && info.contains(" lib-name=redis-py lib-ver=5.0.1 "), "{info}");
+    b.call(&[b"CLIENT", b"SETINFO", b"lib-name", b""], OK);
+    b.call(&[b"CLIENT", b"NO-TOUCH", b"OFF"], OK);
+    b.cmd(&[b"CLIENT", b"INFO"]);
+    let info = b.read_text();
+    assert!(info.contains(" flags=N ") && info.contains(" lib-name= lib-ver=5.0.1 "), "{info}");
 
     a.cmd(&[b"CLIENT", b"LIST", b"ID", id_b.as_bytes()]);
     assert!(a.read_text().starts_with(&format!("id={id_b} ")));
@@ -310,7 +324,7 @@ fn client_list_and_info() {
     a.cmd(&[b"CLIENT", b"INFO"]);
     let info = a.read_text();
     assert!(info.starts_with(&format!("txt:id={id_a} ")) && info.contains(" cmd=client|info "), "{info}");
-    assert!(info.ends_with(" resp=3\n"), "{info}");
+    assert!(info.contains(" resp=3 ") && info.ends_with(" avg-pipeline-len-cnt=8\n"), "{info}");
 
     // A closed connection leaves the list.
     drop(b);
@@ -324,7 +338,10 @@ fn client_errors() {
     let mut c = Client::connect(start());
     c.call(&[b"CLIENT"], b"-ERR wrong number of arguments for 'client' command\r\n");
     c.call(&[b"CLIENT", b"FOO"], b"-ERR unknown subcommand 'FOO'. Try CLIENT HELP.\r\n");
-    c.call(&[b"client", b"setinfo", b"LIB-NAME", b"x"], b"-ERR unknown subcommand 'setinfo'. Try CLIENT HELP.\r\n");
+    c.call(&[b"client", b"setinfo", b"LIB-NAME", b"x y"], b"-ERR LIB-NAME cannot contain spaces, newlines or special characters.\r\n");
+    c.call(&[b"CLIENT", b"SETINFO", b"lib-x", b"x"], b"-ERR Unrecognized option 'lib-x'\r\n");
+    c.call(&[b"CLIENT", b"SETINFO", b"lib-name"], b"-ERR wrong number of arguments for 'client|setinfo' command\r\n");
+    c.call(&[b"CLIENT", b"NO-TOUCH", b"maybe"], b"-ERR syntax error\r\n");
     c.call(&[b"CLIENT", b"SETNAME"], b"-ERR wrong number of arguments for 'client|setname' command\r\n");
     c.call(&[b"CLIENT", b"ID", b"x"], b"-ERR wrong number of arguments for 'client|id' command\r\n");
 }
@@ -382,15 +399,15 @@ fn info_sections() {
     c.call(&[b"INFO", b"keyspace"], b"$12\r\n# Keyspace\r\n\r\n");
     c.call(&[b"SET", b"a", b"1"], OK);
     c.call(&[b"SET", b"b", b"2", b"EX", b"100"], OK);
-    c.call(&[b"INFO", b"KEYSPACE"], b"$44\r\n# Keyspace\r\ndb0:keys=2,expires=1,avg_ttl=0\r\n\r\n");
+    c.call(&[b"INFO", b"KEYSPACE"], b"$56\r\n# Keyspace\r\ndb0:keys=2,expires=1,avg_ttl=0,subexpiry=0\r\n\r\n");
     c.call(&[b"INFO", b"nosuchsection"], b"$0\r\n\r\n");
 
     c.cmd(&[b"INFO"]);
     let all = c.read_text();
-    for needle in ["# Server\r\nredis_version:7.0.15\r\n", "\r\n\r\n# Clients\r\nconnected_clients:1\r\n", "\r\nrole:master\r\n", "\r\n# Keyspace\r\n"] {
+    for needle in ["# Server\r\nredis_version:8.10.2\r\n", "\r\n\r\n# Clients\r\nconnected_clients:1\r\n", "\r\nrole:master\r\n", "\r\n# Keyspace\r\n"] {
         assert!(all.contains(needle), "{needle:?} missing in {all}");
     }
-    assert!(all.ends_with("avg_ttl=0\r\n"), "{all}");
+    assert!(all.ends_with("avg_ttl=0,subexpiry=0\r\n"), "{all}");
 
     c.cmd(&[b"INFO", b"stats", b"server"]);
     let two = c.read_text();
@@ -398,7 +415,7 @@ fn info_sections() {
 
     let id = c.id();
     c.call(&[b"HELLO", b"3"], &hello_reply(3, &id));
-    c.call(&[b"INFO", b"keyspace"], b"=48\r\ntxt:# Keyspace\r\ndb0:keys=2,expires=1,avg_ttl=0\r\n\r\n");
+    c.call(&[b"INFO", b"keyspace"], b"=60\r\ntxt:# Keyspace\r\ndb0:keys=2,expires=1,avg_ttl=0,subexpiry=0\r\n\r\n");
 }
 
 #[test]
@@ -451,9 +468,9 @@ fn no_idle_timeout_by_default() {
 #[test]
 fn unknown_command() {
     let mut c = Client::connect(start());
-    c.call(&[b"FOO"], b"-ERR unknown command 'FOO', with args beginning with: \r\n");
+    c.call(&[b"FOO"], b"-ERR unknown command 'FOO'\r\n");
     c.call(&[b"foo", b"a", b"b c"], b"-ERR unknown command 'foo', with args beginning with: 'a' 'b c' \r\n");
-    c.call(&[b""], b"-ERR unknown command '', with args beginning with: \r\n");
+    c.call(&[b""], b"-ERR unknown command ''\r\n");
     // Newlines in the quoted input become spaces.
     c.call(&[b"BA\r\nR", b"x\ny"], b"-ERR unknown command 'BA  R', with args beginning with: 'x y' \r\n");
     // The connection still works.

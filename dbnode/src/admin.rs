@@ -17,7 +17,7 @@ use std::time::Instant;
 use store::parse_i64;
 
 /// The Redis version whose behaviour the node copies.
-const REDIS_VERSION: &str = "7.0.15";
+const REDIS_VERSION: &str = "8.10.2";
 
 pub(crate) const CLIENT: &[Command] = &[
     conn("client|id", 2, |_, _, client, out| {
@@ -44,6 +44,37 @@ pub(crate) const CLIENT: &[Command] = &[
         Flow::Continue
     }),
     conn("client|list", -2, client_list),
+    conn("client|setinfo", 4, |args, _, client, out| {
+        let (attr, value) = (c_str(&args[2], usize::MAX), &args[3]);
+        let dest = if attr.eq_ignore_ascii_case(b"lib-name") {
+            &client.lib_name
+        } else if attr.eq_ignore_ascii_case(b"lib-ver") {
+            &client.lib_ver
+        } else {
+            out.error_parts(&[b"ERR Unrecognized option '", attr, b"'"]);
+            return Flow::Continue;
+        };
+        // The same characters as a client name: printable ASCII, no space.
+        if !value.iter().all(|&b| (b'!'..=b'~').contains(&b)) {
+            out.error_parts(&[b"ERR ", attr, b" cannot contain spaces, newlines or special characters."]);
+            return Flow::Continue;
+        }
+        *dest.borrow_mut() = (!value.is_empty()).then(|| value.to_vec());
+        out.ok();
+        Flow::Continue
+    }),
+    conn("client|no-touch", 3, |args, _, client, out| {
+        match &args[2] {
+            on if on.eq_ignore_ascii_case(b"on") => client.no_touch.set(true),
+            off if off.eq_ignore_ascii_case(b"off") => client.no_touch.set(false),
+            _ => {
+                out.error(b"ERR syntax error");
+                return Flow::Continue;
+            }
+        }
+        out.ok();
+        Flow::Continue
+    }),
 ];
 
 pub(crate) const COMMAND: &[Command] = &[
@@ -559,7 +590,8 @@ fn info_section(section: &str, node: &Node, text: &mut String) {
             // that hasn't sampled any yet).
             if store.dbsize() > 0 {
                 let keys = store.dbsize();
-                field(text, "db0", format_args!("keys={keys},expires={},avg_ttl=0", store.expiring_len()));
+                // No hash fields expire here (`subexpiry`, Redis 8).
+                field(text, "db0", format_args!("keys={keys},expires={},avg_ttl=0,subexpiry=0", store.expiring_len()));
             }
         }
         _ => unreachable!("not in INFO_SECTIONS: {section}"),

@@ -618,9 +618,9 @@ impl Store {
     }
 
     /// `INCRBYFLOAT`: the new value, as written. In Redis's order: the
-    /// key's type, its value, then the increment; the TTL is kept. (Redis
-    /// keeps the result as an `embstr` even when it reads as an integer;
-    /// `OBJECT ENCODING` here goes by the contents.)
+    /// key's type, its value, then the increment; the TTL is kept. As in
+    /// Redis, the result is a string to `OBJECT ENCODING` (`embstr` or
+    /// `raw`) even when it reads as an integer.
     pub fn incr_by_float(&mut self, key: &[u8], incr: &[u8]) -> Result<Vec<u8>, Error> {
         let old = match self.live(key) {
             Some(e) => float::parse(e.as_str()?).ok_or(Error::NotFloat)?,
@@ -633,6 +633,7 @@ impl Store {
             Some(e) => e.set_str(&new),
             None => self.insert(key, &new, None),
         }
+        self.live(key).expect("just written").mark_float();
         self.effect(|| Effect::As(vec![b"SET".to_vec(), key.to_vec(), new.clone(), b"KEEPTTL".to_vec()]));
         Ok(new)
     }

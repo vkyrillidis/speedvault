@@ -1101,7 +1101,7 @@ fn growth_bounds_any_table_s_next_step() {
 
 #[test]
 fn encodings_are_redis_s() {
-    // Redis: OBJECT ENCODING after SET, INCR and APPEND.
+    // Redis 8.10.2: OBJECT ENCODING after SET, INCR, INCRBYFLOAT and APPEND.
     let mut s = store();
     for (value, encoding) in [
         (&b"12345"[..], "int"),
@@ -1109,12 +1109,26 @@ fn encodings_are_redis_s() {
         (b"9223372036854775808", "embstr"),
         (b"007", "embstr"),
         (b"-0", "embstr"),
-        (&[b'x'; 44], "embstr"),
+        (&[b'x'; 40], "embstr"),
+        (&[b'x'; 41], "raw"),
         (&[b'x'; 45], "raw"),
     ] {
         s.set(b"k", value, SetOptions::default()).unwrap();
         assert_eq!(s.encoding(b"k"), Some(encoding), "{value:?}");
     }
+    // The key counts: 41 bytes of key and value at most, expiry or not.
+    for (key, len, encoding) in [(&[b'k'; 10][..], 31, "embstr"), (&[b'k'; 10], 32, "raw"), (&[b'k'; 20], 21, "embstr"), (&[b'k'; 20], 22, "raw")] {
+        s.set(key, &vec![b'x'; len], ex(SetExpiry::Px(100_000))).unwrap();
+        assert_eq!(s.encoding(key), Some(encoding), "{} + {len}", key.len());
+    }
+    // A float's result is a string, whatever it reads as.
+    s.set(b"f", b"1.5", SetOptions::default()).unwrap();
+    assert_eq!(s.incr_by_float(b"f", b"1.5").unwrap(), b"3");
+    assert_eq!(s.encoding(b"f"), Some("embstr"));
+    s.incr_by_float(b"nf", b"2").unwrap();
+    assert_eq!(s.encoding(b"nf"), Some("embstr"));
+    s.set(b"f", b"4", SetOptions::default()).unwrap();
+    assert_eq!(s.encoding(b"f"), Some("int"), "a SET of the same length forgets it");
     s.incr_by(b"n", 1).unwrap();
     assert_eq!(s.encoding(b"n"), Some("int"));
     // Redis: APPEND makes it raw, whatever it holds, until a SET.
@@ -1125,7 +1139,7 @@ fn encodings_are_redis_s() {
     assert_eq!(s.encoding(b"n"), Some("int"));
     assert_eq!(s.encoding(b"nope"), None);
     put_other(&mut s, b"l");
-    assert_eq!(s.encoding(b"l"), Some("quicklist"));
+    assert_eq!(s.encoding(b"l"), Some("listpack"));
 }
 
 /// The recorded effects as text, one command per string.

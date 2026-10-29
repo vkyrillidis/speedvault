@@ -291,30 +291,19 @@ mod tests {
         for m in &members[..500] {
             assert!(seen.contains(m), "{m:?} missed");
         }
-        // A small set of strings: packed, but a hashtable to Redis 7.0.15,
-        // so scanned a few at a time. Its removals shift the members after
-        // the hole down, which the walk from the end allows too.
+        // A small set of strings: a listpack, which Redis returns whole
+        // with cursor 0, in its order, whatever the count.
         let small: Vec<Vec<u8>> = (0..100).map(|n| format!("p{n}").into_bytes()).collect();
         let refs: Vec<&[u8]> = small.iter().map(|m| &m[..]).collect();
         s.sadd(b"p", &refs).unwrap();
+        assert_eq!(s.encoding(b"p"), Some("listpack"));
+        assert_eq!(s.sscan(b"p", 0, 3, None).unwrap(), (0, small.clone()));
+        // Past 128 members it's a hashtable, walked a few at a time.
+        let more: Vec<Vec<u8>> = (100..200).map(|n| format!("p{n}").into_bytes()).collect();
+        s.sadd(b"p", &more.iter().map(|m| &m[..]).collect::<Vec<_>>()).unwrap();
         assert_eq!(s.encoding(b"p"), Some("hashtable"));
-        let (mut cursor, mut seen, mut round) = (0, HashSet::new(), 0);
-        loop {
-            let (next, got) = s.sscan(b"p", cursor, 3, None).unwrap();
-            seen.extend(got);
-            if next == 0 {
-                break;
-            }
-            let gone = format!("p{}", 50 + (round * 13) % 50).into_bytes();
-            s.srem(b"p", &[&gone]).unwrap();
-            s.sadd(b"p", &[format!("q{round}").as_bytes()]).unwrap();
-            round += 1;
-            cursor = next;
-        }
-        assert!(round > 10);
-        for m in &small[..50] {
-            assert!(seen.contains(m), "{m:?} missed");
-        }
+        let (next, got) = s.sscan(b"p", 0, 3, None).unwrap();
+        assert!(next != 0 && got.len() < 10, "{next} {}", got.len());
         // A big hash, the same way, without changes.
         let pairs: Vec<&[u8]> = members.iter().flat_map(|m| [&m[..], b"v"]).collect();
         s.hset(b"h", &pairs).unwrap();

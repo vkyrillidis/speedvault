@@ -149,9 +149,8 @@ pub(super) fn lpos(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {
         if opt.eq_ignore_ascii_case(b"rank") {
             match n {
                 None => return error(store::Error::NotInteger.to_string().as_bytes(), out),
-                // Redis 7.0.15 negates it (overflowing, still negative),
-                // so every match from the tail qualifies: as -1.
-                Some(i64::MIN) => opts.rank = -1,
+                // It must be negated: out of range (Redis 7.0 overflowed).
+                Some(i64::MIN) => return error(b"ERR value is out of range, value must between -9223372036854775807 and 9223372036854775807", out),
                 Some(0) => return error(b"ERR RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list", out),
                 Some(r) => opts.rank = r,
             }

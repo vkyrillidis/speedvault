@@ -205,7 +205,7 @@ fn hello(args: &Args, client: u64, out: &mut Encoder) {
     }
     let proto = if out.protocol() == Protocol::Resp3 { 3 } else { 2 };
     out.map(7);
-    for (key, value) in [("server", "redis"), ("version", "7.0.15")] {
+    for (key, value) in [("server", "redis"), ("version", "8.10.2")] {
         out.bulk(key.as_bytes());
         out.bulk(value.as_bytes());
     }
@@ -226,7 +226,7 @@ fn info(stuart: &Stuart, out: &mut Encoder) {
     let state = stuart.state.borrow();
     let epoch = state.table().map_or(0, |t| t.epoch());
     let text = format!(
-        "# Server\r\nredis_version:7.0.15\r\nstuart_version:{}\r\nredis_mode:cluster\r\nprocess_id:{}\r\ntcp_port:{}\r\n\
+        "# Server\r\nredis_version:8.10.2\r\nstuart_version:{}\r\nredis_mode:cluster\r\nprocess_id:{}\r\ntcp_port:{}\r\n\
          uptime_in_seconds:{uptime}\r\n\r\n# Cluster\r\ncluster_enabled:1\r\nstuart_nodes:{}\r\nstuart_keepers:{}\r\n\
          stuart_table_epoch:{epoch}\r\nstuart_auto:{}\r\nstuart_leaving:{}\r\nstuart_full:{}\r\n",
         env!("CARGO_PKG_VERSION"),

@@ -222,11 +222,14 @@ def scan_sorted(pairs: bool = False):
     return f
 
 
-HELLO_MASK = {b"server", b"version", b"id"}
+# `modules` too: Redis 8 lists its built-in ones (vectorset; the official
+# images add JSON, search, time series and bloom), we have none.
+HELLO_MASK = {b"server", b"version", b"id", b"modules"}
 
 
 def mask_hello(b: bytes) -> bytes:
-    """HELLO reply (RESP2 flat array or RESP3 map): mask server/version/id."""
+    """HELLO reply (RESP2 flat array or RESP3 map): mask server/version/id
+    and the modules."""
     try:
         r = _parse1(b)
     except Exception:
