@@ -1,0 +1,7 @@
+== memory beyond the payload just after doubling (n = 2^19 + 1, 8-byte elements)
+hash n=524288: 41.0 B an element, 25.0 beyond the payload
+set n=524288: 40.0 B an element, 32.0 beyond the payload
+hash n=524289: 56.0 B an element, 40.0 beyond the payload
+set n=524289: 56.0 B an element, 48.0 beyond the payload
+hash n=1000000: 40.8 B an element, 24.8 beyond the payload
+set n=1000000: 40.8 B an element, 32.8 beyond the payload

@@ -26,8 +26,8 @@
 #
 # Redis gets the base port + 1..3, stuart + 10, our nodes + 11..13; with
 # replicas, Redis + 21..26, stuart + 30, our nodes + 31..36. Needs
-# redis-server and redis-cli 7.0.15 (REDIS_SERVER, REDIS_CLI to choose
-# others), redis-benchmark, and redis-py (pip, or REDIS_PY_PATH: a directory
+# redis-server and redis-cli 8.10.2 (tools/compat/build_redis.sh builds
+# them; REDIS_SERVER, REDIS_CLI to choose others), redis-benchmark, and redis-py (pip, or REDIS_PY_PATH: a directory
 # holding the package, default ~/venvs/redis-py/site). CARGO_TARGET_DIR
 # defaults to ~/target/speedvault.
 set -euo pipefail

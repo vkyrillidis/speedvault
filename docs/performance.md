@@ -14,7 +14,7 @@
 | `sleep(0)`: arm, one loop turn, fire       | 160 ns       |
 | Timer with 10k fibers sleeping at once     | 190 ns       |
 
-`redis-benchmark` against the dbnode on a Ryzen 9800X3D (WSL2, 2026-10-17,, `tools/bench/full_run.sh --also redis-8.10.2=... --also
+`redis-benchmark` against the dbnode on a Ryzen 9800X3D (WSL2, 2026-10-17, `tools/bench/full_run.sh --also redis-8.10.2=... --also
 valkey-9.1.2=...`, results in `tools/bench/results/2026-10-17-ef94116/`;
 `-n 1000000 -c 50 -d 3`, one redis-benchmark 7.0.15 client thread on CPUs
 4-7, each server pinned to CPU 2, Redis 8 and Valkey with their default

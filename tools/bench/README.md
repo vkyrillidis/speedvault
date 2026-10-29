@@ -315,6 +315,23 @@ the host clock: `w32tm /resync /force` in an elevated prompt.
 
 ## Results
 
+Each directory is named `<date>-<commit>`; the commits are those of the
+history before the first public release, which isn't published, so they
+only tell runs apart.
+
+- `results/2026-10-29-b0fb6a1/`: memory per key and the stalls while 10M
+  keys are written (`memory_bench.sh`, `stall_bench.sh`), against Redis
+  7.0.15, 8.10.2 and Valkey 9.1.2.
+- `results/2026-10-25-065658f/` and `results/2026-10-26-5f992a6/`
+  (`handover_bench.sh`): a primary's SIGTERM handover, and a scale-down
+  demoting a primary.
+- `results/2026-10-25-0e7045b/` and `results/2026-10-25-0b36234/`
+  (`migrate_bench.sh`): slots moved by snapshot against phase 5's key by
+  key, before and after the fixes they led to.
+- `results/2026-10-23-sync/`: a replica's sync against Redis 7.0.15.
+- `results/2026-10-23-step4/`: large hashes and sets, one heap block an
+  entry, against the commit before and Redis 7.0.15 (`raw/`: the scripts
+  and their output).
 - `results/2026-10-27-d114045/` (throughput with a replica, standalone
   and cluster mode; sync and the 1 s cut), `results/2026-10-27-4103e02/`
   (failover) and `results/2026-10-27-ea5d41b/` (memory): phase 8

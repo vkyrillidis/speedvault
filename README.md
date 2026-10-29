@@ -5,12 +5,15 @@ itself on Kubernetes**: a HorizontalPodAutoscaler adds and removes nodes,
 and their keys move between them while clients keep reading and writing.
 
 - **Redis-compatible.** It speaks RESP2 and RESP3 and the Redis Cluster
-  protocol, with Redis 7's replies and error texts byte for byte. Stock
-  clients work unchanged: `redis-cli`, `redis-benchmark`, redis-py, Lettuce,
-  and any Redis Cluster client.
-- **Faster than Redis on one core**: 1.4–1.5× Redis 7.0.15 without
-  pipelining and up to 2.9× with it on strings, 1.2–1.6× on hashes, sets and
-  lists ([performance](docs/performance.md)).
+  protocol, with Redis 8.10.2's replies and error texts byte for byte
+  (checked by a differential test against a real Redis). Stock clients work
+  unchanged: `redis-cli`, `redis-benchmark`, redis-py, Lettuce, and any
+  Redis Cluster client. See [compatibility](#compatibility-with-redis) for
+  what's there and what isn't yet.
+- **Faster than Redis on one core**: against Redis 8.10.2, 1.3–1.4× on
+  strings without pipelining and 1.3–2.7× at `-P 16`; 1.2–1.4× and 1.4–1.9×
+  on hashes, sets and lists; ahead of Valkey 9.1.2 by as much or more
+  ([performance](docs/performance.md)).
 - **Replicas and failover**: a replica per primary, synced without a fork;
   a primary that dies is replaced by its replica within seconds, fenced so
   that the two never both take writes; `WAIT` for writes that must survive.
@@ -28,6 +31,12 @@ and their keys move between them while clients keep reading and writing.
 
 Redis-compatible stores today need someone to reshard them, and stores that
 rebalance themselves don't speak Redis. SpeedVault does both.
+
+**A good fit** for a cache or session store, counters, queues on lists, or
+any data set that has to grow and shrink with its load, where the data can
+live in memory and survive as replicas rather than on disk. **Not a fit
+(yet)** if you need sorted sets, pub/sub, Lua scripts or TLS, or the data
+must outlive every copy of it in memory: there are no RDB or AOF files.
 
 ## Quick start
 
@@ -60,14 +69,50 @@ kubectl -n db scale statefulset speedvault --replicas 5
 See [running a cluster](docs/cluster.md) and [Kubernetes](docs/kubernetes.md)
 (autoscaling with the HPA included).
 
-## What it supports
+With a password (a file, so that it stays out of `ps`; clients log in as
+with Redis):
+
+```sh
+target/release/speedvault-server 7000 --requirepass-file /run/secrets/speedvault
+REDISCLI_AUTH="$(cat /run/secrets/speedvault)" redis-cli -p 7000 PING
+```
+
+From code, use any Redis client: redis-py's `redis.Redis(port=7000)`, or
+`redis.cluster.RedisCluster(host="node1", port=7001)` for a cluster.
+
+## Compatibility with Redis
+
+| Redis feature | SpeedVault |
+|---------------|------------|
+| RESP2, RESP3 (`HELLO`), inline commands, pipelining | Yes |
+| Strings, integers, floats | Yes; not yet `GETRANGE SETRANGE GETEX GETSET SETEX PSETEX MSETNX` |
+| Keys and expiry | Yes; not yet `RENAME UNLINK COPY TOUCH RANDOMKEY` |
+| Hashes, sets, lists | Yes, packed as Redis packs them; not yet blocking pops (`BLPOP`...), hash field expiry (`HEXPIRE`...) |
+| Sorted sets, streams, bitmaps, HyperLogLog, geo | Not yet |
+| Transactions (`MULTI EXEC WATCH`) | Yes |
+| Pub/sub, scripting (`EVAL`, functions) | Not yet |
+| `requirepass` and `AUTH` | Yes; ACL users not yet |
+| TLS | Not yet |
+| Redis Cluster protocol (redirects, `CLUSTER SLOTS SHARDS NODES`) | Yes; the layout is stuart's: no `CLUSTER ADDSLOTS MEET FAILOVER`, `redis-cli --cluster` |
+| Replicas, `WAIT`, reads from replicas | Yes, paired by stuart; no `REPLICAOF` |
+| Persistence (RDB, AOF) | No, by design: replicas keep the data |
+| Eviction | `noeviction` only (`--maxmemory`) |
+| Databases | 0 only |
+| Modules (JSON, search, vector sets) | No |
+
+A differential test suite (`tools/compat`) sends the same requests to
+SpeedVault and to Redis 8.10.2 and compares the replies byte for byte; it
+also lists the few deliberate differences.
+
+### Commands
 
 - **Strings and integers:** `GET SET` (with `EX PX EXAT PXAT NX XX KEEPTTL
   GET IFEQ IFNE IFDEQ IFDNE`) `MGET MSET MSETEX SETNX GETDEL DELEX DIGEST
   APPEND STRLEN INCR DECR INCRBY DECRBY INCRBYFLOAT INCREX` (floats in
   Redis's 80-bit `long double`, digit for digit).
 - **Keys:** `DEL EXISTS TYPE EXPIRE PEXPIRE EXPIREAT PEXPIREAT TTL PTTL
-  PERSIST SCAN KEYS DBSIZE FLUSHDB FLUSHALL`, `OBJECT ENCODING`.
+  EXPIRETIME PEXPIRETIME PERSIST SCAN KEYS DBSIZE FLUSHDB FLUSHALL`,
+  `OBJECT ENCODING`.
 - **Hashes:** `HSET HMSET HSETNX HGET HMGET HDEL HEXISTS HLEN HSTRLEN HKEYS
   HVALS HGETALL HINCRBY HINCRBYFLOAT HRANDFIELD HSCAN`.
 - **Sets:** `SADD SREM SISMEMBER SMISMEMBER SCARD SMEMBERS SPOP SRANDMEMBER
@@ -93,14 +138,10 @@ See [running a cluster](docs/cluster.md) and [Kubernetes](docs/kubernetes.md)
 - **Replication:** `WAIT`, `ROLE`, `INFO replication`, reads from replicas
   after `READONLY`; replicas listed in `CLUSTER SLOTS SHARDS NODES`.
 - **Memory:** `--maxmemory` with Redis's `noeviction` (`-OOM` on writes past
-  it). Small hashes, sets and lists are packed as Redis packs them.
+  it).
 
-Not yet: TLS, ACL users, sorted sets, blocking list commands, pub/sub, scripting, eviction policies other than
-`noeviction`, and databases other than 0. There is no persistence (RDB or
-AOF) by design: replicas keep the data, and a pod stopping hands over to
-its replica first. Replies are checked against Redis
-8.10.2 by a differential test suite (`tools/compat`), which also lists the
-few deliberate differences.
+There is no persistence by design: replicas keep the data, and a pod
+stopping hands over to its replica first.
 
 ## How it works
 
@@ -128,7 +169,7 @@ the writes made meanwhile, so nothing forks and nothing stops serving. See
 - [Running a cluster](docs/cluster.md): stuart, nodes joining and leaving, moving slots, clients.
 - [Kubernetes](docs/kubernetes.md): the manifests, replicas, autoscaling, what happens on scale-down and on a lost machine.
 - [Architecture](docs/architecture.md): each crate and the node's and stuart's options.
-- [Performance](docs/performance.md): benchmarks against Redis 7.0.15, Redis 8 and Valkey 9, memory.
+- [Performance](docs/performance.md): benchmarks against Redis 7.0.15, Redis 8.10.2 and Valkey 9.1.2, memory.
 - [Design notes](docs/design/): the decisions behind each part.
 - [Compatibility tools](tools/compat/README.md) and [benchmarks](tools/bench/README.md).
 

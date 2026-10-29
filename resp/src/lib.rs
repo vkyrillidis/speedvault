@@ -33,9 +33,10 @@
 //! assert_eq!(start, 26); // "*1\r\n$4\r\nPI" waits for the rest
 //! ```
 //!
-//! Behaviour, error texts and limits follow Redis 7.0 (`networking.c`:
+//! Behaviour, error texts and limits follow Redis (`networking.c`:
 //! `processMultibulkBuffer`, `processInlineBuffer`; `sds.c`: `sdssplitargs`)
-//! and were checked against a Redis 7.0.15 server byte for byte.
+//! and are checked against a Redis 8.10.2 server byte for byte
+//! (`tools/compat/difftest.py`; Redis 7.0.15 before it).
 
 mod encode;
 mod parse;

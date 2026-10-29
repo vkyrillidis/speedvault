@@ -14,9 +14,9 @@
 # The Redis nodes run with cluster-require-full-coverage no, the behaviour
 # our node copies: an unassigned slot is "not served", the others carry on.
 #
-# REDIS_SERVER / REDIS_CLI pick other binaries (default: the ones on PATH,
-# Redis 7.0.15, whose replies the crate copies). CARGO_TARGET_DIR defaults
-# to ~/target/speedvault.
+# REDIS_SERVER / REDIS_CLI pick other binaries (default: the ones on PATH;
+# Redis 8.10.2, whose replies the crate copies: tools/compat/build_redis.sh
+# builds it). CARGO_TARGET_DIR defaults to ~/target/speedvault.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
