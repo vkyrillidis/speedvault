@@ -12,11 +12,21 @@
 # and its commands time out. Redis Cluster on Kubernetes announces pod
 # addresses too.
 #
-# A node drains on SIGTERM (a scale-down, a rolling update, an eviction,
-# `kubectl delete pod`): its slots move to the others while it serves on,
-# then it exits. With no persistence that's the only way a pod can stop
-# without losing keys, so the grace period is longer than the drain may
-# take (--drain-timeout, 600 s by default), and pods stop one at a time.
+# stuart makes half the pods replicas (`stuart --replicas 1`): six pods
+# are three primaries, each with a replica on another machine where it can
+# (a node's zone is its Kubernetes node: --zone). A replica serves nothing
+# but holds a copy of its primary's keys; a primary lost (its pod killed,
+# its machine gone) is replaced by its replica within seconds, losing at
+# most the writes it hadn't passed on. Add and remove pods in pairs.
+#
+# On SIGTERM (a scale-down, a rolling update, an eviction, `kubectl delete
+# pod`) a primary hands its slots to its replica, its writes waiting a few
+# milliseconds, and exits; no key moves. A replica just exits. A primary
+# without a replica to take over (none, or one still syncing after a
+# minute) drains instead: its slots move to the others while it serves on.
+# The grace period is longer than such a drain may take (--drain-timeout,
+# 600 s by default), and pods stop one at a time, each next one only once
+# the last is back and synced (ready).
 
 # Headless: the StatefulSet's Service, a DNS name per pod (for people:
 # clients and stuart use the pods' addresses), published before the pod is
@@ -65,7 +75,8 @@ metadata:
   name: speedvault
 spec:
   serviceName: speedvault
-  replicas: 3
+  # Three primaries and their replicas.
+  replicas: 6
   # One pod at a time, so a scale-down drains one node after another.
   podManagementPolicy: OrderedReady
   selector:
@@ -79,8 +90,9 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9121"
     spec:
-      # Longer than --drain-timeout: the node exits by itself (status 1 if
-      # it ran out of time) before Kubernetes kills it.
+      # Longer than --drain-timeout and --leave-linger: the node exits by
+      # itself (status 1 if it ran out of time) before Kubernetes kills it.
+      # A handover takes milliseconds; this is for a primary that drains.
       terminationGracePeriodSeconds: 660
       securityContext:
         runAsNonRoot: true
@@ -88,15 +100,18 @@ spec:
         runAsGroup: 10001
         seccompProfile:
           type: RuntimeDefault
-      affinity:
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                topologyKey: kubernetes.io/hostname
-                labelSelector:
-                  matchLabels:
-                    app.kubernetes.io/name: speedvault
+      # The pods spread over the machines, as evenly as they can, so that
+      # stuart can pair each primary with a replica on another (stuart
+      # pairs them as they join, by --zone). Not required: on fewer
+      # machines than pods they share, and a replica may share its
+      # primary's machine.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: speedvault
       containers:
         - name: node
           image: speedvault
@@ -113,6 +128,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            # The machine: stuart puts a replica on another than its
+            # primary's.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           args:
             - "7000"
             - --cluster
@@ -122,6 +143,8 @@ spec:
             - stuart.$(POD_NAMESPACE).svc:7600
             - --name
             - $(POD_NAME)
+            - --zone
+            - $(NODE_NAME)
             - --drain-timeout
             - "600"
             # Of the container's memory limit; the rest is the allocator's
@@ -136,7 +159,8 @@ spec:
               containerPort: 7000
             - name: metrics
               containerPort: 9121
-          # Ready once stuart took its join, until it starts leaving.
+          # Ready once stuart took its join (and, a replica, once synced
+          # with its primary), until it starts leaving.
           readinessProbe:
             httpGet:
               path: /ready

@@ -1,5 +1,5 @@
 //! `dbnode [PORT | HOST:PORT] [--timeout SECONDS] [--busy-poll USEC] [--loglevel LEVEL]
-//! [--maxmemory BYTES | N%] [--metrics PORT | HOST:PORT] [--cluster [--announce HOST:PORT] [--stuart HOST:PORT [--name NAME] [--drain-timeout SECONDS] [--leave-linger SECONDS]]
+//! [--maxmemory BYTES | N%] [--metrics PORT | HOST:PORT] [--cluster [--announce HOST:PORT] [--stuart HOST:PORT [--name NAME] [--zone ZONE] [--drain-timeout SECONDS] [--leave-linger SECONDS]]
 //! [--migrate-batch KEYS] [--migrate-pause USEC] [--migrate-chunk ELEMENTS]]`: serves on 127.0.0.1:7000 by default.
 //! Exits on SIGTERM or SIGINT; with `--stuart`, the first SIGTERM leaves the cluster first.
 
@@ -20,7 +20,7 @@ const DEFAULT_ADDR: &str = "127.0.0.1:7000";
 const DEFAULT_BUSY_POLL: Duration = Duration::from_micros(20);
 const USAGE: &str = "usage: dbnode [PORT | HOST:PORT] [--timeout SECONDS] [--busy-poll USEC] [--loglevel LEVEL]
               [--maxmemory BYTES | N%] [--metrics PORT | HOST:PORT]
-              [--cluster [--announce HOST:PORT] [--stuart HOST:PORT [--name NAME] [--drain-timeout SECONDS] [--leave-linger SECONDS]]
+              [--cluster [--announce HOST:PORT] [--stuart HOST:PORT [--name NAME] [--zone ZONE] [--drain-timeout SECONDS] [--leave-linger SECONDS]]
                          [--migrate-batch KEYS] [--migrate-pause USEC] [--migrate-chunk ELEMENTS]]
   PORT | HOST:PORT    where to listen (default 127.0.0.1:7000; a bare port listens on all interfaces)
   --timeout SECONDS   close connections idle this long (default 0: never), like Redis's timeout
@@ -42,15 +42,17 @@ const USAGE: &str = "usage: dbnode [PORT | HOST:PORT] [--timeout SECONDS] [--bus
   --name NAME         with --stuart: a name that stays when the node restarts at another address
                       (a pod's name, announcing its pod's address); stuart takes a node joining
                       with the name of another as its replacement, as one at its address
+  --zone ZONE         with --stuart: the machine the node runs on (a Kubernetes node's name);
+                      stuart puts a replica on another zone than its primary where it can
   --drain-timeout SECONDS  after that SIGTERM, exit anyway after this long (default 600)
   --leave-linger SECONDS  once it has left, redirect clients this long before exiting, so that
                       they learn where its slots went (default 10; 0: exit at once)
-  --migrate-batch KEYS  keys sent per batch when a slot moves to another node (default 100;
-                      a batch also stops at 1 MiB of values)
-  --migrate-pause USEC  pause after a batch if clients were served meanwhile (default 50;
+  --migrate-batch KEYS  keys per batch of a slot's copy when it moves to another node
+                      (default 100; a batch also stops at 1 MiB of values)
+  --migrate-pause USEC  pause after such a batch if clients were served meanwhile (default 50;
                       0: only let the waiting clients run)
   --migrate-chunk ELEMENTS  elements per batch (a string is one); a larger hash, set or list
-                      moves in parts of this many, hidden at the target until whole (default 4096)
+                      goes in parts of this many (default 4096)
   --help, --version";
 
 /// What the command line asks for (made once: its size doesn't matter).
@@ -65,6 +67,7 @@ enum Command {
         cluster: Option<Announce>,
         stuart: Option<String>,
         name: Option<String>,
+        zone: Option<String>,
         migrate: Migrate,
         drain_timeout: Duration,
         leave_linger: Duration,
@@ -78,9 +81,9 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    let (addr, timeout, busy_poll, level, cluster, stuart, name, migrate, drain_timeout, leave_linger, maxmemory, metrics) = match parse_args(std::env::args().skip(1)) {
-        Some(Command::Serve { addr, timeout, busy_poll, level, cluster, stuart, name, migrate, drain_timeout, leave_linger, maxmemory, metrics }) => {
-            (addr, timeout, busy_poll, level, cluster, stuart, name, migrate, drain_timeout, leave_linger, maxmemory, metrics)
+    let (addr, timeout, busy_poll, level, cluster, stuart, name, zone, migrate, drain_timeout, leave_linger, maxmemory, metrics) = match parse_args(std::env::args().skip(1)) {
+        Some(Command::Serve { addr, timeout, busy_poll, level, cluster, stuart, name, zone, migrate, drain_timeout, leave_linger, maxmemory, metrics }) => {
+            (addr, timeout, busy_poll, level, cluster, stuart, name, zone, migrate, drain_timeout, leave_linger, maxmemory, metrics)
         }
         Some(Command::Help) => {
             println!("{USAGE}");
@@ -133,7 +136,7 @@ fn main() -> ExitCode {
         std::process::id(),
         busy_poll.as_micros()
     );
-    let error = dbnode::serve(listener, metrics, Config { idle_timeout: timeout, busy_poll, cluster, stuart, name, migrate, drain_timeout, leave_linger: Some(leave_linger), maxmemory });
+    let error = dbnode::serve(listener, metrics, Config { idle_timeout: timeout, busy_poll, cluster, stuart, name, zone, migrate, drain_timeout, leave_linger: Some(leave_linger), maxmemory });
     warning!("Server stopped: {}", error.err().map_or("no error".to_string(), |e| e.to_string()));
     ExitCode::FAILURE
 }
@@ -141,7 +144,7 @@ fn main() -> ExitCode {
 fn parse_args(mut args: impl Iterator<Item = String>) -> Option<Command> {
     let mut addr = None;
     let (mut timeout, mut busy_poll, mut level) = (None, DEFAULT_BUSY_POLL, Level::Notice);
-    let (mut cluster, mut announce, mut stuart, mut name) = (false, None, None, None);
+    let (mut cluster, mut announce, mut stuart, mut name, mut zone) = (false, None, None, None, None);
     let (mut migrate, mut drain_timeout, mut leave_linger, mut maxmemory, mut metrics) = (Migrate::default(), None, None, Limit::Bytes(0), None);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -155,6 +158,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Option<Command> {
             // Resolved by the join thread, on every try.
             "--stuart" => stuart = Some(args.next().filter(|s| parse_announce(s).is_some())?),
             "--name" => name = Some(args.next().filter(|n| valid_name(n))?),
+            "--zone" => zone = Some(args.next().filter(|z| valid_name(z))?),
             "--migrate-batch" => migrate.batch = args.next()?.parse().ok().filter(|&n| n > 0)?,
             "--migrate-pause" => migrate.pause = Duration::from_micros(args.next()?.parse().ok()?),
             "--migrate-chunk" => migrate.chunk = args.next()?.parse().ok().filter(|&n| n > 0)?,
@@ -176,6 +180,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Option<Command> {
     if name.is_some() && stuart.is_none() {
         return Some(Command::Invalid("--name needs --stuart"));
     }
+    if zone.is_some() && stuart.is_none() {
+        return Some(Command::Invalid("--zone needs --stuart"));
+    }
     if leave_linger.is_some() && stuart.is_none() {
         return Some(Command::Invalid("--leave-linger needs --stuart"));
     }
@@ -190,7 +197,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Option<Command> {
         }
         (true, None) => Some(Announce { host: addr.ip().to_string(), port: addr.port() }),
     };
-    Some(Command::Serve { addr, timeout, busy_poll, level, cluster, stuart, name, migrate, drain_timeout, leave_linger, maxmemory, metrics })
+    Some(Command::Serve { addr, timeout, busy_poll, level, cluster, stuart, name, zone, migrate, drain_timeout, leave_linger, maxmemory, metrics })
 }
 
 /// `host:port`, or `[v6 address]:port`; a host that `CLUSTER NODES` can
@@ -222,7 +229,7 @@ mod tests {
     fn serve(addr: &str, timeout: Option<u64>, level: Level) -> Option<Command> {
         let timeout = timeout.map(Duration::from_secs);
         let addr = addr.parse().unwrap();
-        Some(Command::Serve { addr, timeout, busy_poll: DEFAULT_BUSY_POLL, level, cluster: None, stuart: None, name: None, migrate: Migrate::default(), drain_timeout: DRAIN_TIMEOUT, leave_linger: LEAVE_LINGER, maxmemory: Limit::Bytes(0), metrics: None })
+        Some(Command::Serve { addr, timeout, busy_poll: DEFAULT_BUSY_POLL, level, cluster: None, stuart: None, name: None, zone: None, migrate: Migrate::default(), drain_timeout: DRAIN_TIMEOUT, leave_linger: LEAVE_LINGER, maxmemory: Limit::Bytes(0), metrics: None })
     }
 
     fn announced(args: &[&str]) -> Option<Announce> {
@@ -280,6 +287,16 @@ mod tests {
         assert_eq!(parse(&["--cluster", "--stuart", "10.0.0.1:7600", "--name", "a b"]), None);
         assert_eq!(parse(&["--cluster", "--stuart", "10.0.0.1:7600", "--name", ""]), None);
         assert_eq!(parse(&["--cluster", "--name", "x"]), Some(Command::Invalid("--name needs --stuart")));
+
+        let zone = |args: &[&str]| match parse(args) {
+            Some(Command::Serve { zone, .. }) => zone,
+            other => panic!("{args:?}: {other:?}"),
+        };
+        assert_eq!(zone(&["--cluster", "--stuart", "10.0.0.1:7600"]), None);
+        assert_eq!(zone(&["--cluster", "--stuart", "10.0.0.1:7600", "--zone", "kind-worker2"]), Some("kind-worker2".into()));
+        assert_eq!(parse(&["--cluster", "--stuart", "10.0.0.1:7600", "--zone", "a b"]), None);
+        assert_eq!(parse(&["--cluster", "--stuart", "10.0.0.1:7600", "--zone"]), None);
+        assert_eq!(parse(&["--cluster", "--zone", "x"]), Some(Command::Invalid("--zone needs --stuart")));
 
         let migrate = |args: &[&str]| match parse(args) {
             Some(Command::Serve { migrate, .. }) => migrate,

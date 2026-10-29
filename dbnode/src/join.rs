@@ -1,5 +1,5 @@
 //! Joining stuart (`--stuart HOST:PORT`): a thread of its own sends
-//! `STUART JOIN id host port [NAME name]` once a second until stuart
+//! `STUART JOIN id host port [NAME name] [ZONE zone]` once a second until stuart
 //! acknowledges it. It uses blocking sockets and resolves stuart's name again on every try
 //! (a Kubernetes Service may not resolve yet when the pod starts), so
 //! neither a slow DNS nor an absent stuart holds up the reactor: the node
@@ -80,14 +80,24 @@ impl Stuart {
 }
 
 /// Starts joining `stuart` in the background; `joined` is set once it has.
-pub(crate) fn spawn(stuart: Arc<Stuart>, id: NodeId, announce: Announce, name: Option<String>, joined: Arc<AtomicBool>) -> io::Result<()> {
-    thread::Builder::new().name("join".into()).spawn(move || join(&stuart, &id, &announce, name.as_deref(), &joined)).map(drop)
+pub(crate) fn spawn(
+    stuart: Arc<Stuart>,
+    id: NodeId,
+    announce: Announce,
+    name: Option<String>,
+    zone: Option<String>,
+    joined: Arc<AtomicBool>,
+) -> io::Result<()> {
+    thread::Builder::new()
+        .name("join".into())
+        .spawn(move || join(&stuart, &id, &announce, name.as_deref(), zone.as_deref(), &joined))
+        .map(drop)
 }
 
-fn join(stuart: &Stuart, id: &NodeId, announce: &Announce, name: Option<&str>, joined: &AtomicBool) {
+fn join(stuart: &Stuart, id: &NodeId, announce: &Announce, name: Option<&str>, zone: Option<&str>, joined: &AtomicBool) {
     let mut failures = 0u64;
     loop {
-        match join_once(stuart, id, announce, name) {
+        match join_once(stuart, id, announce, name, zone) {
             Ok(()) => {
                 joined.store(true, Ordering::Relaxed);
                 notice!("Joined stuart at {}", stuart.addr);
@@ -105,11 +115,14 @@ fn join(stuart: &Stuart, id: &NodeId, announce: &Announce, name: Option<&str>, j
     }
 }
 
-fn join_once(stuart: &Stuart, id: &NodeId, announce: &Announce, name: Option<&str>) -> io::Result<()> {
+fn join_once(stuart: &Stuart, id: &NodeId, announce: &Announce, name: Option<&str>, zone: Option<&str>) -> io::Result<()> {
     let port = announce.port.to_string();
     let mut args: Vec<&[u8]> = vec![b"STUART", b"JOIN", id.as_bytes(), announce.host.as_bytes(), port.as_bytes()];
     if let Some(name) = name {
         args.extend([b"NAME".as_slice(), name.as_bytes()]);
+    }
+    if let Some(zone) = zone {
+        args.extend([b"ZONE".as_slice(), zone.as_bytes()]);
     }
     let reply = stuart.call(&args)?;
     match reply.as_bytes().first() {

@@ -128,6 +128,18 @@ pub enum TableError {
     MigrationToOwner(u16),
     /// Two migrations of one slot.
     DuplicateMigration(u16),
+    /// A node listed as a replica twice.
+    DuplicateReplica(NodeId),
+    /// A replica of itself.
+    ReplicaOfItself(NodeId),
+    /// A replica of a node that is a replica too: replicas don't chain.
+    ReplicaOfReplica(NodeId),
+    /// A replica owning slots: only primaries serve them.
+    ReplicaOwnsSlots(NodeId),
+    /// A slot migrating to a replica.
+    ReplicaMigrates(u16),
+    /// A node marked failed twice.
+    DuplicateFailed(NodeId),
 }
 
 impl fmt::Display for TableError {
@@ -145,6 +157,12 @@ impl fmt::Display for TableError {
             TableError::NotTheOwner(slot) => write!(f, "slot {slot} can only migrate from its owner"),
             TableError::MigrationToOwner(slot) => write!(f, "slot {slot} migrates to its owner"),
             TableError::DuplicateMigration(slot) => write!(f, "slot {slot} migrates twice"),
+            TableError::DuplicateReplica(id) => write!(f, "node {id} is listed as a replica twice"),
+            TableError::ReplicaOfItself(id) => write!(f, "node {id} is a replica of itself"),
+            TableError::ReplicaOfReplica(id) => write!(f, "node {id} is a replica of a replica"),
+            TableError::ReplicaOwnsSlots(id) => write!(f, "replica {id} owns slots"),
+            TableError::ReplicaMigrates(slot) => write!(f, "slot {slot} migrates to a replica"),
+            TableError::DuplicateFailed(id) => write!(f, "node {id} is marked failed twice"),
         }
     }
 }
@@ -154,21 +172,36 @@ impl std::error::Error for TableError {}
 /// `owner` entry of a slot no node owns.
 const UNASSIGNED: u16 = u16::MAX;
 
-/// A slot on its way from the node that owns it to another (phase 5), as
-/// Redis's `CLUSTER SETSLOT slot MIGRATING` on `from` and `IMPORTING` on
-/// `to` put it: `from` still owns the slot and serves the keys it has,
-/// redirecting the others to `to` with `-ASK`. The nodes are indexes into
-/// [`SlotTable::nodes`].
+/// A slot on its way from the node that owns it to another. The nodes are
+/// indexes into [`SlotTable::nodes`]. Two ways:
+/// - key by key (phase 5), as Redis's `CLUSTER SETSLOT slot MIGRATING` on
+///   `from` and `IMPORTING` on `to` put it: `from` still owns the slot and
+///   serves the keys it has, redirecting the others to `to` with `-ASK`;
+/// - by snapshot (phase 8, `snapshot`), as Valkey 9's and Redis 8.4's
+///   atomic slot migration: `to` copies the slot from `from`, which owns it
+///   and serves all of it meanwhile; `to` serves none of it (`-MOVED` to
+///   `from`) until a table gives it the slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Migration {
     pub slot: u16,
     pub from: usize,
     pub to: usize,
+    pub snapshot: bool,
+}
+
+/// A node that copies another (phase 8), as indexes into
+/// [`SlotTable::nodes`]. A replica owns no slots; clients may read its
+/// primary's slots from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Replica {
+    pub replica: usize,
+    pub primary: usize,
 }
 
 /// The cluster's layout: its nodes, in a fixed order (the order of
-/// `CLUSTER SHARDS` and `NODES`), the owner of every slot, and the slots
-/// being moved.
+/// `CLUSTER SHARDS` and `NODES`), the owner of every slot, the slots
+/// being moved, which nodes are replicas of which, and which are marked
+/// failed.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SlotTable {
     epoch: u64,
@@ -177,6 +210,13 @@ pub struct SlotTable {
     owner: Box<[u16; SLOTS]>,
     /// By slot; usually empty, and a few at most.
     migrations: Vec<Migration>,
+    /// In the order given: a primary's replicas are listed (`CLUSTER
+    /// SLOTS`, `SHARDS`) in this order, as Redis lists them in the order
+    /// they attached. The nodes not listed are primaries.
+    replicas: Vec<Replica>,
+    /// The nodes marked failed (phase 8: stuart found them down), by
+    /// index, in order.
+    failed: Vec<usize>,
 }
 
 impl SlotTable {
@@ -223,14 +263,27 @@ impl SlotTable {
         if let Some(slot) = owner.iter().position(|&o| o == MISSING) {
             return Err(TableError::Gap(slot as u16));
         }
-        Ok(SlotTable { epoch, nodes, owner, migrations: Vec::new() })
+        Ok(SlotTable { epoch, nodes, owner, migrations: Vec::new(), replicas: Vec::new(), failed: Vec::new() })
     }
 
     /// The same table with these slots migrating, as `(slot, from, to)`:
     /// each slot once, from the node that owns it to another known node.
     /// Replaces any migrations the table had.
     pub fn with_migrations(mut self, migrations: &[(u16, NodeId, NodeId)]) -> Result<SlotTable, TableError> {
-        let mut list = Vec::with_capacity(migrations.len());
+        self.migrations.clear();
+        self.add_migrations(migrations, false)
+    }
+
+    /// The same table with these slots also moving by snapshot (phase 8;
+    /// see [`Migration`]), as `(slot, from, to)`, after
+    /// [`with_migrations`](Self::with_migrations): the same rules, and no
+    /// slot moving both ways.
+    pub fn with_syncs(self, syncs: &[(u16, NodeId, NodeId)]) -> Result<SlotTable, TableError> {
+        self.add_migrations(syncs, true)
+    }
+
+    fn add_migrations(mut self, migrations: &[(u16, NodeId, NodeId)], snapshot: bool) -> Result<SlotTable, TableError> {
+        let mut list = std::mem::take(&mut self.migrations);
         for &(slot, from, to) in migrations {
             if usize::from(slot) >= SLOTS {
                 return Err(TableError::BadSlot(slot));
@@ -243,7 +296,10 @@ impl SlotTable {
             if to == from {
                 return Err(TableError::MigrationToOwner(slot));
             }
-            list.push(Migration { slot, from, to });
+            if self.primary_of(to).is_some() {
+                return Err(TableError::ReplicaMigrates(slot));
+            }
+            list.push(Migration { slot, from, to, snapshot });
         }
         list.sort_by_key(|m| m.slot);
         if let Some(w) = list.windows(2).find(|w| w[0].slot == w[1].slot) {
@@ -253,7 +309,100 @@ impl SlotTable {
         Ok(self)
     }
 
-    /// The slots migrating, in slot order.
+    /// The same table with these nodes replicas, as `(replica, primary)`:
+    /// each replica once, of a known node that is no replica, owning no
+    /// slots and with none migrating to it. Replaces any replicas the
+    /// table had.
+    pub fn with_replicas(mut self, replicas: &[(NodeId, NodeId)]) -> Result<SlotTable, TableError> {
+        let mut list: Vec<Replica> = Vec::with_capacity(replicas.len());
+        for &(replica, primary) in replicas {
+            let r = self.position(&replica).ok_or(TableError::UnknownNode(replica))?;
+            let p = self.position(&primary).ok_or(TableError::UnknownNode(primary))?;
+            if r == p {
+                return Err(TableError::ReplicaOfItself(replica));
+            }
+            if list.iter().any(|x| x.replica == r) {
+                return Err(TableError::DuplicateReplica(replica));
+            }
+            if self.owner.iter().any(|&o| usize::from(o) == r) {
+                return Err(TableError::ReplicaOwnsSlots(replica));
+            }
+            if let Some(m) = self.migrations.iter().find(|m| m.to == r) {
+                return Err(TableError::ReplicaMigrates(m.slot));
+            }
+            list.push(Replica { replica: r, primary: p });
+        }
+        if let Some(x) = list.iter().find(|x| list.iter().any(|y| y.replica == x.primary)) {
+            return Err(TableError::ReplicaOfReplica(*self.nodes[x.replica].id()));
+        }
+        self.replicas = list;
+        Ok(self)
+    }
+
+    /// The same table with these nodes marked failed (phase 8): known
+    /// nodes, each once. Replaces any the table had. As in Redis Cluster,
+    /// a failed node is `fail` in `CLUSTER NODES` and `SHARDS`, and a
+    /// failed replica is left out of `SLOTS`; its primary writes without
+    /// it (the lease).
+    pub fn with_failed(mut self, failed: &[NodeId]) -> Result<SlotTable, TableError> {
+        let mut list = Vec::with_capacity(failed.len());
+        for id in failed {
+            let i = self.position(id).ok_or(TableError::UnknownNode(*id))?;
+            if list.contains(&i) {
+                return Err(TableError::DuplicateFailed(*id));
+            }
+            list.push(i);
+        }
+        list.sort_unstable();
+        self.failed = list;
+        Ok(self)
+    }
+
+    /// The same table with `node` added last, owning no slots: what stuart
+    /// gives a node that left the cluster while it lingers, so that it
+    /// redirects as the others do (a node's table lists the node). The
+    /// other nodes keep their indexes.
+    pub fn with_node(mut self, node: Node) -> Result<SlotTable, TableError> {
+        if self.nodes.len() == SLOTS {
+            return Err(TableError::TooManyNodes(SLOTS + 1));
+        }
+        if self.position(&node.id).is_some() {
+            return Err(TableError::DuplicateNode(node.id));
+        }
+        if self.nodes.iter().any(|n| n.host == node.host && n.port == node.port) {
+            return Err(TableError::DuplicateAddress(node.host, node.port));
+        }
+        self.nodes.push(node);
+        Ok(self)
+    }
+
+    /// The indexes of the nodes marked failed, in order.
+    pub fn failed(&self) -> &[usize] {
+        &self.failed
+    }
+
+    /// Whether node `i` is marked failed.
+    pub fn is_failed(&self, i: usize) -> bool {
+        self.failed.binary_search(&i).is_ok()
+    }
+
+    /// The replicas, in the order given.
+    pub fn replicas(&self) -> &[Replica] {
+        &self.replicas
+    }
+
+    /// The index of the primary node `i` is a replica of; `None` if it is
+    /// a primary.
+    pub fn primary_of(&self, i: usize) -> Option<usize> {
+        self.replicas.iter().find(|r| r.replica == i).map(|r| r.primary)
+    }
+
+    /// The indexes of node `i`'s replicas, in the order given.
+    pub fn replicas_of(&self, i: usize) -> impl Iterator<Item = usize> + '_ {
+        self.replicas.iter().filter(move |r| r.primary == i).map(|r| r.replica)
+    }
+
+    /// The slots migrating, either way, in slot order.
     pub fn migrations(&self) -> &[Migration] {
         &self.migrations
     }
@@ -330,6 +479,8 @@ impl fmt::Debug for SlotTable {
             .field("nodes", &self.nodes)
             .field("runs", &runs)
             .field("migrations", &self.migrations)
+            .field("replicas", &self.replicas)
+            .field("failed", &self.failed)
             .finish()
     }
 }
@@ -498,11 +649,18 @@ mod tests {
         assert_eq!(t.migration(5), None);
         let m = t.clone().with_migrations(&[(150, id(2), id(1)), (5, id(1), id(3)), (6, id(1), id(2))]).unwrap();
         assert_eq!(m.migrations(), [
-            Migration { slot: 5, from: 0, to: 2 },
-            Migration { slot: 6, from: 0, to: 1 },
-            Migration { slot: 150, from: 1, to: 0 },
+            Migration { slot: 5, from: 0, to: 2, snapshot: false },
+            Migration { slot: 6, from: 0, to: 1, snapshot: false },
+            Migration { slot: 150, from: 1, to: 0, snapshot: false },
         ]);
-        assert_eq!(m.migration(150), Some(&Migration { slot: 150, from: 1, to: 0 }));
+        assert_eq!(m.migration(150), Some(&Migration { slot: 150, from: 1, to: 0, snapshot: false }));
+        // By snapshot, with them: the same rules, and no slot both ways.
+        let s = m.clone().with_syncs(&[(7, id(1), id(2))]).unwrap();
+        assert_eq!(s.migration(7), Some(&Migration { slot: 7, from: 0, to: 1, snapshot: true }));
+        assert_eq!(s.migrations().len(), 4);
+        assert_eq!(m.clone().with_syncs(&[(5, id(1), id(2))]).unwrap_err(), TableError::DuplicateMigration(5));
+        assert_eq!(m.clone().with_syncs(&[(150, id(1), id(2))]).unwrap_err(), TableError::NotTheOwner(150));
+        assert_eq!(s.clone().with_migrations(&[]).unwrap().migrations(), [], "with_migrations replaces both ways");
         assert_eq!(m.migration(7), None);
         assert_eq!(m.owner_index(5), Some(0), "the source still owns a migrating slot");
         assert_ne!(m, t, "migrations make another table");
@@ -517,5 +675,93 @@ mod tests {
         assert_eq!(err(&[(5, id(4), id(1))]), TableError::UnknownNode(id(4)));
         assert_eq!(err(&[(16384, id(1), id(2))]), TableError::BadSlot(16384));
         assert_eq!(TableError::NotTheOwner(5).to_string(), "slot 5 can only migrate from its owner");
+    }
+
+    #[test]
+    fn replicas() {
+        let t = SlotTable::new(
+            2,
+            vec![node(1), node(2), node(3), node(4), node(5)],
+            &[(r(0, 8191), Some(id(1))), (r(8192, 16383), Some(id(2)))],
+        )
+        .unwrap();
+        assert!(t.replicas().is_empty());
+        assert_eq!(t.primary_of(2), None);
+        // Node 5 before node 3 for node 1: the order given is kept.
+        let rt = t.clone().with_replicas(&[(id(5), id(1)), (id(4), id(2)), (id(3), id(1))]).unwrap();
+        assert_eq!(rt.replicas(), [Replica { replica: 4, primary: 0 }, Replica { replica: 3, primary: 1 }, Replica { replica: 2, primary: 0 }]);
+        assert_eq!(rt.primary_of(4), Some(0));
+        assert_eq!(rt.primary_of(2), Some(0));
+        assert_eq!(rt.primary_of(0), None);
+        assert_eq!(rt.replicas_of(0).collect::<Vec<_>>(), [4, 2]);
+        assert_eq!(rt.replicas_of(1).collect::<Vec<_>>(), [3]);
+        assert_eq!(rt.replicas_of(2).count(), 0);
+        assert_ne!(rt, t, "replicas make another table");
+        assert_eq!(rt.clone().with_replicas(&[]).unwrap(), t);
+        // A primary may have no slots.
+        assert!(t.clone().with_replicas(&[(id(4), id(3))]).is_ok());
+
+        let err = |replicas: &[(NodeId, NodeId)]| t.clone().with_replicas(replicas).unwrap_err();
+        assert_eq!(err(&[(id(6), id(1))]), TableError::UnknownNode(id(6)));
+        assert_eq!(err(&[(id(3), id(6))]), TableError::UnknownNode(id(6)));
+        assert_eq!(err(&[(id(3), id(3))]), TableError::ReplicaOfItself(id(3)));
+        assert_eq!(err(&[(id(3), id(1)), (id(3), id(2))]), TableError::DuplicateReplica(id(3)));
+        assert_eq!(err(&[(id(1), id(3))]), TableError::ReplicaOwnsSlots(id(1)));
+        assert_eq!(err(&[(id(2), id(3))]), TableError::ReplicaOwnsSlots(id(2)));
+        assert_eq!(err(&[(id(3), id(1)), (id(4), id(3))]), TableError::ReplicaOfReplica(id(4)));
+        assert_eq!(err(&[(id(4), id(3)), (id(3), id(1))]), TableError::ReplicaOfReplica(id(4)), "in either order");
+
+        // Migrations to a replica, either way round.
+        let m = t.clone().with_migrations(&[(5, id(1), id(3))]).unwrap();
+        assert_eq!(m.clone().with_replicas(&[(id(3), id(2))]).unwrap_err(), TableError::ReplicaMigrates(5));
+        assert_eq!(rt.clone().with_migrations(&[(5, id(1), id(5))]).unwrap_err(), TableError::ReplicaMigrates(5));
+        assert!(rt.clone().with_migrations(&[(5, id(1), id(2))]).is_ok());
+        assert_eq!(TableError::ReplicaOfReplica(id(4)).to_string(), format!("node {} is a replica of a replica", id(4)));
+    }
+
+    #[test]
+    fn failed() {
+        let t = SlotTable::new(2, vec![node(1), node(2), node(3)], &[(r(0, 16383), Some(id(1)))])
+            .unwrap()
+            .with_replicas(&[(id(3), id(1))])
+            .unwrap();
+        assert!(t.failed().is_empty());
+        assert!(!t.is_failed(2));
+        // Kept in node order, whatever the order given.
+        let f = t.clone().with_failed(&[id(3), id(2)]).unwrap();
+        assert_eq!(f.failed(), [1, 2]);
+        assert!(f.is_failed(1) && f.is_failed(2) && !f.is_failed(0));
+        assert_ne!(f, t, "marks make another table");
+        assert_eq!(f.clone().with_failed(&[]).unwrap(), t);
+        // The other parts don't touch the marks.
+        let f = f.with_replicas(&[]).unwrap().with_migrations(&[(5, id(1), id(2))]).unwrap();
+        assert_eq!(f.failed(), [1, 2]);
+
+        assert_eq!(t.clone().with_failed(&[id(4)]).unwrap_err(), TableError::UnknownNode(id(4)));
+        assert_eq!(t.clone().with_failed(&[id(3), id(3)]).unwrap_err(), TableError::DuplicateFailed(id(3)));
+        assert_eq!(TableError::DuplicateFailed(id(3)).to_string(), format!("node {} is marked failed twice", id(3)));
+    }
+
+    #[test]
+    fn with_node() {
+        let t = SlotTable::new(7, vec![node(1), node(2), node(3)], &[(r(0, 99), Some(id(2))), (r(100, 16383), Some(id(1)))])
+            .unwrap()
+            .with_syncs(&[(5, id(2), id(1))])
+            .unwrap()
+            .with_replicas(&[(id(3), id(1))])
+            .unwrap()
+            .with_failed(&[id(3)])
+            .unwrap();
+        let w = t.clone().with_node(node(4)).unwrap();
+        assert_eq!(w.epoch(), 7);
+        assert_eq!(w.nodes(), [node(1), node(2), node(3), node(4)]);
+        assert_eq!(w.position(&id(4)), Some(3));
+        assert!(w.runs().eq(t.runs()), "it owns nothing, the others keep their slots");
+        assert_eq!((w.migrations(), w.replicas(), w.failed()), (t.migrations(), t.replicas(), t.failed()));
+        assert_eq!(w.primary_of(3), None);
+
+        assert_eq!(t.clone().with_node(node(2)).unwrap_err(), TableError::DuplicateNode(id(2)));
+        let taken = Node::new(id(4), "127.0.0.1", 7001).unwrap();
+        assert_eq!(t.clone().with_node(taken).unwrap_err(), TableError::DuplicateAddress("127.0.0.1".into(), 7001));
     }
 }

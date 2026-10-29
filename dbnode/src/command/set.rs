@@ -129,6 +129,43 @@ pub(super) fn combine(args: &Args, store: &mut Store, out: &mut Encoder, op: Set
     Flow::Continue
 }
 
+/// `SINTERCARD numkeys key [key ...] [LIMIT limit]`, the arguments read as
+/// Redis 7.0 does (a later `LIMIT` wins).
+pub(super) fn sintercard(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {
+    let numkeys = match parse_i64(&args[1]) {
+        Some(n) if n >= 1 => n as u64,
+        _ => {
+            out.error(b"ERR numkeys should be greater than 0");
+            return Flow::Continue;
+        }
+    };
+    if numkeys > args.len() as u64 - 2 {
+        out.error(b"ERR Number of keys can't be greater than number of args");
+        return Flow::Continue;
+    }
+    let keys_end = 2 + numkeys as usize;
+    let mut limit = 0;
+    let mut i = keys_end;
+    while i < args.len() {
+        if args[i].eq_ignore_ascii_case(b"limit") && i + 1 < args.len() {
+            i += 1;
+            match parse_i64(&args[i]) {
+                Some(n) if n >= 0 => limit = n as usize,
+                _ => {
+                    out.error(b"ERR LIMIT can't be negative");
+                    return Flow::Continue;
+                }
+            }
+        } else {
+            syntax_error(out);
+            return Flow::Continue;
+        }
+        i += 1;
+    }
+    let keys: Vec<&[u8]> = args.iter().skip(2).take(keys_end - 2).collect();
+    integer_reply(store.sintercard(&keys, limit).map(|n| n as i64), out)
+}
+
 /// `SUNIONSTORE`, `SINTERSTORE`, `SDIFFSTORE`.
 pub(super) fn combine_store(args: &Args, store: &mut Store, out: &mut Encoder, op: SetOp) -> Flow {
     integer_reply(store.combine_store(op, &args[1], &members_of(args, 2)).map(|n| n as i64), out)

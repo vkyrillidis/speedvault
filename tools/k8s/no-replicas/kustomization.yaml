@@ -1,0 +1,11 @@
+# kind_check.sh --no-replicas: the kind overlay without replicas
+# (components/no-replicas: three nodes, all primaries).
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../../deploy/kubernetes/overlays/kind
+
+components:
+  - ../../../deploy/kubernetes/components/no-replicas

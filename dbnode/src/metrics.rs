@@ -30,7 +30,7 @@ impl Site for Node {
         metric(out, "speedvault_memory_used_ratio", Kind::Gauge, "used / maxmemory; 0 without a limit.", ratio);
         metric(out, "speedvault_memory_peak_bytes", Kind::Gauge, "The most memory allocated so far (sampled).", self.peak_memory.get());
         metric(out, "speedvault_memory_rss_bytes", Kind::Gauge, "The process's resident memory.", memory::rss());
-        let growth = "What the next new key would allocate at once, the map doubling; 0 while it has room. Past maxmemory with it, new keys are refused.";
+        let growth = "The most the next new key may allocate at once, a table of keys growing. Past maxmemory with it, new keys are refused.";
         metric(out, "speedvault_memory_map_growth_bytes", Kind::Gauge, growth, self.store.borrow().growth());
 
         metric(out, "speedvault_commands_processed_total", Kind::Counter, "Commands run.", self.commands_processed.get());
@@ -60,10 +60,8 @@ impl Site for Node {
         metric(out, "speedvault_cluster_leaving", Kind::Gauge, "1 once the node is leaving the cluster (SIGTERM).", u8::from(c.leaving.load(Ordering::Relaxed)));
         let s = &c.stats;
         metric(out, "speedvault_migrate_keys_sent_total", Kind::Counter, "Keys of migrating slots the new owners took.", s.keys_sent.get());
-        metric(out, "speedvault_migrate_batches_sent_total", Kind::Counter, "Batches of keys sent to new owners.", s.batches_sent.get());
-        metric(out, "speedvault_migrate_bytes_sent_total", Kind::Counter, "Bytes of values sent to new owners.", s.bytes_sent.get());
         metric(out, "speedvault_migrate_keys_imported_total", Kind::Counter, "Keys taken from other nodes.", s.keys_imported.get());
-        let refused = "Batches of keys from other nodes refused: past maxmemory.";
+        let refused = "Times a slot sync's copy here waited for room under maxmemory.";
         metric(out, "speedvault_migrate_imports_refused_total", Kind::Counter, refused, s.imports_refused.get());
         family(out, "speedvault_redirects_total", Kind::Counter, "Redirects sent to clients: MOVED, ASK and TRYAGAIN.");
         sample(out, "speedvault_redirects_total", &[("kind", "moved")], s.moved.get());
@@ -73,16 +71,28 @@ impl Site for Node {
 
     /// Standalone: always. In cluster mode: once stuart knows it (it
     /// joined), or without stuart once it has a table; never while leaving.
+    /// A replica also needs its link to its primary up and synced (phase
+    /// 8): until then it protects nothing, and a rolling update or an
+    /// eviction (the StatefulSet, the PodDisruptionBudget) waits for it
+    /// before stopping the next pod, maybe its primary.
     fn ready(&self) -> Result<(), String> {
         let Some(c) = &self.cluster else { return Ok(()) };
         if c.leaving.load(Ordering::Relaxed) {
             return Err("leaving the cluster".into());
         }
         if self.config.stuart.is_some() {
-            return if c.joined.load(Ordering::Relaxed) { Ok(()) } else { Err("not joined to stuart yet".into()) };
-        }
-        if c.table().0.epoch() == 0 {
+            if !c.joined.load(Ordering::Relaxed) {
+                return Err("not joined to stuart yet".into());
+            }
+        } else if c.table().0.epoch() == 0 {
             return Err("no slot table yet".into());
+        }
+        let replica = {
+            let (table, me) = c.table();
+            table.primary_of(me).is_some()
+        };
+        if replica && self.repl.link.state() != crate::repl::replica::State::Online {
+            return Err("a replica not synced with its primary".into());
         }
         Ok(())
     }

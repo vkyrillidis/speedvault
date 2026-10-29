@@ -6,7 +6,7 @@ standard library only.
 | File | What it is |
 |------|------------|
 | `resp.py` | Small RESP2/RESP3 client: raw sends (optionally split into chunks with delays), exact reply framing for every RESP3 type, close and timeout detection. Also a CLI: `python3 resp.py 127.0.0.1:6379 --resp3 MGET a b` |
-| `corpus.py` | The test cases, with their normalisers and expected-byte overrides |
+| `corpus.py` | The test cases (334), with their normalisers and expected-byte overrides |
 | `difftest.py` | Differential tester: runs the corpus against a reference and a target and compares replies byte for byte |
 | `allowlist.py` | Known, intended differences (case pattern → reason) |
 | `resp_proxy.py` | Logging TCP proxy: prints every request and reply going through it, including the ones `MONITOR` doesn't show (rejected commands) |

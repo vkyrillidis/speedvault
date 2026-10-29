@@ -1,34 +1,55 @@
 #!/usr/bin/env bash
 # The Kubernetes manifests end to end, in kind (Kubernetes in Docker):
-# makes a kind cluster, builds the image and the checker's
-# (checker/Dockerfile) and loads them into it, applies
-# deploy/kubernetes/overlays/kind in a namespace of its own, and runs the
-# scenarios below. In each, a checker pod (kcheck.py), in another
+# makes a kind cluster of a control plane and three workers, builds the
+# image and the checker's (checker/Dockerfile) and loads them into it,
+# applies deploy/kubernetes/overlays/kind in a namespace of its own, and
+# runs the scenarios below. In each, a checker pod (kcheck.py), in another
 # namespace, writes through the seed Service while the pods change (redis-py,
-# redis-cli and Lettuce, LETTUCE below), then reads every node: no
-# acknowledged write lost, none applied twice, no key at two nodes, and no
-# write failed unless a pod was killed without draining (then only that
-# pod's keys may be lost).
+# redis-cli and Lettuce, LETTUCE below; redis-py with WAIT too), then reads
+# every node: no acknowledged write lost, none applied twice, no key at
+# two nodes, every replica the same as its primary, and no write failed
+# unless a pod was killed (then only writes its replica hadn't got may be
+# lost).
 #
-#   form        three nodes form a cluster by themselves (stuart --auto)
-#   scale-up    kubectl scale 3 -> 5: the new ones get their share
-#   scale-down  kubectl scale 5 -> 3: the last two drain, one after the
-#               other, and exit by themselves
-#   rollout     kubectl rollout restart: each pod drains, restarts and
-#               gets its share back
-#   delete      kubectl delete pod: it drains first, then comes back
-#   force       kubectl delete pod --grace-period=0 --force: it comes back
-#               under its name with a new id, its slots handed out empty
+# The manifests' six pods are three primaries with a replica each (stuart
+# --replicas 1):
+#
+#   form        six nodes form a cluster by themselves (stuart --auto):
+#               three pairs, each replica on another kind node than its
+#               primary
+#   scale-up    kubectl scale 6 -> 8: a new primary with its share, and
+#               its replica
+#   scale-down  kubectl scale 8 -> 6: the last two go, one after the other,
+#               and exit by themselves
+#   rollout     kubectl rollout restart: each primary hands its slots to
+#               its replica, each pod back is a replica: no slot moves
+#   delete      kubectl delete pod of a primary: it hands over (no slot
+#               moves), and comes back as a replica
+#   force       kubectl delete pod --grace-period=0 --force of a primary:
+#               its replica is promoted, it comes back as its replica;
+#               only writes the replica hadn't got may be lost
+#   worker-stop a kind worker killed (docker kill: its machine gone, no
+#               SIGTERM for its pods) that holds no stuart nor checker:
+#               its primaries fail over to their replicas;
+#               once Kubernetes marks it NotReady it gets the out-of-service
+#               taint, and its pods start on the other workers, as
+#               replicas; then it starts again
 #   stuart      stuart's pod deleted: it comes back with its state (the
 #               table, the nodes) from its volume, writes go on meanwhile
 #   delete-all  kubectl delete -k of the overlay (stuart, the nodes and
 #               their Services at once): every pod gone within a minute,
 #               then applied again
-#   teardown    the namespace deleted (every pod gets SIGTERM at once): it's
-#               gone within a minute, not at the end of the grace period
+#   teardown    the namespace deleted (every pod gets SIGTERM at once): its
+#               pods gone within a minute, not at the end of the grace
+#               period (the namespace itself goes a minute or two later)
 #
 # Before them, the autoscaling overlay (the HPA) is checked with a
 # server-side dry run.
+#
+# --no-replicas runs them without replicas (tools/k8s/no-replicas: the
+# kind overlay with components/no-replicas): three nodes, scale-up and
+# scale-down 3 -> 5 -> 3, each SIGTERM draining the node, force losing
+# the pod's keys, worker-stop its pods' keys.
 #
 # --autoscale runs the HPA for real instead: it installs Prometheus and the
 # Prometheus adapter (Helm charts, tools/k8s/monitoring/prometheus.yaml and
@@ -36,20 +57,25 @@
 # tools/k8s/autoscale (the kind overlay with the HPA, quicker). Its scenarios (by default these, then
 # rollout and delete):
 #
-#   hpa-memory  3 nodes filled to 95.5% of their maxmemory: the HPA adds
-#               two (ceil(3 x 0.955 / 0.7) = 5), and no more once their
-#               slots have come
-#   hpa-cpu     memtier_benchmark keeping 5 nodes about 55% busy, past
-#               the test HPA's 40% (and its 10% tolerance): the HPA adds a
-#               sixth (its maximum here); the client's throughput and
-#               p99, second by second, alongside
-#   hpa-down    kubectl scale 6 -> 3 once the load is gone: the HPA leaves
+#   hpa-memory  6 nodes filled to 90% of their maxmemory: the HPA adds a
+#               pair (ceil(6 x 0.9 / 0.7) = 8), and no more once their
+#               slots have come (4 primaries at 67.5%)
+#   hpa-cpu     memtier_benchmark keeping 3 primaries about 55% busy, their
+#               replicas far less, past the test HPA's 20% average (and its
+#               10% tolerance): the HPA adds a pair (to its maximum here,
+#               8); the client's throughput and p99, second by second,
+#               alongside
+#   hpa-down    kubectl scale 8 -> 6 once the load is gone: the HPA leaves
 #               it there (it never scales down, and the metrics are low)
+#
+# With --no-replicas (tools/k8s/autoscale-no-replicas): hpa-memory 3 -> 5
+# at 95.5%, hpa-cpu 5 -> 6 (each node 55% busy, the HPA at 40%), hpa-down
+# 6 -> 3.
 #
 # For each, when the HPA asked for more pods, when they were ready, and
 # when their slots had arrived, from the start of the load.
 #
-#   tools/k8s/kind_check.sh [--keep] [--reuse] [--autoscale] [--out DIR] [SCENARIO...]
+#   tools/k8s/kind_check.sh [--keep] [--reuse] [--autoscale] [--no-replicas] [--out DIR] [SCENARIO...]
 #
 # --keep leaves the kind cluster up at the end; --reuse uses one that is
 # already there (and rebuilds the images). --out DIR keeps memtier's JSON
@@ -78,15 +104,15 @@ PROMETHEUS_CHART=29.37.0
 ADAPTER_CHART=5.3.0
 # memtier_benchmark in hpa-cpu: threads, clients per thread, the
 # --rate-limiting of each of their connections, for so long. In cluster
-# mode a client has a connection per node, each at that rate: the load per
-# node stays the same as nodes come (the HPA goes to its maximum; the
-# memory scenario is the one that shows it stopping by itself). The
-# defaults make about 560k requests a second on five nodes, about half
+# mode a client has a connection per primary, each at that rate: the load
+# per primary stays the same as nodes come (the HPA goes to its maximum;
+# the memory scenario is the one that shows it stopping by itself). The
+# defaults make about 560k requests a second on five primaries, about half
 # what memtier's 8 threads can do on a 16-core Docker Desktop, so that its
-# latencies are the nodes' and not its own queue's; that keeps each node
-# about 55% busy (without busy-polling a request costs a node about 5 us
-# of busy time). Elsewhere, tune LOAD_RATE so that hpa-cpu's "HPA wants"
-# line shows five nodes past 440m.
+# latencies are the nodes' and not its own queue's; that keeps each
+# primary about 55% busy (without busy-polling a request costs a node
+# about 5 us of busy time). Elsewhere, tune LOAD_RATE so that hpa-cpu's
+# "HPA wants" line shows the nodes past 220m (440m with --no-replicas).
 LOAD_THREADS="${LOAD_THREADS:-8}"
 LOAD_CLIENTS="${LOAD_CLIENTS:-8}"
 LOAD_RATE="${LOAD_RATE:-2000}"
@@ -97,6 +123,7 @@ LETTUCE="${LETTUCE-default}"
 KEEP=0
 REUSE=0
 AUTOSCALE=0
+REPLICAS=1
 OUT=""
 SCENARIOS=()
 while [ $# -gt 0 ]; do
@@ -104,8 +131,9 @@ while [ $# -gt 0 ]; do
     --keep) KEEP=1; shift;;
     --reuse) REUSE=1; shift;;
     --autoscale) AUTOSCALE=1; shift;;
+    --no-replicas) REPLICAS=0; shift;;
     --out) OUT="$2"; mkdir -p "$OUT"; shift 2;;
-    -h|--help) sed -n '2,61p' "$0"; exit 0;;
+    -h|--help) sed -n '2,99p' "$0" | sed '/^set -euo/,$d'; exit 0;;
     -*) echo "unknown argument: $1" >&2; exit 2;;
     *) SCENARIOS+=("$1"); shift;;
   esac
@@ -114,8 +142,16 @@ if [ ${#SCENARIOS[@]} -eq 0 ]; then
   if [ "$AUTOSCALE" = 1 ]; then
     SCENARIOS=(hpa-memory hpa-cpu hpa-down rollout delete)
   else
-    SCENARIOS=(form scale-up scale-down rollout delete force stuart delete-all teardown)
+    SCENARIOS=(form scale-up scale-down rollout delete force worker-stop stuart delete-all teardown)
   fi
+fi
+# The pod counts: BASE the manifests', UP after scale-up; the autoscaling
+# scenarios' (MEM_* for hpa-memory, CPU_* for hpa-cpu, MAX the test HPA's
+# maximum, hpa-down's start).
+if [ "$REPLICAS" = 1 ]; then
+  BASE=6 UP=8 FILL=0.9 MEM_TO=8 CPU_FROM=6 CPU_TO=8 MAX=8
+else
+  BASE=3 UP=5 FILL=0.955 MEM_TO=5 CPU_FROM=5 CPU_TO=6 MAX=6
 fi
 
 k() { "$KUBECTL" --context "kind-$CLUSTER" -n "$NS" "$@"; }
@@ -149,6 +185,7 @@ else
     "$KIND" create cluster --name "$CLUSTER" --image "$NODE_IMAGE" --wait 120s --config - <<EOF
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
+nodes: [{role: control-plane}, {role: worker}, {role: worker}, {role: worker}]
 networking:
   apiServerAddress: "0.0.0.0"
 kubeadmConfigPatches:
@@ -158,7 +195,12 @@ kubeadmConfigPatches:
       certSANs: ["$KIND_API_HOST"]
 EOF
   else
-    "$KIND" create cluster --name "$CLUSTER" --image "$NODE_IMAGE" --wait 120s
+    # Three workers: a replica on another than its primary, and one to stop.
+    "$KIND" create cluster --name "$CLUSTER" --image "$NODE_IMAGE" --wait 120s --config - <<EOF
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes: [{role: control-plane}, {role: worker}, {role: worker}, {role: worker}]
+EOF
   fi
 fi
 if [ -n "${KIND_API_HOST:-}" ]; then
@@ -189,9 +231,11 @@ if [ "$AUTOSCALE" = 1 ]; then
   h upgrade --install prometheus prometheus --repo "$CHARTS" --version "$PROMETHEUS_CHART"     --create-namespace -f "$HERE/monitoring/prometheus.yaml" --wait --timeout 5m >/dev/null
   h upgrade --install prometheus-adapter prometheus-adapter --repo "$CHARTS" --version "$ADAPTER_CHART"     -f "$ROOT/deploy/kubernetes/overlays/autoscaling/prometheus-adapter.yaml"     --set prometheus.url=http://prometheus-server.monitoring.svc --set prometheus.port=80     --wait --timeout 5m >/dev/null
   OVERLAY="$HERE/autoscale"
+  [ "$REPLICAS" = 1 ] || OVERLAY="$HERE/autoscale-no-replicas"
   k apply -k "$OVERLAY" >/dev/null
 else
   OVERLAY="$ROOT/deploy/kubernetes/overlays/kind"
+  [ "$REPLICAS" = 1 ] || OVERLAY="$HERE/no-replicas"
   k apply -k "$OVERLAY" >/dev/null
   k apply -k "$ROOT/deploy/kubernetes/overlays/autoscaling" --dry-run=server >/dev/null
   say "the autoscaling overlay passes a server-side dry run"
@@ -231,6 +275,8 @@ spec:
           value: speedvault-seed.$NS.svc
         - name: STUART
           value: stuart.$NS.svc
+        - name: REPLICAS
+          value: "$REPLICAS"
 EOF
   for _ in $(seq 400); do
     if kc logs checker 2>/dev/null | grep -qx writing; then return 0; fi
@@ -252,6 +298,37 @@ stop_checker() {  # stop_checker N: the checker's verdict once N nodes are even
   done
   kc logs checker | sed -n '/^writing$/,$p' | sed 's/^/    /'
   [ "$phase" = Succeeded ]
+}
+
+check() {  # check ARGS...: kcheck.py ARGS in the running checker, its output indented
+  kc exec checker -- env REPLICAS="$REPLICAS" python3 /app/k8s/kcheck.py "$@" | sed 's/^/    /'
+  return "${PIPESTATUS[0]}"
+}
+
+counts() {  # stuart's counters: "slots_moved=N handovers=N demotions=N"
+  kc exec checker -- python3 /app/k8s/kcheck.py counts
+}
+
+count() {  # count NAME COUNTS: NAME's value in COUNTS
+  echo "$2" | tr ' ' '\n' | sed -n "s/^$1=//p"
+}
+
+gone() {  # gone FROM TO: the pods speedvault-FROM .. speedvault-(TO-1), as names
+  local i; for i in $(seq "$1" $(($2 - 1))); do echo "pod/speedvault-$i"; done
+}
+
+ready_node() {  # ready_node NAME: the kind node's Ready condition (True, False, Unknown)
+  "$KUBECTL" --context "kind-$CLUSTER" get node "$1" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+}
+
+STOPPED=""
+restore_worker() {  # the worker worker-stop stopped: started again, untainted
+  [ -n "$STOPPED" ] || return 0
+  docker start "$STOPPED" >/dev/null || true
+  for _ in $(seq 90); do [ "$(ready_node "$STOPPED")" = True ] && break; sleep 2; done
+  "$KUBECTL" --context "kind-$CLUSTER" taint node "$STOPPED" node.kubernetes.io/out-of-service- >/dev/null 2>&1 || true
+  say "  $STOPPED started again: Ready $(ready_node "$STOPPED")"
+  STOPPED=""
 }
 
 stuart_nodes() {  # once stuart answers through its Service (it may have just restarted)
@@ -390,64 +467,126 @@ scenario() {
   say "== $name"
   case "$name" in
     form)
-      nodes_ready 3
-      start_checker 3
+      nodes_ready $BASE
+      start_checker $BASE
       stuart_nodes | sed 's/^/    /'
-      stop_checker 3;;
+      # Each replica on another kind node than its primary.
+      [ "$REPLICAS" = 0 ] || check pairs
+      stop_checker $BASE;;
     scale-up)
-      start_checker 3
-      k scale statefulset speedvault --replicas 5 >/dev/null
-      nodes_ready 5
-      say "5 pods ready after $(($(date +%s) - t0)) s"
-      stop_checker 5;;
+      start_checker $BASE
+      k scale statefulset speedvault --replicas $UP >/dev/null
+      nodes_ready $UP
+      say "$UP pods ready after $(($(date +%s) - t0)) s"
+      stop_checker $UP;;
     scale-down)
-      k scale statefulset speedvault --replicas 5 >/dev/null  # if scale-up didn't run
-      nodes_ready 5
-      start_checker 5
+      k scale statefulset speedvault --replicas $UP >/dev/null  # if scale-up didn't run
+      nodes_ready $UP
+      start_checker $UP
       local t1; t1=$(date +%s)
-      k scale statefulset speedvault --replicas 3 >/dev/null
-      nodes_ready 3
-      k wait --for=delete pod/speedvault-3 pod/speedvault-4 --timeout 60s >/dev/null 2>&1 || true
+      k scale statefulset speedvault --replicas $BASE >/dev/null
+      nodes_ready $BASE
+      k wait --for=delete $(gone $BASE $UP) --timeout 60s >/dev/null 2>&1 || true
       local took=$(($(date +%s) - t1))
       say "scaled down in $took s"
       # Well within the grace period: the nodes drained and exited by
       # themselves, not killed at its end.
       [ "$took" -lt 300 ] || { echo "the scale-down took $took s" >&2; return 1; }
-      stop_checker 3;;
+      stop_checker $BASE;;
     rollout)
-      nodes_ready 3
-      start_checker 3
+      nodes_ready $BASE
+      start_checker $BASE
+      local before; before=$(counts)
       k rollout restart statefulset speedvault >/dev/null
       k rollout status statefulset speedvault --timeout 15m >/dev/null
-      nodes_ready 3
+      nodes_ready $BASE
       say "rolled out in $(($(date +%s) - t0)) s"
-      stop_checker 3;;
+      local after; after=$(counts)
+      stop_checker $BASE
+      if [ "$REPLICAS" = 1 ]; then
+        # Every primary handed over: no slot moved.
+        local moved handed
+        moved=$(($(count slots_moved "$after") - $(count slots_moved "$before")))
+        handed=$(($(count handovers "$after") - $(count handovers "$before")))
+        say "  $moved slots moved, $handed handovers"
+        [ "$moved" = 0 ] && [ "$handed" -ge 3 ] || { echo "a rolling update moved $moved slots, $handed handovers" >&2; return 1; }
+      fi;;
     delete)
-      nodes_ready 3
-      start_checker 3
-      local uid; uid=$(k get pod speedvault-1 -o jsonpath='{.metadata.uid}')
-      k delete pod speedvault-1 >/dev/null
-      wait_new_pod speedvault-1 "$uid"
-      nodes_ready 3
-      stop_checker 3;;
+      nodes_ready $BASE
+      start_checker $BASE
+      local pod=speedvault-1 before
+      [ "$REPLICAS" = 0 ] || pod=$(kc exec checker -- python3 /app/k8s/kcheck.py primary)
+      before=$(counts)
+      local uid; uid=$(k get pod "$pod" -o jsonpath='{.metadata.uid}')
+      say "  deleting $pod"
+      k delete pod "$pod" >/dev/null
+      wait_new_pod "$pod" "$uid"
+      nodes_ready $BASE
+      local after; after=$(counts)
+      stop_checker $BASE
+      if [ "$REPLICAS" = 1 ]; then
+        # The primary handed over: no slot moved.
+        local moved handed
+        moved=$(($(count slots_moved "$after") - $(count slots_moved "$before")))
+        handed=$(($(count handovers "$after") - $(count handovers "$before")))
+        say "  $moved slots moved, $handed handovers"
+        [ "$moved" = 0 ] && [ "$handed" = 1 ] || { echo "deleting a primary moved $moved slots, $handed handovers" >&2; return 1; }
+      fi;;
     force)
-      nodes_ready 3
-      start_checker 3
-      kc exec checker -- python3 /app/k8s/kcheck.py lossy speedvault-1 | sed 's/^/    /'
-      local uid; uid=$(k get pod speedvault-1 -o jsonpath='{.metadata.uid}')
-      k delete pod speedvault-1 --grace-period=0 --force >/dev/null 2>&1
-      wait_new_pod speedvault-1 "$uid"
-      nodes_ready 3
-      stop_checker 3;;
+      nodes_ready $BASE
+      start_checker $BASE
+      local pod=speedvault-1
+      [ "$REPLICAS" = 0 ] || pod=$(kc exec checker -- python3 /app/k8s/kcheck.py primary)
+      check lossy "$pod"
+      local uid; uid=$(k get pod "$pod" -o jsonpath='{.metadata.uid}')
+      k delete pod "$pod" --grace-period=0 --force >/dev/null 2>&1
+      wait_new_pod "$pod" "$uid"
+      nodes_ready $BASE
+      stop_checker $BASE;;
+    worker-stop)
+      nodes_ready $BASE
+      start_checker $BASE
+      # A worker with nodes but neither stuart nor the checker (stopped,
+      # stuart couldn't fail over; the checker would stop checking): the
+      # one with the most primaries.
+      local spared worker="" best=-1 w
+      spared="$(k get pod stuart-0 -o jsonpath='{.spec.nodeName}') $(kc get pod checker -o jsonpath='{.spec.nodeName}')"
+      for w in $(k get pods -l app.kubernetes.io/name=speedvault -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' | sort -u); do
+        case " $spared " in *" $w "*) continue;; esac
+        local n; n=$(stuart_nodes | grep " zone=$w" | grep -vc "replica-of" || true)
+        [ "$n" -gt "$best" ] && { best=$n; worker=$w; }
+      done
+      [ -n "$worker" ] || { echo "no worker without stuart and the checker" >&2; return 1; }
+      check lossy-zone "$worker"
+      [ "$REPLICAS" = 0 ] || [ "$best" -gt 0 ] || echo "    (no primary on $worker: nothing to fail over)"
+      local t1; t1=$(date +%s)
+      # Killed: a machine that stops (a graceful `docker stop` would
+      # SIGTERM the pods, and their primaries hand over).
+      docker kill "$worker" >/dev/null
+      STOPPED=$worker
+      say "  $worker killed"
+      if [ "$REPLICAS" = 1 ]; then
+        check failover "$worker"
+      fi
+      for _ in $(seq 90); do [ "$(ready_node "$worker")" != True ] && break; sleep 2; done
+      say "  +$(($(date +%s) - t1))s $worker $(ready_node "$worker" | sed 's/Unknown/not ready (Unknown)/;s/False/not ready/')"
+      # Its pods stay (Terminating once evicted) until the node is known
+      # to be down: then they're deleted, and start elsewhere.
+      "$KUBECTL" --context "kind-$CLUSTER" taint node "$worker" node.kubernetes.io/out-of-service=nodeshutdown:NoExecute >/dev/null
+      nodes_ready $BASE
+      say "  +$(($(date +%s) - t1))s $BASE pods ready again, on $(k get pods -l app.kubernetes.io/name=speedvault -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' | sort -u | tr '\n' ' ')"
+      [ "$REPLICAS" = 0 ] || check pairs || true
+      stop_checker $BASE
+      restore_worker;;
     stuart)
-      nodes_ready 3
-      start_checker 3
+      nodes_ready $BASE
+      start_checker $BASE
       k delete pod stuart-0 >/dev/null
       k wait --for=condition=Ready pod/stuart-0 --timeout 120s >/dev/null
       stuart_nodes | sed 's/^/    /'
-      stop_checker 3;;
+      stop_checker $BASE;;
     delete-all)
-      nodes_ready 3
+      nodes_ready $BASE
       kc delete pod checker --ignore-not-found --wait=true >/dev/null
       k delete -k "$OVERLAY" --wait=true --timeout 90s >/dev/null
       k wait --for=delete pod --all --timeout 90s >/dev/null 2>&1 || true
@@ -460,52 +599,63 @@ scenario() {
       fi
       k delete pvc --all --wait=true >/dev/null
       k apply -k "$OVERLAY" >/dev/null
-      nodes_ready 3;;
+      nodes_ready $BASE;;
     teardown)
-      nodes_ready 3
+      nodes_ready $BASE
       kc delete pod checker --ignore-not-found --wait=true >/dev/null
-      "$KUBECTL" --context "kind-$CLUSTER" delete namespace "$NS" --timeout 90s >/dev/null
-      local took=$(($(date +%s) - t0))
-      say "namespace deleted in $took s"
-      [ "$took" -lt 60 ] || { echo "deleting the namespace took $took s" >&2; return 1; };;
-    hpa-memory)
-      ensure_nodes 3
-      wait_metrics 300
-      start_checker 3
       local t1; t1=$(date +%s)
-      kc exec checker -- python3 /app/k8s/kcheck.py fill 0.955 | sed 's/^/    /'
+      "$KUBECTL" --context "kind-$CLUSTER" delete namespace "$NS" --wait=false >/dev/null
+      # The pods: gone within a minute, not at the end of the grace period.
+      for _ in $(seq 60); do [ -z "$(k get pods -o name 2>/dev/null)" ] && break; sleep 1; done
+      local took=$(($(date +%s) - t1))
+      say "every pod gone in $took s"
+      [ "$took" -lt 60 ] || { echo "the pods took $took s to go" >&2; k get pods >&2; return 1; }
+      # The namespace: Kubernetes 1.33 deletes a namespace's pods first and
+      # the rest once they're gone, a minute or two later.
+      "$KUBECTL" --context "kind-$CLUSTER" wait --for=delete namespace "$NS" --timeout 5m >/dev/null
+      say "the namespace deleted in $(($(date +%s) - t1)) s";;
+    hpa-memory)
+      ensure_nodes $BASE
+      wait_metrics 300
+      start_checker $BASE
+      local t1; t1=$(date +%s)
+      check fill $FILL
       say "  +$(($(date +%s) - t1))s filled" | tee -a "$TIMELINE"
-      watch_scale 5 "$t1"
-      even 5 "$t1"
-      hold 5 60
-      stop_checker 5;;
+      watch_scale $MEM_TO "$t1"
+      even $MEM_TO "$t1"
+      hold $MEM_TO 60
+      stop_checker $MEM_TO;;
     hpa-cpu)
-      ensure_nodes 5
-      start_checker 5
-      # The FLUSHALL of the checker's start emptied the nodes.
+      # The FLUSHALL of the checker's start empties the nodes first (else
+      # hpa-memory's keys, on fewer nodes, would make the HPA add some).
+      local cur; cur=$(k get statefulset speedvault -o jsonpath='{.spec.replicas}')
+      nodes_ready "$cur"
+      start_checker "$cur"
+      ensure_nodes $CPU_FROM
+      even $CPU_FROM "$t0"
       wait_metrics 300
       start_load
       local t1; t1=$(date +%s)
-      say "  load: memtier_benchmark, $((LOAD_THREADS * LOAD_CLIENTS)) clients at $LOAD_RATE requests a second to each node, for $LOAD_TIME s"
-      watch_scale 6 "$t1"
-      even 6 "$t1"
+      say "  load: memtier_benchmark, $((LOAD_THREADS * LOAD_CLIENTS)) clients at $LOAD_RATE requests a second to each primary, for $LOAD_TIME s"
+      watch_scale $CPU_TO "$t1"
+      even $CPU_TO "$t1"
       load_result cpu
-      stop_checker 6;;
+      stop_checker $CPU_TO;;
     hpa-down)
       # Scaling down moves keys: only by hand. (A test would wait the HPA's
       # 5 minute scale-down window to see it happen.)
       [ "$(k get hpa speedvault -o jsonpath='{.spec.behavior.scaleDown.selectPolicy}')" = Disabled ] \
         || { echo "the HPA may scale down by itself" >&2; return 1; }
-      ensure_nodes 6
+      ensure_nodes $MAX
       wait_metrics 300
-      start_checker 6
+      start_checker $MAX
       local t1; t1=$(date +%s)
-      k scale statefulset speedvault --replicas 3 >/dev/null
-      nodes_ready 3
-      k wait --for=delete pod/speedvault-3 pod/speedvault-4 pod/speedvault-5 --timeout 120s >/dev/null 2>&1 || true
+      k scale statefulset speedvault --replicas $BASE >/dev/null
+      nodes_ready $BASE
+      k wait --for=delete $(gone $BASE $MAX) --timeout 120s >/dev/null 2>&1 || true
       say "  scaled down in $(($(date +%s) - t1)) s" | tee -a "$TIMELINE"
-      hold 3 45
-      stop_checker 3;;
+      hold $BASE 45
+      stop_checker $BASE;;
     *) echo "unknown scenario $name" >&2; return 2;;
   esac
 }
@@ -534,6 +684,7 @@ for s in "${SCENARIOS[@]}"; do
   else
     say "FAIL $s"
     dump
+    restore_worker
     FAILED+=("$s")
   fi
 done

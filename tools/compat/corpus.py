@@ -341,6 +341,16 @@ seq("expireat_past_deletes", ("SET", "k", "v"), ("EXPIREAT", "k", "1"), ("EXISTS
 seq("expireat_future", ("SET", "k", "v"), ("EXPIREAT", "k", str(NOW + 1000)), ("TTL", "k"),
     ("EXPIREAT", "k", str(NOW + 2000), "LT"), ("EXPIREAT", "k", str(NOW + 2000), "GT"), ("TTL", "k"),
     norm=[at(2, int_range(900, 1000)), at(5, int_range(1900, 2000))])
+seq("expiretime", ("SET", "k", "v"), ("EXPIREAT", "k", str(NOW + 1000)), ("EXPIRETIME", "k"), ("PEXPIRETIME", "k"),
+    ("PEXPIREAT", "k", str(NOW * 1000 + 1999)), ("EXPIRETIME", "k"), ("PEXPIRETIME", "k"), ("SET", "p", "v"),
+    ("EXPIRETIME", "p"), ("PEXPIRETIME", "p"), ("EXPIRETIME", "nokey"), ("PEXPIRETIME", "nokey"),
+    ("HSET", "h", "f", "v"), ("EXPIREAT", "h", str(NOW + 1000)), ("EXPIRETIME", "h"), ("EXPIRETIME",),
+    ("PEXPIRETIME", "a", "b"))
+seq("wait_no_replicas", ("WAIT", "0", "0"), ("SET", "k", "v"), ("WAIT", "0", "0"), ("WAIT", "-1", "0"),
+    ("WAIT", "1", "50"), ("WAIT", "2", "1"), ("GET", "k"))
+seq("wait_errors", ("WAIT", "x", "0"), ("WAIT", "1", "x"), ("WAIT", "1", "1.5"), ("WAIT", "1", "-1"),
+    ("WAIT", "99999999999999999999", "0"), ("WAIT", "1"), ("WAIT", "1", "2", "3"),
+    ("WAIT",))
 seq("persist", ("SET", "k", "v", "EX", "100"), ("PERSIST", "k"), ("TTL", "k"), ("PERSIST", "k"), ("PERSIST", "nokey"),
     ("GET", "k"))
 seq("expire_arity", ("EXPIRE", "k"), ("PEXPIRE", "k"), ("EXPIREAT", "k"), ("TTL",), ("TTL", "a", "b"), ("PTTL",),
@@ -406,6 +416,29 @@ seq("hash_hincrby", ("HINCRBY", "h", "n", "5"), ("HINCRBY", "h", "n", "-7"), ("H
     ("HSET", "h", "s", "x", "m", "9223372036854775807", "z", "07"), ("HINCRBY", "h", "s", "1"),
     ("HINCRBY", "h", "m", "1"), ("HINCRBY", "h", "z", "1"), ("HINCRBY", "h", "n", "x"),
     ("HINCRBY", "h", "n", "1.5"), ("HINCRBY", "nokey", "f", "x"), ("EXISTS", "nokey"), ("HGETALL", "h"))
+seq("hash_hincrbyfloat", ("HSET", "h", "a", "1"), ("HINCRBYFLOAT", "h", "a", "2.5"), ("HINCRBYFLOAT", "h", "b", "1e2"),
+    ("HINCRBYFLOAT", "h", "c", "x"), ("HSET", "h", "s", "xx"), ("HINCRBYFLOAT", "h", "s", "1"),
+    ("HINCRBYFLOAT", "h", "a", "inf"), ("HINCRBYFLOAT", "h", "a", "nan"), ("HINCRBYFLOAT", "h", "a", "0.1"),
+    ("HGETALL", "h"), ("OBJECT", "ENCODING", "h"), ("HINCRBYFLOAT", "h", "a", "1e300"), ("OBJECT", "ENCODING", "h"),
+    ("HSET", "h", "i", "inf"), ("HINCRBYFLOAT", "h", "i", "1"), ("HINCRBYFLOAT", "nokey", "f", "-inf"),
+    ("EXISTS", "nokey"), ("HINCRBYFLOAT", "big", "f", "1e4932"), ("HINCRBYFLOAT", "big", "f", "1e4932"),
+    ("SET", "str", "v"), ("HINCRBYFLOAT", "str", "a", "1"), ("HINCRBYFLOAT", "str", "a", "x"),
+    ("HINCRBYFLOAT", "h", "a"), ("HINCRBYFLOAT", "h", "a", "1", "2"), ("HSET", "k", "x" * 65, "1"),
+    ("HSET", "k2", "a", "1"), ("HINCRBYFLOAT", "k2", "x" * 65, "1"), ("OBJECT", "ENCODING", "k2"))
+# A small hash's fields come whole in their order; random picks by length.
+seq("hash_hrandfield", ("HSET", "h", "a", "1", "b", "2", "c", "3"), ("HRANDFIELD", "nokey"),
+    ("HRANDFIELD", "nokey", "2"), ("HRANDFIELD", "h", "5"), ("HRANDFIELD", "h", "3", "withvalues"),
+    ("HRANDFIELD", "h", "0"), ("HRANDFIELD", "h", "-5", "WITHVALUES"), ("HRANDFIELD", "h", "2"), ("HRANDFIELD", "h"),
+    ("HRANDFIELD", "h", "x"), ("HRANDFIELD", "h", "1", "foo"), ("HRANDFIELD", "h", "1", "withvalues", "x"),
+    ("HRANDFIELD", "h", "-9223372036854775808"), ("HRANDFIELD", "h", "4611686018427387904", "withvalues"),
+    ("HRANDFIELD", "h", "-4611686018427387904", "withvalues"), ("HRANDFIELD", "h", "4611686018427387903", "withvalues"),
+    ("HRANDFIELD", "nokey", "1", "foo"), ("HRANDFIELD", "nokey", "x"), ("SET", "str", "v"), ("HRANDFIELD", "str"),
+    ("HRANDFIELD", "str", "1"), ("HRANDFIELD", "str", "0"), ("HRANDFIELD",), ("HRANDFIELD", "h", "-1"),
+    norm=[at([6, 7], length_only), at([8, 23], kind_only)])
+seq("hash_hrandfield_resp3", ("HELLO", "3"), ("HSET", "h", "a", "1", "b", "2", "c", "3"), ("HRANDFIELD", "nokey"),
+    ("HRANDFIELD", "nokey", "1"), ("HRANDFIELD", "h", "5", "WITHVALUES"), ("HRANDFIELD", "h", "-2", "withvalues"),
+    ("HRANDFIELD", "h", "1", "withvalues"), ("HRANDFIELD", "h", "-1"),
+    norm=[at(0, mask_hello), at([5, 6, 7], length_only)])
 seq("hash_encoding", ("HSET", "h", "f", "x" * 64), ("OBJECT", "ENCODING", "h"), ("HSET", "h", "g", "x" * 65),
     ("OBJECT", "ENCODING", "h"), ("HSET", "k", "x" * 65, "v"), ("OBJECT", "ENCODING", "k"),
     ("HDEL", "h", "g"), ("OBJECT", "ENCODING", "h"))
@@ -453,6 +486,16 @@ seq("set_algebra", ("SADD", "a", "1", "2", "3"), ("SADD", "b", "3", "4"), ("SADD
     ("SINTERSTORE", "str", "a", "b"), ("TYPE", "str"), ("SDIFFSTORE", "str", "a", "nokey"), ("SMEMBERS", "str"),
     ("SINTERSTORE", "str", "a", "nokey"), ("EXISTS", "str"), ("SUNIONSTORE", "d", "c"), ("OBJECT", "ENCODING", "d"),
     ("SUNION",), ("SINTERSTORE", "d"), norm=[at([7, 8], sorted_elems)])
+seq("set_sintercard", ("SADD", "s1", "a", "b", "c", "d"), ("SADD", "s2", "b", "c", "d", "e"),
+    ("SINTERCARD", "2", "s1", "s2"), ("SINTERCARD", "2", "s1", "s2", "LIMIT", "2"), ("SINTERCARD", "2", "s1", "s2", "limit", "0"),
+    ("SINTERCARD", "1", "s1"), ("SINTERCARD", "2", "s1", "s1"), ("SINTERCARD", "0", "s1"), ("SINTERCARD", "x", "s1"),
+    ("SINTERCARD", "-1", "s1"), ("SINTERCARD", "3", "s1", "s2"), ("SINTERCARD", "2", "s1", "s2", "LIMIT"),
+    ("SINTERCARD", "2", "s1", "s2", "LIMIT", "-1"), ("SINTERCARD", "2", "s1", "s2", "LIMIT", "x"),
+    ("SINTERCARD", "2", "s1", "s2", "FOO", "1"), ("SINTERCARD", "2", "s1", "s2", "LIMIT", "1", "LIMIT", "3"),
+    ("SET", "str", "v"), ("SINTERCARD", "2", "nokey", "str"), ("SINTERCARD", "2", "str", "nokey"),
+    ("SINTERCARD", "1", "nokey"), ("SINTERCARD", "2abc", "s1", "s2"), ("SINTERCARD", "1", "s1", "s2"),
+    ("SINTERCARD", "9223372036854775808", "s1"), ("SADD", "i", "1", "2", "3"), ("SINTERCARD", "2", "i", "s1"),
+    ("SINTERCARD", "1"), ("SINTERCARD",), ("sintercard", "1", "i", "limit", "2"))
 seq("set_store_keeps_no_ttl", ("SADD", "a", "1"), ("SADD", "d", "9"), ("EXPIRE", "d", "100"),
     ("SUNIONSTORE", "d", "a"), ("TTL", "d"), ("SMEMBERS", "d"))
 seq("set_wrongtype", ("SET", "str", "v"), ("SADD", "str", "a"), ("SREM", "str", "a"), ("SMEMBERS", "str"),
@@ -498,6 +541,17 @@ seq("list_lmove", ("RPUSH", "a", "1", "2"), ("EXPIRE", "a", "100"), ("LMOVE", "a
     ("LMOVE", "b", "str", "LEFT", "LEFT"), ("LMOVE", "str", "b", "LEFT", "LEFT"), ("RPOPLPUSH", "b", "str"),
     ("LRANGE", "b", "0", "-1"), ("RPUSH", "one", "x"), ("EXPIRE", "one", "100"), ("RPOPLPUSH", "one", "one"),
     ("TTL", "one"))
+seq("list_lmpop", ("RPUSH", "l1", "a", "b", "c", "d"), ("RPUSH", "l2", "x"), ("LMPOP", "2", "nokey", "l1", "LEFT"),
+    ("LMPOP", "2", "nokey", "l1", "RIGHT", "COUNT", "2"), ("LMPOP", "2", "l1", "l2", "left", "count", "10"),
+    ("EXISTS", "l1"), ("LMPOP", "1", "nokey", "LEFT"), ("LMPOP", "0", "l2", "LEFT"), ("LMPOP", "1", "l2"),
+    ("LMPOP", "2", "l2", "LEFT"), ("LMPOP", "1", "l2", "UP"), ("LMPOP", "1", "l2", "LEFT", "COUNT", "0"),
+    ("LMPOP", "1", "l2", "LEFT", "COUNT", "x"), ("LMPOP", "1", "l2", "LEFT", "COUNT", "1", "COUNT", "2"),
+    ("LMPOP", "1", "l2", "LEFT", "FOO"), ("LMPOP", "x", "l2", "LEFT"), ("LMPOP", "1", "l2", "LEFT", "COUNT"),
+    ("LMPOP", "9223372036854775807", "l2", "LEFT"), ("LMPOP", "1", "l2", "LEFT", "COUNT", "9223372036854775807"),
+    ("SET", "str", "v"), ("RPUSH", "l3", "q"), ("LMPOP", "3", "nokey", "str", "l3", "LEFT"),
+    ("LMPOP", "2", "l3", "str", "LEFT"), ("LMPOP", "1", "str", "RIGHT"), ("LMPOP",), ("LMPOP", "1", "a"))
+seq("list_lmpop_resp3", ("HELLO", "3"), ("RPUSH", "l", "x", "y"), ("LMPOP", "1", "nokey", "LEFT"),
+    ("LMPOP", "1", "l", "RIGHT", "COUNT", "5"), norm=[at(0, mask_hello)])
 seq("list_wrongtype", ("SET", "str", "v"), ("LPUSH", "str", "a"), ("RPUSH", "str", "a"), ("LPUSHX", "str", "a"),
     ("LPOP", "str"), ("RPOP", "str", "1"), ("LPOP", "str", "x"), ("LLEN", "str"), ("LRANGE", "str", "0", "-1"),
     ("LRANGE", "str", "x", "1"), ("LINDEX", "str", "0"), ("LSET", "str", "0", "a"), ("LINSERT", "str", "BEFORE", "a", "b"),
@@ -566,6 +620,32 @@ seq("incr_keeps_ttl", ("SET", "n", "1", "EX", "100"), ("INCR", "n"), ("TTL", "n"
     norm=[at(2, int_range(98, 100))])
 seq("incr_arity", ("INCR",), ("INCR", "a", "b"), ("DECR",), ("INCRBY", "a"), ("INCRBY", "a", "1", "2"),
     ("DECRBY", "a"))
+# --- floats ------------------------------------------------------------
+# Redis on x86_64 adds in the x87's 80-bit long double and writes %.17Lf.
+seq("incrbyfloat_basic", ("SET", "f", "10.5"), ("INCRBYFLOAT", "f", "0.1"), ("INCRBYFLOAT", "f", "5.0e3"),
+    ("INCRBYFLOAT", "f", "-5010.6"), ("INCRBYFLOAT", "n", "3"), ("GET", "n"), ("SET", "i", "3.0"),
+    ("INCRBYFLOAT", "i", "1.0"), ("INCRBYFLOAT", "i", "1.5e-20"), ("INCRBYFLOAT", "i", "0x10"),
+    ("INCRBYFLOAT", "i", "10000000000000000000000"), ("INCRBYFLOAT", "i", "1.123456789012345678901"),
+    ("SET", "j", "1.7976931348623157e308"), ("INCRBYFLOAT", "j", "1.7976931348623157e308"),
+    ("INCRBYFLOAT", "big", "1e4932"), ("SET", "t", "-1e-20"), ("INCRBYFLOAT", "t", "0"),
+    ("SET", "t", "1.00000000000000000005"), ("INCRBYFLOAT", "t", "0"), ("SET", "t", b"1.5\x00junk"),
+    ("INCRBYFLOAT", "t", "1"), ("SET", "k", "5", "EX", "100"), ("INCRBYFLOAT", "k", "1"), ("TTL", "k"),
+    norm=[at(23, int_range(98, 100))])
+seq("incrbyfloat_strings", *[c for v in ["1e-4940", "1e-4950", "1e-5000", "-1e-20", "1.2e4932", "infinity", "-inf",
+                                         "0x1p3", "0x1.8p-1", ".5", "5.", "+5", "-0", "1e-17", "5e-18", "1.5e-17",
+                                         "2.5e-17", "00012", "1_0", "", " ", "1 ", " 1", "1e", "1e+", "0x", "0xg",
+                                         "nan", "0x1p", "1e99999999999999999999", "0e9999999999", "0x1p-16446",
+                                         "0x1p-16445", "0x0.ffffffffffffffffp16384", "0x1p16384", "\t1", "1" * 5119,
+                                         "0x1p-18", "0x3p-18", "0" * 5119 + "1", "0" * 5118 + "1"]
+                             for c in (("SET", "x", "0"), ("INCRBYFLOAT", "x", v))])
+seq("incrbyfloat_errors", ("SET", "g", "abc"), ("INCRBYFLOAT", "g", "1"), ("INCRBYFLOAT", "g", "x"),
+    ("SET", "m", "1.18e4932"), ("INCRBYFLOAT", "m", "1e4931"), ("GET", "m"), ("SET", "s", "inf"),
+    ("INCRBYFLOAT", "s", "1"), ("INCRBYFLOAT", "nokey", "x"), ("EXISTS", "nokey"), ("HSET", "h", "a", "1"),
+    ("INCRBYFLOAT", "h", "x"), ("INCRBYFLOAT", "h", "1"), ("INCRBYFLOAT", "f"), ("INCRBYFLOAT", "f", "1", "2"),
+    ("SET", "y", "1" * 5120), ("INCRBYFLOAT", "y", "1"),
+    # Only the sticky bit puts this past halfway: ...615; -0.5 ties to even.
+    ("SET", "e", "18446744073709551616"), ("INCRBYFLOAT", "e", "-0x1.0000000000000002p-1"),
+    ("SET", "e", "18446744073709551616"), ("INCRBYFLOAT", "e", "-0.5"))
 
 # --- DBSIZE / FLUSHDB / FLUSHALL / SELECT ------------------------------
 seq("dbsize", ("DBSIZE",), ("MSET", "a", "1", "b", "2", "c", "3"), ("DBSIZE",), ("DEL", "a"), ("DBSIZE",),

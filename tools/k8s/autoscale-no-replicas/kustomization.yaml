@@ -1,0 +1,27 @@
+# kind_check.sh --autoscale --no-replicas: tools/k8s/autoscale without
+# replicas (components/no-replicas), up to six nodes, busy CPU at 40% (every
+# node a primary; see autoscale).
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../autoscale
+
+components:
+  - ../../../deploy/kubernetes/components/no-replicas
+
+patches:
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: speedvault
+    patch: |-
+      - op: replace
+        path: /spec/maxReplicas
+        value: 6
+      - op: test
+        path: /spec/metrics/0/pods/metric/name
+        value: speedvault_busy_cores
+      - op: replace
+        path: /spec/metrics/0/pods/target/averageValue
+        value: 400m

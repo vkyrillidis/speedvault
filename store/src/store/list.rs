@@ -6,21 +6,9 @@ use super::{Store, Value};
 use crate::collections::List;
 use crate::Error;
 
-impl Value {
-    fn as_list(&self) -> Result<&List, Error> {
-        match self {
-            Value::List(l) => Ok(l),
-            _ => Err(Error::WrongType),
-        }
-    }
+/// Which of the keys a pop took from, and the elements, in pop order.
+type Popped = (usize, Vec<Box<[u8]>>);
 
-    fn as_list_mut(&mut self) -> Result<&mut List, Error> {
-        match self {
-            Value::List(l) => Ok(l),
-            _ => Err(Error::WrongType),
-        }
-    }
-}
 
 /// Which end of a list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,7 +41,7 @@ impl Store {
     /// The list at `key`, `None` if there's none (`LRANGE`, `LINDEX`, ...).
     pub fn list_at(&mut self, key: &[u8]) -> Result<Option<&List>, Error> {
         match self.live(key) {
-            Some(e) => Ok(Some(e.value.as_list()?)),
+            Some(e) => Ok(Some(e.as_list()?)),
             None => Ok(None),
         }
     }
@@ -61,7 +49,7 @@ impl Store {
     /// The list at `key` to change, `None` if there's none.
     fn list_mut(&mut self, key: &[u8]) -> Result<Option<&mut List>, Error> {
         match self.live(key) {
-            Some(e) => Ok(Some(e.value.as_list_mut()?)),
+            Some(e) => Ok(Some(e.as_list_mut()?)),
             None => Ok(None),
         }
     }
@@ -103,6 +91,18 @@ impl Store {
         };
         self.drop_if_empty(key);
         Ok(Some(popped))
+    }
+
+    /// `LMPOP`: up to `count` elements from the first of `keys` holding a
+    /// list, and which key that was; `None` if none does. A key of another
+    /// type before that one fails, any after it isn't looked at.
+    pub fn mpop(&mut self, keys: &[&[u8]], end: End, count: usize) -> Result<Option<Popped>, Error> {
+        for (i, key) in keys.iter().enumerate() {
+            if self.list_at(key)?.is_some() {
+                return Ok(self.pop(key, end, count)?.map(|popped| (i, popped)));
+            }
+        }
+        Ok(None)
     }
 
     /// `LSET`.
@@ -225,6 +225,21 @@ mod tests {
         assert_eq!(s.pop(b"l", End::Left, 5).unwrap().unwrap().len(), 1);
         assert!(!s.exists(b"l"));
         assert_eq!(s.pop(b"l", End::Left, 1), Ok(None));
+    }
+
+    #[test]
+    fn mpop() {
+        let mut s = store();
+        s.push(b"a", End::Right, &[b"1", b"2", b"3"], false).unwrap();
+        s.push(b"b", End::Right, &[b"x"], false).unwrap();
+        s.set(b"o", b"v", Default::default()).unwrap();
+        let one = |e: &str| Box::from(e.as_bytes());
+        assert_eq!(s.mpop(&[b"nope", b"a", b"b"], End::Right, 2), Ok(Some((1, vec![one("3"), one("2")]))));
+        assert_eq!(s.mpop(&[b"a", b"b"], End::Left, 10), Ok(Some((0, vec![one("1")]))));
+        assert!(!s.exists(b"a"));
+        assert_eq!(s.mpop(&[b"b", b"o"], End::Left, 1), Ok(Some((0, vec![one("x")]))), "a type after isn't looked at");
+        assert_eq!(s.mpop(&[b"nope", b"b"], End::Left, 1), Ok(None));
+        assert_eq!(s.mpop(&[b"nope", b"o", b"b"], End::Left, 1), Err(Error::WrongType));
     }
 
     #[test]

@@ -24,6 +24,15 @@ pub enum Error {
     StringTooLong,
     /// `HINCRBY` of a field that isn't an integer.
     HashNotInteger,
+    /// The value, or the increment, of `INCRBYFLOAT` or `HINCRBYFLOAT`
+    /// isn't a float Redis reads.
+    NotFloat,
+    /// `HINCRBYFLOAT` of a field that isn't a float.
+    HashNotFloat,
+    /// `HINCRBYFLOAT` by an infinity.
+    NanOrInfinity,
+    /// `INCRBYFLOAT` and `HINCRBYFLOAT` would make an infinity.
+    NotFinite,
     /// `LSET` of a missing key.
     NoSuchKey,
     /// `LSET` past the end of the list.
@@ -42,6 +51,10 @@ impl fmt::Display for Error {
             Error::ExpireGtLtConflict => f.write_str("ERR GT and LT options at the same time are not compatible"),
             Error::StringTooLong => f.write_str("ERR string exceeds maximum allowed size (proto-max-bulk-len)"),
             Error::HashNotInteger => f.write_str("ERR hash value is not an integer"),
+            Error::NotFloat => f.write_str("ERR value is not a valid float"),
+            Error::HashNotFloat => f.write_str("ERR hash value is not a float"),
+            Error::NanOrInfinity => f.write_str("ERR value is NaN or Infinity"),
+            Error::NotFinite => f.write_str("ERR increment would produce NaN or Infinity"),
             Error::NoSuchKey => f.write_str("ERR no such key"),
             Error::IndexOutOfRange => f.write_str("ERR index out of range"),
         }

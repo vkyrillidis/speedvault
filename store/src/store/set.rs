@@ -5,25 +5,10 @@
 //! variants) are built as a [`Set`] here too, from empty, so they come out
 //! an intset (in numeric order) exactly when Redis's would.
 
-use super::{Store, Value};
+use super::{Effect, Store, Value};
 use crate::collections::Set;
 use crate::Error;
 
-impl Value {
-    fn as_set(&self) -> Result<&Set, Error> {
-        match self {
-            Value::Set(s) => Ok(s),
-            _ => Err(Error::WrongType),
-        }
-    }
-
-    fn as_set_mut(&mut self) -> Result<&mut Set, Error> {
-        match self {
-            Value::Set(s) => Ok(s),
-            _ => Err(Error::WrongType),
-        }
-    }
-}
 
 /// Which of `SUNION`, `SINTER`, `SDIFF`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,7 +22,7 @@ impl Store {
     /// The set at `key`, `None` if there's none (`SMEMBERS`, `SCARD`, ...).
     pub fn set_at(&mut self, key: &[u8]) -> Result<Option<&Set>, Error> {
         match self.live(key) {
-            Some(e) => Ok(Some(e.value.as_set()?)),
+            Some(e) => Ok(Some(e.as_set()?)),
             None => Ok(None),
         }
     }
@@ -46,7 +31,7 @@ impl Store {
     pub fn sadd(&mut self, key: &[u8], members: &[&[u8]]) -> Result<usize, Error> {
         match self.live(key) {
             Some(e) => {
-                let s = e.value.as_set_mut()?;
+                let s = e.as_set_mut()?;
                 Ok(members.iter().filter(|m| s.insert(m)).count())
             }
             None => {
@@ -61,7 +46,7 @@ impl Store {
     /// `SREM`: how many of `members` were there.
     pub fn srem(&mut self, key: &[u8], members: &[&[u8]]) -> Result<usize, Error> {
         let Some(e) = self.live(key) else { return Ok(0) };
-        let s = e.value.as_set_mut()?;
+        let s = e.as_set_mut()?;
         let removed = members.iter().filter(|m| s.remove(m)).count();
         if s.is_empty() {
             self.remove(key);
@@ -72,15 +57,19 @@ impl Store {
     /// `SPOP key`: a random member, now removed.
     pub fn spop(&mut self, key: &[u8]) -> Result<Option<Box<[u8]>>, Error> {
         let len = match self.live(key) {
-            None => return Ok(None),
-            Some(e) => e.value.as_set()?.len(),
+            None => {
+                self.effect(|| Effect::Nothing);
+                return Ok(None);
+            }
+            Some(e) => e.as_set()?.len(),
         };
         let pos = self.random_below(len);
-        let s = self.live(key).expect("looked up above").value.as_set_mut()?;
+        let s = self.live(key).expect("looked up above").as_set_mut()?;
         let member = s.take_at(pos);
         if s.is_empty() {
             self.remove(key);
         }
+        self.effect(|| Effect::As(vec![b"SREM".to_vec(), key.to_vec(), member.to_vec()]));
         Ok(Some(member))
     }
 
@@ -88,22 +77,30 @@ impl Store {
     /// them, in the set's order, when `count` covers the set, as in Redis.
     pub fn spop_count(&mut self, key: &[u8], count: usize) -> Result<Vec<Box<[u8]>>, Error> {
         let len = match self.live(key) {
-            None => return Ok(Vec::new()),
-            Some(e) => e.value.as_set()?.len(),
+            None => {
+                self.effect(|| Effect::Nothing);
+                return Ok(Vec::new());
+            }
+            Some(e) => e.as_set()?.len(),
         };
-        if count >= len {
-            let members = match self.remove(key).map(|e| e.value) {
+        let popped: Vec<Box<[u8]>> = if count >= len {
+            match self.remove(key).map(|e| e.into_value()) {
                 Some(Value::Set(s)) => s.members().into_iter().map(Box::from).collect(),
                 _ => unreachable!("type checked above"),
-            };
-            return Ok(members);
-        }
-        let mut popped = Vec::with_capacity(count);
-        for left in (len - count + 1..=len).rev() {
-            let pos = self.random_below(left);
-            let s = self.live(key).expect("not emptied").value.as_set_mut()?;
-            popped.push(s.take_at(pos));
-        }
+            }
+        } else {
+            let mut popped = Vec::with_capacity(count);
+            for left in (len - count + 1..=len).rev() {
+                let pos = self.random_below(left);
+                let s = self.live(key).expect("not emptied").as_set_mut()?;
+                popped.push(s.take_at(pos));
+            }
+            popped
+        };
+        self.effect(|| match popped.is_empty() {
+            true => Effect::Nothing,
+            false => Effect::As([b"SREM".to_vec(), key.to_vec()].into_iter().chain(popped.iter().map(|m| m.to_vec())).collect()),
+        });
         Ok(popped)
     }
 
@@ -111,10 +108,10 @@ impl Store {
     pub fn srandmember(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         let len = match self.live(key) {
             None => return Ok(None),
-            Some(e) => e.value.as_set()?.len(),
+            Some(e) => e.as_set()?.len(),
         };
         let pos = self.random_below(len);
-        Ok(Some(self.live(key).expect("looked up above").value.as_set()?.member_at(pos).to_vec()))
+        Ok(Some(self.live(key).expect("looked up above").as_set()?.member_at(pos).to_vec()))
     }
 
     /// `SRANDMEMBER key count`: `count` > 0 distinct members (all of them,
@@ -123,7 +120,7 @@ impl Store {
     pub fn srandmember_count(&mut self, key: &[u8], count: i64) -> Result<Vec<Vec<u8>>, Error> {
         let len = match self.live(key) {
             None => return Ok(Vec::new()),
-            Some(e) => e.value.as_set()?.len(),
+            Some(e) => e.as_set()?.len(),
         };
         let mut picks: Vec<usize> = Vec::new();
         if count < 0 {
@@ -132,7 +129,7 @@ impl Store {
                 picks.push(self.random_below(len));
             }
         } else if count as u64 >= len as u64 {
-            let s = self.live(key).expect("looked up above").value.as_set()?;
+            let s = self.live(key).expect("looked up above").as_set()?;
             return Ok(s.members().into_iter().map(<[u8]>::to_vec).collect());
         } else {
             // A partial Fisher-Yates over the positions.
@@ -144,7 +141,7 @@ impl Store {
             all.truncate(count as usize);
             picks = all;
         }
-        let s = self.live(key).expect("looked up above").value.as_set()?;
+        let s = self.live(key).expect("looked up above").as_set()?;
         Ok(picks.into_iter().map(|pos| s.member_at(pos).to_vec()).collect())
     }
 
@@ -153,9 +150,9 @@ impl Store {
     pub fn smove(&mut self, src: &[u8], dst: &[u8], member: &[u8]) -> Result<bool, Error> {
         // Redis's order: a missing source first, then both types.
         let Some(e) = self.live(src) else { return Ok(false) };
-        let has = e.value.as_set()?.contains(member);
+        let has = e.as_set()?.contains(member);
         if let Some(e) = self.live(dst) {
-            e.value.as_set()?;
+            e.as_set()?;
         }
         if src == dst || !has {
             return Ok(has);
@@ -168,20 +165,10 @@ impl Store {
     /// `SUNION`, `SINTER`, `SDIFF` of `keys` (at least one). Every key's
     /// type is checked first, missing keys or not (Redis 7.0.15).
     pub fn combine(&mut self, op: SetOp, keys: &[&[u8]]) -> Result<Set, Error> {
-        // Type checks first (and expiry), then borrow every set at once.
-        let mut missing = false;
-        for key in keys {
-            match self.live(key) {
-                None => missing = true,
-                Some(e) => {
-                    e.value.as_set()?;
-                }
-            }
-        }
-        if missing && op == SetOp::Inter {
+        if self.check_sets(keys)? && op == SetOp::Inter {
             return Ok(Set::default());
         }
-        let sets: Vec<Option<&Set>> = keys.iter().map(|k| self.map.get(*k).map(|e| e.value.as_set().expect("checked"))).collect();
+        let sets = self.sets(keys);
         let mut out = Set::default();
         match op {
             SetOp::Union => {
@@ -212,6 +199,40 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// `SINTERCARD`: the size of the intersection of `keys` (at least
+    /// one), counted up to `limit` (0: no limit). Types checked as `SINTER`.
+    pub fn sintercard(&mut self, keys: &[&[u8]], limit: usize) -> Result<usize, Error> {
+        if self.check_sets(keys)? {
+            return Ok(0);
+        }
+        let mut sets: Vec<&Set> = self.sets(keys).into_iter().flatten().collect();
+        sets.sort_by_key(|s| s.len());
+        let limit = if limit == 0 { usize::MAX } else { limit };
+        Ok(sets[0].iter().filter(|m| sets[1..].iter().all(|s| s.contains(m))).take(limit).count())
+    }
+
+    /// Checks that each of `keys` that exists holds a set (expiring the
+    /// keys due), missing keys or not, as Redis 7.0.15: whether one is
+    /// missing.
+    fn check_sets(&mut self, keys: &[&[u8]]) -> Result<bool, Error> {
+        let mut missing = false;
+        for key in keys {
+            match self.live(key) {
+                None => missing = true,
+                Some(e) => {
+                    e.as_set()?;
+                }
+            }
+        }
+        Ok(missing)
+    }
+
+    /// The sets at `keys`, after [`check_sets`](Self::check_sets): every
+    /// one borrowed at once.
+    fn sets(&self, keys: &[&[u8]]) -> Vec<Option<&Set>> {
+        keys.iter().map(|k| self.keys.get(k).map(|e| e.as_set().expect("checked"))).collect()
     }
 
     /// `SUNIONSTORE`, `SINTERSTORE`, `SDIFFSTORE`: the result replaces
@@ -332,5 +353,21 @@ mod tests {
         assert_eq!(s.type_of(b"l"), "set");
         assert_eq!(s.combine_store(SetOp::Inter, b"l", &[b"a", b"nope"]), Ok(0));
         assert!(!s.exists(b"l"));
+    }
+
+    #[test]
+    fn sintercard() {
+        let mut s = store();
+        s.sadd(b"a", &[b"a", b"b", b"c", b"d"]).unwrap();
+        s.sadd(b"b", &[b"b", b"c", b"d", b"e"]).unwrap();
+        put_other(&mut s, b"l");
+        assert_eq!(s.sintercard(&[b"a", b"b"], 0), Ok(3));
+        assert_eq!(s.sintercard(&[b"a", b"b"], 2), Ok(2));
+        assert_eq!(s.sintercard(&[b"a", b"b"], 9), Ok(3));
+        assert_eq!(s.sintercard(&[b"a"], 0), Ok(4));
+        assert_eq!(s.sintercard(&[b"a", b"a"], 0), Ok(4));
+        assert_eq!(s.sintercard(&[b"nope"], 0), Ok(0));
+        assert_eq!(s.sintercard(&[b"nope", b"l"], 0), Err(Error::WrongType), "Redis checks every type");
+        assert_eq!(s.sintercard(&[b"l", b"nope"], 0), Err(Error::WrongType));
     }
 }

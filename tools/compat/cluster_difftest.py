@@ -6,6 +6,8 @@ cluster_difftest.sh, which starts both).
     python3 cluster_difftest.py clients  --redis 7851 --ours 7860 [--ours 7861]
     python3 cluster_difftest.py load     --ours 7860 --seconds 6
     python3 cluster_difftest.py migrating --redis 7851,7852,7853 --ours 7861,7862,7863
+    python3 cluster_difftest.py replicas --redis 7871,...,7876 --ours 7881,...,7886
+    python3 cluster_difftest.py failed   --redis 7871,...,7876 --ours 7881,...,7886 --dead 7872,7884
 
 requests: the same requests to node i of each cluster (keys of every
   node's slots, alone, twice, with hash tags and mixed: MOVED, CROSSSLOT;
@@ -25,6 +27,26 @@ migrating: a slot of the first node migrating to the second, Redis's put
   and without ASKING to the source, the target and the third node (ASK,
   TRYAGAIN, MOVED, CLUSTER NODES with the [slot->-id] markers), RESP2 and
   RESP3. Both clusters end with the slot stable again.
+replicas (phase 8): three primaries with a replica each, Redis's made by
+  redis-cli --cluster create --cluster-replicas 1, ours by stuart
+  --replicas 1. The same keys of every type written to both (some with an
+  absolute expiry), then, once every replica has its primary's offset and
+  every node lists the replicas: every node's CLUSTER SLOTS, SHARDS (the
+  offsets masked: the streams differ, Redis's has SELECT), NODES, INFO
+  and HELLO, RESP2 and RESP3, our replicas mapped to Redis's by their
+  primaries; at the replicas, writes and reads without READONLY
+  redirected, reads after READONLY answered from the copy (another
+  primary's keys still redirected), DBSIZE.
+failover (phase 8): after failed, the primary of the range at 5461 SIGKILLed
+  in each (by its pid, from INFO server); once its replica has taken over
+  everywhere, Redis's by itself, ours through stuart: the layout at every
+  live node (the old primary a failed master without slots), a write and
+  ROLE at the new primary.
+failed (phase 8): after replicas, the replica of slot 0's primary SIGKILLed
+  in each (--dead R,O: their ports); once every node left marks it failed,
+  Redis by gossip, ours by stuart's table: every live node's CLUSTER
+  SLOTS, SHARDS, NODES and INFO, RESP2 and RESP3, a write at its primary,
+  which has no replica attached any more.
 """
 
 from __future__ import annotations
@@ -40,6 +62,7 @@ from resp import Conn, cmd, parse
 from cluster_compat import mask_nodes
 
 HELLO_ID = re.compile(rb"\$2\r\nid\r\n:\d+\r\n")
+SHARDS_OFFSET = re.compile(rb"\$18\r\nreplication-offset\r\n:\d+\r\n")
 
 
 def ports(text: str) -> List[int]:
@@ -116,7 +139,15 @@ def requests(keys: List[bytes]) -> List[Tuple]:
                    ("SADD", st, "3", "1", "2"), ("SMEMBERS", st), ("SUNIONSTORE", st, st, st), ("SUNION", st, other),
                    ("SMOVE", st, other, "1"), ("RPUSH", l, "x", "y"), ("LMOVE", l, l2, "LEFT", "RIGHT"),
                    ("LRANGE", l2, "0", "-1"), ("RPOPLPUSH", l, other), ("HSCAN", h, "0"), ("SSCAN", st, "0"),
-                   ("OBJECT", "ENCODING", h), ("TYPE", l2)]
+                   ("OBJECT", "ENCODING", h), ("TYPE", l2), ("HINCRBYFLOAT", h, "f", "1.5"), ("INCRBYFLOAT", k, "0.5"),
+                   ("HRANDFIELD", h, "100"),
+                   # Keys after a count: routed by them, none when the count
+                   # isn't one (the command fails where it is).
+                   ("SINTERCARD", "2", st, st), ("SINTERCARD", "1", st, "LIMIT", "1"), ("SINTERCARD", "2", st, other),
+                   ("SINTERCARD", "0", st), ("SINTERCARD", "3", st, other), ("SINTERCARD", "x", st),
+                   ("SINTERCARD", "2abc", st, st), ("SINTERCARD", " 2", st, other),
+                   ("LMPOP", "2", l, l2, "LEFT"), ("LMPOP", "1", l2, "RIGHT", "COUNT", "2"), ("LMPOP", "2", l, other, "LEFT"),
+                   ("LMPOP", "3", l, "LEFT"), ("LMPOP", "0", l, "LEFT"), ("LMPOP", "2", l, "LEFT")]
     probes += [("SCAN", "0", "COUNT", "100000"), ("SCAN", "0", "MATCH", "*:h", "COUNT", "100000"),
                ("SCAN", "0", "TYPE", "list", "COUNT", "100000"), ("KEYS", "*"), ("KEYS", "*:s")]
     probes += [("CLUSTER", "COUNTKEYSINSLOT", "0"), ("DBSIZE",)]
@@ -147,7 +178,8 @@ def compare_requests(redis: List[int], ours: List[int]) -> int:
             return kind + "\n".join(sorted(text.split("\n"))).encode()
         if p[:2] == ("CLUSTER", "SHARDS"):
             reply, _ = parse(raw)
-            return raw[:raw.index(b"\r\n")] + b"".join(sorted(e.encode() for e in reply.value))
+            shards = b"".join(sorted(SHARDS_OFFSET.sub(b"$18\r\nreplication-offset\r\n:N\r\n", e.encode()) for e in reply.value))
+            return raw[:raw.index(b"\r\n")] + shards
         if p[:2] == ("CLUSTER", "INFO"):
             return b"\r\n".join(raw.split(b"\r\n")[1:8])  # cluster_state .. cluster_size
         # A node's keys in its dict's order: compared as sets.
@@ -490,12 +522,325 @@ def load(port: int, seconds: float) -> int:
     return len(errors) + len(missing)
 
 
+def replicas_of(port: int) -> Dict[bytes, bytes]:
+    """Primary id -> replica id, from `port`'s CLUSTER NODES (one each)."""
+    with Conn("127.0.0.1", port, timeout=5) as c:
+        text = c.call("CLUSTER", "NODES").value
+    pairs = {}
+    for line in text.decode().splitlines():
+        f = line.split()
+        if "slave" in f[2]:
+            pairs[f[3].encode()] = f[0].encode()
+    return pairs
+
+
+def address(port: int, node_id: bytes) -> Tuple[bytes, int]:
+    with Conn("127.0.0.1", port, timeout=5) as c:
+        text = c.call("CLUSTER", "NODES").value.decode()
+    f = next(line.split() for line in text.splitlines() if line.startswith(node_id.decode()))
+    host, p = f[1].split("@")[0].rsplit(":", 1)
+    return host.encode(), int(p)
+
+
+def pair_replicas(redis: int, ours: int) -> Tuple[List[Tuple[bytes, bytes]], List[Tuple[int, int, int]]]:
+    """Each cluster's three primaries and their replicas, as `redis` and
+    `ours` (primaries) see them, paired by their slots: byte replacements
+    (ours, theirs) of addresses, ports and ids; (redis port, our port, the
+    first slot of a replica's primary, None for a primary)."""
+    theirs_view, mine_view = slots_view(redis), slots_view(ours)
+    if sorted(theirs_view) != sorted(mine_view) or len(mine_view) != 3:
+        raise SystemExit(f"the layouts differ: {sorted(theirs_view)} vs {sorted(mine_view)}")
+    theirs_r, mine_r = replicas_of(redis), replicas_of(ours)
+    pairs, nodes = [], []
+    for start in sorted(mine_view):
+        (h1, p1, i1), (h2, p2, i2) = mine_view[start], theirs_view[start]
+        (rh1, rp1), (rh2, rp2) = address(ours, mine_r[i1]), address(redis, theirs_r[i2])
+        for (ha, pa, ia), (hb, pb, ib) in [((h1, p1, i1), (h2, p2, i2)), ((rh1, rp1, mine_r[i1]), (rh2, rp2, theirs_r[i2]))]:
+            pairs += [(b"%s:%d" % (ha, pa), b"%s:%d" % (hb, pb)), (b":%d\r\n" % pa, b":%d\r\n" % pb), (ia, ib)]
+        # A replica with the first slot of its primary's range.
+        nodes += [(p2, p1, None), (rp2, rp1, start)]
+    return pairs, nodes
+
+
+def replace_all(pairs: List[Tuple[bytes, bytes]], raw: bytes) -> bytes:
+    for mine, theirs in pairs:
+        raw = raw.replace(mine, theirs)
+    return raw
+
+
+def norm_layout(p: Tuple, raw: bytes) -> bytes:
+    """A reply with what differs between the clusters masked: HELLO's id,
+    NODES' live fields and order, SHARDS' offsets and order, CLUSTER INFO
+    past cluster_size."""
+    raw = HELLO_ID.sub(b"$2\r\nid\r\n:ID\r\n", raw)
+    if p[:2] == ("CLUSTER", "NODES"):
+        kind, text = mask_nodes(raw)
+        return kind + "\n".join(sorted(text.split("\n"))).encode()
+    if p[:2] == ("CLUSTER", "SHARDS"):
+        reply, _ = parse(raw)
+        shards = b"".join(sorted(SHARDS_OFFSET.sub(b"$18\r\nreplication-offset\r\n:N\r\n", e.encode()) for e in reply.value))
+        return raw[:raw.index(b"\r\n")] + shards
+    if p[:2] == ("CLUSTER", "INFO"):
+        return b"\r\n".join(raw.split(b"\r\n")[1:8])  # cluster_state .. cluster_size
+    return raw
+
+
+def compare_replicas(redis: List[int], ours: List[int]) -> int:
+    pairs, nodes = pair_replicas(redis[0], ours[0])
+    print("replicas: " + ", ".join(f"{r}/{o}{' (replica)' if rep is not None else ''}" for r, o, rep in nodes))
+    ours_as_theirs = lambda raw: replace_all(pairs, raw)  # noqa: E731
+    norm = norm_layout
+    theirs_view, mine_view = slots_view(redis[0]), slots_view(ours[0])
+    theirs_r, mine_r = replicas_of(redis[0]), replicas_of(ours[0])
+
+    keys = keys_per_node(redis[0], 4)
+    starts = sorted(theirs_view)
+    with Conn("127.0.0.1", redis[0], timeout=5) as c:
+        slot = {k: c.call("CLUSTER", "KEYSLOT", k).value for k in keys}
+    shard = lambda k: max(s for s in starts if s <= slot[k])  # noqa: E731
+
+    # The same keys at both, each at its primary; then both synced.
+    far = int(time.time()) + 100000
+    tagged = lambda k, t: b"{%s}%s" % (k, t)  # noqa: E731
+    for k in keys:
+        writes = [("SET", k, b"v-" + k), ("HSET", tagged(k, b"h"), "f1", "a", "f2", "b"),
+                  ("RPUSH", tagged(k, b"l"), "x", "y", "z"), ("SADD", tagged(k, b"s"), "m1", "m2", "m3"),
+                  ("SET", tagged(k, b"t"), "v", "EXAT", str(far)), ("INCRBYFLOAT", tagged(k, b"f"), "1.5")]
+        for port in (theirs_view[shard(k)][1], mine_view[shard(k)][1]):
+            with Conn("127.0.0.1", port, timeout=5) as c:
+                for w in writes:
+                    reply = c.call(*w)
+                    if reply.kind == "-":
+                        raise SystemExit(f"{port}: {w}: {reply.value!r}")
+    pairs_by_port = {}  # replica port -> primary port, both clusters
+    for start in starts:
+        pairs_by_port[address(redis[0], theirs_r[theirs_view[start][2]])[1]] = theirs_view[start][1]
+        pairs_by_port[address(ours[0], mine_r[mine_view[start][2]])[1]] = mine_view[start][1]
+
+    def offset(port: int, name: bytes) -> int:
+        with Conn("127.0.0.1", port, timeout=5) as c:
+            return int(re.search(rb"^%s:(\d+)" % name, c.call("INFO", "replication").value, re.M).group(1))
+
+    def synced() -> bool:
+        for replica, primary in pairs_by_port.items():
+            if offset(primary, b"master_repl_offset") != offset(replica, b"slave_repl_offset"):
+                return False
+        for port in redis + ours:
+            with Conn("127.0.0.1", port, timeout=5) as c:
+                # Each range's primary and replica.
+                if c.call("CLUSTER", "SLOTS").encode().count(b"*4\r\n$9\r\n127.0.0.1\r\n") != 6:
+                    return False
+        return True
+
+    deadline = time.time() + 30
+    while not synced():
+        if time.time() > deadline:
+            raise SystemExit("replicas: not synced, or the replicas not listed, after 30 s")
+        time.sleep(0.2)
+
+    layout = [("CLUSTER", "SLOTS"), ("CLUSTER", "SHARDS"), ("CLUSTER", "NODES"), ("CLUSTER", "INFO"), ("CLUSTER", "MYID")]
+    failures = total = 0
+    for proto in (2, 3):
+        for rport, oport, mine in nodes:
+            probes = list(layout)
+            # Reads only at a primary: a write would be replicated.
+            probes += [("GET", k) for k in keys] + [("EXISTS", k) for k in keys]
+            if mine is not None:
+                for k in keys:
+                    probes += [("SET", k, "v"), ("INCR", k), ("MGET", k, k), ("DEL", k), ("HSET", k, "f", "v")]
+                probes += [("READONLY",)] + [("GET", k) for k in keys if shard(k) != mine]
+                for k in (k for k in keys if shard(k) == mine):
+                    h, l, s, t, f = (tagged(k, x) for x in (b"h", b"l", b"s", b"t", b"f"))
+                    probes += [("GET", k), ("MGET", k, k), ("EXISTS", k, k), ("TYPE", h), ("TYPE", l), ("TYPE", s),
+                               ("HGET", h, "f2"), ("HLEN", h), ("HMGET", h, "f1", "nope"), ("LRANGE", l, "0", "-1"),
+                               ("LINDEX", l, "-1"), ("SCARD", s), ("SISMEMBER", s, "m2"), ("GET", t),
+                               ("EXPIRETIME", t), ("PEXPIRETIME", t), ("TTL", k), ("GET", f), ("SET", k, "w"),
+                               ("GET", h)]
+                probes += [("DBSIZE",), ("READWRITE",)] + [("GET", k) for k in keys if shard(k) == mine]
+                probes += [("READONLY", "x"), ("DBSIZE",)]
+            probes.append(("HELLO", str(proto)))
+            with Conn("127.0.0.1", rport, timeout=5) as r, Conn("127.0.0.1", oport, timeout=5) as o:
+                if proto == 3:
+                    r.call("HELLO", "3")
+                    o.call("HELLO", "3")
+                same = 0
+                for p in probes:
+                    r.send(cmd(*p))
+                    o.send(cmd(*p))
+                    rr, _ = r.read_reply()
+                    oo, _ = o.read_reply()
+                    total += 1
+                    if norm(p, rr) == norm(p, ours_as_theirs(oo)):
+                        same += 1
+                    else:
+                        failures += 1
+                        if failures <= 20:
+                            print(f"RESP{proto} node {rport}/{oport}: {' '.join(map(str, p))}: DIFFERENT\n"
+                                  f"  redis: {rr[:400]!r}\n  ours:  {oo[:400]!r}")
+                print(f"replicas: RESP{proto}, Redis node {rport} / our node {oport}: {same}/{len(probes)} the same")
+    print(f"replicas: {total - failures}/{total} the same")
+    return failures
+
+
+def compare_failed(redis: List[int], ours: List[int], dead: Tuple[int, int]) -> int:
+    """The replicas mode's layout once a replica was killed in each
+    cluster (`dead`: its Redis port and ours) and every node left marks it
+    failed: Redis by gossip (PFAIL, then FAIL), ours once stuart found it
+    down for 5 s. Every live node's CLUSTER SLOTS, SHARDS, NODES and INFO,
+    RESP2 and RESP3; at its primary a write, and no replica attached."""
+    live_r, live_o = [p for p in redis if p != dead[0]], [p for p in ours if p != dead[1]]
+    pairs, nodes = pair_replicas(live_r[0], live_o[0])
+    # nodes: each primary, then its replica.
+    shard = next(i for i in range(0, len(nodes), 2) if nodes[i + 1][:2] == dead)
+    primary, start = nodes[shard][:2], nodes[shard + 1][2]
+    print(f"failed: replica {dead[0]}/{dead[1]} killed, its primary {primary[0]}/{primary[1]}")
+    starts = sorted(slots_view(live_r[0]))
+    end = next((s - 1 for s in starts if s > start), 16383)
+    with Conn("127.0.0.1", live_r[0], timeout=5) as c:
+        key = next(k for k in (f"failed{i}".encode() for i in range(100000)) if start <= c.call("CLUSTER", "KEYSLOT", k).value <= end)
+
+    def marked(port: int, dead_port: int) -> bool:
+        with Conn("127.0.0.1", port, timeout=5) as c:
+            text = c.call("CLUSTER", "NODES").value.decode()
+        line = next(l for l in text.splitlines() if f":{dead_port}@" in l)
+        return ",fail " in line and line.endswith(" disconnected")
+
+    deadline = time.time() + 30
+    while not (all(marked(p, dead[0]) for p in live_r) and all(marked(p, dead[1]) for p in live_o)):
+        if time.time() > deadline:
+            raise SystemExit("failed: the replica isn't marked failed everywhere after 30 s")
+        time.sleep(0.2)
+
+    layout = [("CLUSTER", "SLOTS"), ("CLUSTER", "SHARDS"), ("CLUSTER", "NODES"), ("CLUSTER", "INFO")]
+    failures = total = 0
+    for proto in (2, 3):
+        for rport, oport, _ in (n for n in nodes if n[:2] != dead):
+            probes = list(layout)
+            if (rport, oport) == primary:
+                probes += [("SET", key, "v"), ("GET", key), ("DEL", key)]
+            with Conn("127.0.0.1", rport, timeout=5) as r, Conn("127.0.0.1", oport, timeout=5) as o:
+                if proto == 3:
+                    r.call("HELLO", "3")
+                    o.call("HELLO", "3")
+                same = 0
+                for p in probes:
+                    r.send(cmd(*p))
+                    o.send(cmd(*p))
+                    rr, _ = r.read_reply()
+                    oo, _ = o.read_reply()
+                    total += 1
+                    if norm_layout(p, rr) == norm_layout(p, replace_all(pairs, oo)):
+                        same += 1
+                    else:
+                        failures += 1
+                        if failures <= 20:
+                            print(f"RESP{proto} node {rport}/{oport}: {' '.join(map(str, p))}: DIFFERENT\n"
+                                  f"  redis: {rr[:600]!r}\n  ours:  {oo[:600]!r}")
+                print(f"failed: RESP{proto}, Redis node {rport} / our node {oport}: {same}/{len(probes)} the same")
+    # Neither primary has the replica attached any more.
+    for port in primary:
+        with Conn("127.0.0.1", port, timeout=5) as c:
+            text = c.call("INFO", "replication").value
+        total += 1
+        if b"\r\nconnected_slaves:0\r\n" not in text:
+            failures += 1
+            print(f"failed: {port} still has its replica: {text!r}")
+    print(f"failed: {total - failures}/{total} the same")
+    return failures
+
+
+def compare_failover(redis: List[int], ours: List[int]) -> int:
+    """A primary SIGKILLed in each cluster: the one of the range at 5461
+    (another shard than the failed mode's). Redis's replica takes over by
+    itself (cluster-node-timeout 2000, cluster-replica-validity-factor 0:
+    WSL2's wall clock steps make its data look too old otherwise), ours
+    once stuart has failed it over (--fail-after 5 s, the 3 s lease). Then
+    every live node's CLUSTER SLOTS, SHARDS, NODES and INFO, RESP2 and
+    RESP3, the old primary shown as a failed master without slots; at the
+    new one a write, and no replica attached."""
+    live_r = [p for p in redis if pings(p)]
+    live_o = [p for p in ours if pings(p)]
+    pairs, nodes = pair_replicas(live_r[0], live_o[0])
+    # nodes: each primary, then its replica (the first slot of its range).
+    shard = next(i for i in range(0, len(nodes), 2) if nodes[i + 1][2] == 5461)
+    dead, heir = nodes[shard][:2], nodes[shard + 1][:2]
+    for port in dead:
+        with Conn("127.0.0.1", port, timeout=5) as c:
+            pid = int(re.search(rb"^process_id:(\d+)", c.call("INFO", "server").value, re.M).group(1))
+        os.kill(pid, 9)
+    t0 = time.monotonic()
+    print(f"failover: primary {dead[0]}/{dead[1]} killed, its replica {heir[0]}/{heir[1]}")
+    with Conn("127.0.0.1", heir[0], timeout=5) as c:
+        key = next(k for k in (f"failover{i}".encode() for i in range(100000)) if 5461 <= c.call("CLUSTER", "KEYSLOT", k).value <= 10922)
+
+    def taken_over(port: int, heir_port: int, dead_port: int) -> bool:
+        try:
+            with Conn("127.0.0.1", port, timeout=5) as c:
+                text = c.call("CLUSTER", "NODES").value.decode()
+        except OSError:
+            return False
+        old = next(l for l in text.splitlines() if f":{dead_port}@" in l)
+        new = next(l for l in text.splitlines() if f":{heir_port}@" in l)
+        return "master,fail" in old and old.endswith(" disconnected") and "master" in new.split()[2] and "5461-10922" in new
+
+    deadline = time.monotonic() + 60
+    done = {}
+    while len(done) < 2:
+        for name, ports, h, d in (("Redis", [p for p in live_r if p != dead[0]], heir[0], dead[0]), ("ours", [p for p in live_o if p != dead[1]], heir[1], dead[1])):
+            if name not in done and all(taken_over(p, h, d) for p in ports):
+                done[name] = time.monotonic() - t0
+        if time.monotonic() > deadline:
+            raise SystemExit(f"failover: not taken over everywhere after 60 s ({done})")
+        time.sleep(0.1)
+    print("failover: taken over everywhere after " + ", ".join(f"{k} {v:.1f} s" for k, v in done.items()))
+
+    layout = [("CLUSTER", "SLOTS"), ("CLUSTER", "SHARDS"), ("CLUSTER", "NODES"), ("CLUSTER", "INFO")]
+    failures = total = 0
+    for proto in (2, 3):
+        for rport, oport, _ in (n for n in nodes if n[:2] != dead and pings(n[0]) and pings(n[1])):
+            probes = list(layout)
+            if (rport, oport) == heir:
+                probes += [("SET", key, "v"), ("GET", key), ("DEL", key), ("ROLE",)]
+            with Conn("127.0.0.1", rport, timeout=5) as r, Conn("127.0.0.1", oport, timeout=5) as o:
+                if proto == 3:
+                    r.call("HELLO", "3")
+                    o.call("HELLO", "3")
+                same = 0
+                for p in probes:
+                    r.send(cmd(*p))
+                    o.send(cmd(*p))
+                    rr, _ = r.read_reply()
+                    oo, _ = o.read_reply()
+                    total += 1
+                    if p == ("ROLE",):  # the offsets differ (Redis's stream has SELECT)
+                        rr, oo = re.sub(rb":\d+", b":N", rr), re.sub(rb":\d+", b":N", oo)
+                    if norm_layout(p, rr) == norm_layout(p, replace_all(pairs, oo)):
+                        same += 1
+                    else:
+                        failures += 1
+                        if failures <= 20:
+                            print(f"RESP{proto} node {rport}/{oport}: {' '.join(map(str, p))}: DIFFERENT\n"
+                                  f"  redis: {rr[:600]!r}\n  ours:  {oo[:600]!r}")
+                print(f"failover: RESP{proto}, Redis node {rport} / our node {oport}: {same}/{len(probes)} the same")
+    print(f"failover: {total - failures}/{total} the same")
+    return failures
+
+
+def pings(port: int) -> bool:
+    try:
+        with Conn("127.0.0.1", port, timeout=2) as c:
+            return c.call("PING").value == b"PONG"
+    except OSError:
+        return False
+
+
 def main(argv: List[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("mode", choices=["requests", "clients", "load", "migrating"])
+    ap.add_argument("mode", choices=["requests", "clients", "load", "migrating", "replicas", "failed", "failover"])
     ap.add_argument("--redis", help="Redis Cluster node port(s), comma separated")
     ap.add_argument("--ours", action="append", help="our node ports (requests) or a seed port (clients, load)")
     ap.add_argument("--seconds", type=float, default=6)
+    ap.add_argument("--dead", help="failed: the killed replica's ports, Redis's and ours (R,O)")
     args = ap.parse_args(argv)
     if args.mode == "requests":
         failures = compare_requests(ports(args.redis), ports(args.ours[0]))
@@ -503,6 +848,13 @@ def main(argv: List[str]) -> int:
         failures = compare_clients(ports(args.redis)[0], [int(p) for p in args.ours])
     elif args.mode == "migrating":
         failures = compare_migrating(ports(args.redis), ports(args.ours[0]))
+    elif args.mode == "replicas":
+        failures = compare_replicas(ports(args.redis), ports(args.ours[0]))
+    elif args.mode == "failover":
+        failures = compare_failover(ports(args.redis), ports(args.ours[0]))
+    elif args.mode == "failed":
+        r, o = ports(args.dead)
+        failures = compare_failed(ports(args.redis), ports(args.ours[0]), (r, o))
     else:
         failures = load(int(args.ours[0]), args.seconds)
     print("OK" if failures == 0 else f"FAILED: {failures}")

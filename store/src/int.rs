@@ -36,7 +36,12 @@ pub fn parse_i64(s: &[u8]) -> Option<i64> {
 
 /// Replaces the contents of `out` with `n` in decimal, keeping its buffer.
 pub(crate) fn write_i64(out: &mut Vec<u8>, n: i64) {
-    let mut buf = [0u8; 20];
+    out.clear();
+    out.extend_from_slice(format_i64(&mut [0; 20], n));
+}
+
+/// `n` in decimal, written at the end of `buf` (20 bytes fit `i64::MIN`).
+pub(crate) fn format_i64(buf: &mut [u8; 20], n: i64) -> &[u8] {
     let mut i = buf.len();
     let mut v = n.unsigned_abs();
     loop {
@@ -47,11 +52,11 @@ pub(crate) fn write_i64(out: &mut Vec<u8>, n: i64) {
             break;
         }
     }
-    out.clear();
     if n < 0 {
-        out.push(b'-');
+        i -= 1;
+        buf[i] = b'-';
     }
-    out.extend_from_slice(&buf[i..]);
+    &buf[i..]
 }
 
 #[cfg(test)]

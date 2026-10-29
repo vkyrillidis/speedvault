@@ -5,8 +5,9 @@
 //! against the node's [`Store`] ([`command`]) and write the replies of each
 //! batch of pipelined requests in one `write`. A third fiber reclaims
 //! expired keys nobody reads again. In cluster mode ([`cluster_mode`]) a
-//! command runs only if this node owns its keys' slot, and a fourth fiber
-//! ([`migrate`]) sends the keys of slots migrating away to their new node.
+//! command runs only if this node owns its keys' slot, and more fibers
+//! replicate ([`repl`]): to and from replicas, and the slots moving to this
+//! node by snapshot from their owners.
 //! With `--metrics`, more fibers serve `/metrics` and the probes over HTTP
 //! ([`http`], [`metrics`]).
 //!
@@ -25,7 +26,7 @@ mod leave;
 pub mod log;
 pub mod memory;
 mod metrics;
-mod migrate;
+mod repl;
 
 use client::Clients;
 use cluster_mode::Cluster;
@@ -66,6 +67,10 @@ pub struct Config {
     /// when the node restarts at another address; stuart takes a node
     /// joining with another's name as its replacement.
     pub name: Option<String>,
+    /// With `stuart`: the machine the node runs on (`--zone`; on
+    /// Kubernetes, its node's name from the Downward API). stuart puts a
+    /// replica on another zone than its primary where it can.
+    pub zone: Option<String>,
     /// How a slot migrating away is sent.
     pub migrate: Migrate,
     /// With `stuart`: after a SIGTERM, how long the node tries to leave the
@@ -100,7 +105,8 @@ pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(600);
 /// connection, where they time out.
 pub const LEAVE_LINGER: Duration = Duration::from_secs(10);
 
-/// How the keys of a slot migrating away are sent to its new node.
+/// How the source of a slot sync (a move by snapshot) sends the copy of
+/// the slots' keys to their new node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Migrate {
     /// Keys per batch at most (`--migrate-batch`); batches also stop at
@@ -112,8 +118,8 @@ pub struct Migrate {
     /// waiting have run.
     pub pause: Duration,
     /// Elements per batch at most (`--migrate-chunk`; a string is one): a
-    /// hash, set or list with more moves alone, in parts of this many,
-    /// hidden at the target until it's whole.
+    /// hash, set or list with more goes alone, in parts of this many (a
+    /// replica's full sync too).
     pub chunk: usize,
 }
 
@@ -151,6 +157,9 @@ pub(crate) struct Node {
     pub(crate) peak_memory: Cell<usize>,
     /// In cluster mode, the slot table and the node's id.
     pub(crate) cluster: Option<Cluster>,
+    /// The replication stream ([`repl`]); its id, `master_replid`, is 40
+    /// random hex digits, new at every start, as Redis makes one.
+    pub(crate) repl: repl::Replication,
 }
 
 /// Serves clients on `listener`, and `/metrics` and the probes on
@@ -181,7 +190,8 @@ pub fn serve(listener: net::TcpListener, metrics: Option<net::TcpListener>, mut 
             if let Some(stuart) = &config.stuart {
                 let stuart = Arc::new(join::Stuart::new(stuart.clone()));
                 cluster.stuart = Some(stuart.clone());
-                join::spawn(stuart.clone(), *cluster.myself(), announce.clone(), config.name.clone(), cluster.joined.clone())?;
+                let (name, zone) = (config.name.clone(), config.zone.clone());
+                join::spawn(stuart.clone(), *cluster.myself(), announce.clone(), name, zone, cluster.joined.clone())?;
                 let id = *cluster.myself();
                 let (leaving, owned) = (cluster.leaving.clone(), cluster.owned.clone());
                 let timeout = if config.drain_timeout.is_zero() { DRAIN_TIMEOUT } else { config.drain_timeout };
@@ -213,6 +223,7 @@ pub fn serve(listener: net::TcpListener, metrics: Option<net::TcpListener>, mut 
         startup_memory: memory::used(),
         peak_memory: Cell::new(memory::used()),
         cluster,
+        repl: repl::Replication::new(random_node_id()?, repl::BACKLOG_SIZE),
     });
     let listener = TcpListener::from_std(listener)?;
 
@@ -220,7 +231,11 @@ pub fn serve(listener: net::TcpListener, metrics: Option<net::TcpListener>, mut 
     reactor.spawn(move || accept_loop(listener, n))?;
     if node.cluster.is_some() {
         let n = node.clone();
-        reactor.spawn(move || migrate::migrate_loop(n))?;
+        reactor.spawn(move || repl::replica::replica_loop(n))?;
+        let n = node.clone();
+        reactor.spawn(move || repl::slots::sync_loop(n))?;
+        let n = node.clone();
+        reactor.spawn(move || repl::slots::trim_loop(n))?;
     }
     if let Some(metrics) = metrics {
         http::spawn_server(metrics, node.clone())?;
@@ -231,9 +246,9 @@ pub fn serve(listener: net::TcpListener, metrics: Option<net::TcpListener>, mut 
 
 impl Node {
     /// Whether the node uses more than `maxmemory`, or would once the
-    /// store grows its map for one more key: `denyoom` commands are refused
-    /// (Redis's `noeviction`). The map doubles in one allocation, which can
-    /// be far larger than the key (1M keys: 114 MB).
+    /// store grows a table of keys for one more key: `denyoom` commands are
+    /// refused (Redis's `noeviction`). A table doubles in one allocation,
+    /// larger than the key (a few kB; the expiry index of 1M keys: 16 MB).
     pub(crate) fn out_of_memory(&self) -> bool {
         let max = self.maxmemory.get();
         max != 0 && (memory::used() + self.store.borrow().growth()) as u64 > max
@@ -278,14 +293,29 @@ fn expire_loop(node: Rc<Node>) {
     loop {
         sleep(EXPIRE_INTERVAL);
         node.used_memory();
-        let mut store = node.store.borrow_mut();
-        store.shrink();
-        store.set_now(unix_ms());
-        for _ in 0..EXPIRE_MAX_SWEEPS {
-            if store.expire_cycle(EXPIRE_BUDGET) < EXPIRE_BUDGET / 4 {
-                break;
-            }
+        node.store.borrow_mut().shrink();
+        node.store.borrow_mut().set_now(unix_ms());
+        expire_sweep(&node);
+        node.repl.ping();
+    }
+}
+
+/// The sweeps of one turn of the expiry timer; the keys reclaimed go into
+/// the replication stream.
+fn expire_sweep(node: &Node) {
+    // Not while writes wait for a handover (as Redis's `CLIENT PAUSE
+    // WRITE`): the replica is to catch up with a stream that stays put.
+    if node.cluster.as_ref().is_some_and(|c| c.all_paused()) {
+        return;
+    }
+    let mut store = node.store.borrow_mut();
+    for _ in 0..EXPIRE_MAX_SWEEPS {
+        if store.expire_cycle(EXPIRE_BUDGET) < EXPIRE_BUDGET / 4 {
+            break;
         }
+    }
+    if node.repl.active() {
+        node.repl.feed(&mut store, None);
     }
 }
 

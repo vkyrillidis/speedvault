@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Moving slots, measured (phase 5 milestone 6, Linux / WSL2): builds
-# dbnode and stuart and runs migrate_bench.py: how fast keys move, what a
-# move costs the clients of its nodes for each --migrate-batch /
-# --migrate-pause, and REBALANCE for each --moves-per-source /
-# --max-moves. Results go to tools/bench/results/<date>-<commit>/migrate.md.
+# Moving slots, measured (phase 5 milestone 6, by snapshot since phase 8
+# milestone 6; Linux / WSL2): builds dbnode and stuart and runs
+# migrate_bench.py: how fast keys move, what a move costs the clients of
+# its nodes for each --migrate-batch / --migrate-pause, REBALANCE and a
+# drain of few keys for each --moves-per-source / --max-moves; the
+# cutover pauses and the target's memory. Results go to
+# tools/bench/results/<date>-<commit>/migrate.md.
 #
-#   tools/bench/migrate_bench.sh [--base-port 7900] [PART...]   # speed impact rebalance (default: all)
+#   tools/bench/migrate_bench.sh [--base-port 7900] [PART...] [-- migrate_bench.py options]
+#   # parts: speed impact rebalance drain (default: all)
 #
 # Needs redis-benchmark, taskset and redis-py (pip, or REDIS_PY_PATH:
 # default ~/venvs/redis-py/site). CARGO_TARGET_DIR defaults to
@@ -15,10 +18,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 BASE=7900
 PARTS=()
+EXTRA=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --base-port) BASE="$2"; shift 2;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0;;
+    --) shift; EXTRA=("$@"); break;;
     -*) echo "unknown argument: $1" >&2; exit 2;;
     *) PARTS+=("$1"); shift;;
   esac
@@ -34,5 +39,5 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/target/speedvault}"
 (cd "$ROOT" && cargo build --release --locked --quiet -p dbnode -p stuart)
 OUT="$HERE/results/$(date +%F)-$(git -C "$ROOT" rev-parse --short HEAD)"
 mkdir -p "$OUT"
-python3 "$HERE/migrate_bench.py" "${PARTS[@]}" --bin "$CARGO_TARGET_DIR/release" --base-port "$BASE" --out "$OUT/migrate.md"
+python3 "$HERE/migrate_bench.py" "${PARTS[@]}" --bin "$CARGO_TARGET_DIR/release" --base-port "$BASE" --out "$OUT/migrate.md" "${EXTRA[@]}"
 echo "results: $OUT/migrate.md"

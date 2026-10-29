@@ -7,7 +7,8 @@
 //! from empty, so the encoding comes out of the contents, as it does when
 //! Redis loads a value with `RESTORE`.
 
-use super::{Store, Value, NO_SLOT};
+use super::{Store, Value};
+use crate::kv::Val;
 
 /// A value's type on the wire: what `TYPE` says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,24 +110,48 @@ impl Store {
     /// [`contains`](Self::contains), an expired key is `None` and isn't
     /// reclaimed.
     pub fn dump(&self, key: &[u8]) -> Option<(Dump<'_>, Option<i64>)> {
-        let e = self.map.get(key).filter(|e| self.now <= e.expire_at)?;
-        let ttl = (e.slot != NO_SLOT).then(|| (e.expire_at - self.now).max(1));
-        let dump = match &e.value {
-            Value::Str(s) => Dump::Str(s),
-            Value::Hash(h) => {
+        let e = self.keys.get(key).filter(|e| self.now <= e.expire_at())?;
+        let ttl = e.has_ttl().then(|| (e.expire_at() - self.now).max(1));
+        let dump = match e.value() {
+            Val::Str(s) => Dump::Str(s),
+            Val::Hash(h) => {
                 let (bytes, n) = encode(h.iter().flat_map(|(f, v)| [f, v]));
                 Dump::Elements(Kind::Hash, bytes, n)
             }
-            Value::Set(s) => {
+            Val::Set(s) => {
                 let (bytes, n) = encode(s.iter());
                 Dump::Elements(Kind::Set, bytes, n)
             }
-            Value::List(l) => {
+            Val::List(l) => {
                 let (bytes, n) = encode(l.iter());
                 Dump::Elements(Kind::List, bytes, n)
             }
         };
         Some((dump, ttl))
+    }
+
+    /// A key's value, its expiry (absolute unix ms, `None` without) and
+    /// its `OBJECT ENCODING`, expired or not, without reclaiming it: to
+    /// compare two stores key by key (a primary and a replica).
+    pub fn inspect(&self, key: &[u8]) -> Option<(Dump<'_>, Option<i64>, &'static str)> {
+        let e = self.keys.get(key)?;
+        let at = e.has_ttl().then(|| e.expire_at());
+        let dump = match e.value() {
+            Val::Str(s) => Dump::Str(s),
+            Val::Hash(h) => {
+                let (bytes, n) = encode(h.iter().flat_map(|(f, v)| [f, v]));
+                Dump::Elements(Kind::Hash, bytes, n)
+            }
+            Val::Set(s) => {
+                let (bytes, n) = encode(s.iter());
+                Dump::Elements(Kind::Set, bytes, n)
+            }
+            Val::List(l) => {
+                let (bytes, n) = encode(l.iter());
+                Dump::Elements(Kind::List, bytes, n)
+            }
+        };
+        Some((dump, at, e.encoding()))
     }
 
     /// Replaces `key` with the value `payload` of `kind` (checked with
@@ -145,15 +170,30 @@ impl Store {
         self.insert_value(key, staged.value, at);
     }
 
+    /// Replaces `key` with the value built in `staged`, expiring at `at`
+    /// (absolute unix ms) if given: what a replica copies, whatever its
+    /// own clock says.
+    pub fn restore_staged_at(&mut self, key: &[u8], staged: Staged, at: Option<i64>) {
+        self.remove(key);
+        self.insert_value(key, staged.value, at);
+    }
+
+    /// A live key's expiry, absolute unix ms: `Some(None)` without one,
+    /// `None` for a missing or expired key (not reclaimed).
+    pub fn expire_at(&self, key: &[u8]) -> Option<Option<i64>> {
+        let e = self.keys.get(key).filter(|e| self.now <= e.expire_at())?;
+        Some(e.has_ttl().then(|| e.expire_at()))
+    }
+
     /// How many elements a live key holds (a string: 1); expired is `None`,
     /// not reclaimed. O(1), so a move can tell a key to send in parts.
     pub fn elements(&self, key: &[u8]) -> Option<usize> {
-        let e = self.map.get(key).filter(|e| self.now <= e.expire_at)?;
-        Some(match &e.value {
-            Value::Str(_) => 1,
-            Value::Hash(h) => h.len(),
-            Value::Set(s) => s.len(),
-            Value::List(l) => l.len(),
+        let e = self.keys.get(key).filter(|e| self.now <= e.expire_at())?;
+        Some(match e.value() {
+            Val::Str(_) => 1,
+            Val::Hash(h) => h.len(),
+            Val::Set(s) => s.len(),
+            Val::List(l) => l.len(),
         })
     }
 
@@ -165,8 +205,8 @@ impl Store {
     ///
     /// [`dump`]: Self::dump
     pub fn dump_part(&self, key: &[u8], from: usize, max: usize, max_bytes: usize) -> Option<Part> {
-        let e = self.map.get(key).filter(|e| self.now <= e.expire_at)?;
-        let ttl = (e.slot != NO_SLOT).then(|| (e.expire_at - self.now).max(1));
+        let e = self.keys.get(key).filter(|e| self.now <= e.expire_at())?;
+        let ttl = e.has_ttl().then(|| (e.expire_at() - self.now).max(1));
         let mut part = Part { kind: Kind::Str, payload: Vec::new(), count: 0, total: 0, ttl };
         // Adds one element; false once the part is full.
         let add = |part: &mut Part, items: &[&[u8]]| {
@@ -177,9 +217,9 @@ impl Store {
             part.count += 1;
             part.count < max.max(1) && part.payload.len() < max_bytes
         };
-        match &e.value {
-            Value::Str(_) => return None,
-            Value::Hash(h) => {
+        match e.value() {
+            Val::Str(_) => return None,
+            Val::Hash(h) => {
                 (part.kind, part.total) = (Kind::Hash, h.len());
                 for (f, v) in h.iter_from(from) {
                     if !add(&mut part, &[f, v]) {
@@ -187,7 +227,7 @@ impl Store {
                     }
                 }
             }
-            Value::Set(s) => {
+            Val::Set(s) => {
                 (part.kind, part.total) = (Kind::Set, s.len());
                 for m in s.iter().skip(from) {
                     if !add(&mut part, &[m]) {
@@ -195,7 +235,7 @@ impl Store {
                     }
                 }
             }
-            Value::List(l) => {
+            Val::List(l) => {
                 (part.kind, part.total) = (Kind::List, l.len());
                 for item in l.iter_from(from) {
                     if !add(&mut part, &[item]) {
@@ -211,7 +251,7 @@ impl Store {
     /// time ([`Garbage::free`]): dropping a collection of millions of
     /// elements at once would hold the node up.
     pub fn take(&mut self, key: &[u8]) -> Option<Garbage> {
-        self.remove(key).map(|e| Garbage(e.value))
+        self.remove(key).map(|e| Garbage(e.into_value()))
     }
 }
 

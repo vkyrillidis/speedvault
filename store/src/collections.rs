@@ -33,7 +33,7 @@ pub struct Hash {
 enum HashRepr {
     /// Fields and values in turn.
     Packed(Packed),
-    Table(Table<Box<[u8]>>),
+    Table(Table),
 }
 
 impl Default for Hash {
@@ -84,7 +84,7 @@ impl Hash {
     pub fn get(&self, field: &[u8]) -> Option<&[u8]> {
         match &self.repr {
             HashRepr::Packed(p) => find_pair(p, field).map(|(_, v)| p.get(v)),
-            HashRepr::Table(t) => t.get(field).map(|v| &**v),
+            HashRepr::Table(t) => t.get(field),
         }
     }
 
@@ -96,7 +96,7 @@ impl Hash {
             let mut items = p.iter();
             while let Some((_, f)) = items.next() {
                 let (_, v) = items.next().expect("fields and values in turn");
-                t.insert(f, v.into());
+                t.insert(f, v);
             }
             self.repr = HashRepr::Table(t);
         }
@@ -127,7 +127,7 @@ impl Hash {
                     true
                 }
             },
-            HashRepr::Table(t) => t.insert(field, value.into()).is_none(),
+            HashRepr::Table(t) => t.insert(field, value),
         };
         if self.len() > HASH_MAX_LISTPACK_ENTRIES {
             self.convert();
@@ -145,7 +145,7 @@ impl Hash {
                 }
                 None => false,
             },
-            HashRepr::Table(t) => t.remove_swap(field).is_some(),
+            HashRepr::Table(t) => t.remove_swap(field),
         }
     }
 
@@ -188,7 +188,7 @@ pub struct HashIter<'a>(IterRepr<'a>);
 enum IterRepr<'a> {
     Packed(crate::packed::Iter<'a>),
     /// The table and the next position.
-    Table(&'a Table<Box<[u8]>>, usize),
+    Table(&'a Table, usize),
 }
 
 impl<'a> Iterator for HashIter<'a> {
@@ -204,7 +204,7 @@ impl<'a> Iterator for HashIter<'a> {
             IterRepr::Table(t, pos) => {
                 let (f, v) = t.get_index(*pos)?;
                 *pos += 1;
-                Some((f, &**v))
+                Some((f, v))
             }
         }
     }
@@ -241,7 +241,7 @@ enum SetRepr {
     Ints(Packed),
     /// Up to [`SET_MAX_PACKED_ENTRIES`] members, in the order added.
     Small(Packed),
-    Table(Table<()>),
+    Table(Table),
 }
 
 impl Default for Set {
@@ -324,7 +324,7 @@ impl Set {
         } else {
             let mut t = Table::default();
             members.iter().for_each(|m| {
-                t.insert(m, ());
+                t.insert(m, b"");
             });
             SetRepr::Table(t)
         };
@@ -360,7 +360,7 @@ impl Set {
             self.convert(false);
         }
         match &mut self.repr {
-            SetRepr::Table(t) => t.insert(member, ()).is_none(),
+            SetRepr::Table(t) => t.insert(member, b""),
             _ => unreachable!("converted above"),
         }
     }
@@ -380,7 +380,7 @@ impl Set {
                 }
                 None => false,
             },
-            SetRepr::Table(t) => t.remove_swap(member).is_some(),
+            SetRepr::Table(t) => t.remove_swap(member),
         }
     }
 
@@ -402,7 +402,7 @@ impl Set {
                 p.remove_range(at.whole(), 1);
                 m
             }
-            SetRepr::Table(t) => t.remove_swap_at(pos).0,
+            SetRepr::Table(t) => t.remove_swap_at(pos),
         }
     }
 
@@ -439,7 +439,7 @@ pub struct SetIter<'a>(SetIterRepr<'a>);
 enum SetIterRepr<'a> {
     Packed(crate::packed::Iter<'a>),
     /// The table and the next position.
-    Table(&'a Table<()>, usize),
+    Table(&'a Table, usize),
 }
 
 impl<'a> Iterator for SetIter<'a> {
@@ -449,7 +449,7 @@ impl<'a> Iterator for SetIter<'a> {
         match &mut self.0 {
             SetIterRepr::Packed(items) => items.next().map(|(_, m)| m),
             SetIterRepr::Table(t, pos) => {
-                let (m, ()) = t.get_index(*pos)?;
+                let (m, _) = t.get_index(*pos)?;
                 *pos += 1;
                 Some(m)
             }

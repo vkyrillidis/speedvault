@@ -5,38 +5,62 @@ against the manifests' cluster instead of processes it starts.
 
     kcheck.py run --nodes N [--keys 2000] [--filler 20000] [--lettuce MODES]
     kcheck.py lossy POD          (kubectl exec, beside a running `run`)
+    kcheck.py lossy-zone ZONE    (kubectl exec, beside a running `run`)
     kcheck.py fill RATIO         (kubectl exec, beside a running `run`)
     kcheck.py even N             (kubectl exec)
+    kcheck.py pairs              (kubectl exec)
+    kcheck.py primary            (kubectl exec)
+    kcheck.py failover ZONE      (kubectl exec)
+    kcheck.py counts             (kubectl exec)
     kcheck.py load < JSON        (kubectl exec -i)
     kcheck.py stop N             (kubectl exec, beside a running `run`)
 
-`run` waits until stuart's N nodes hold even shares of the slots, empties
-them (FLUSHALL), writes the filler keys, starts the writers (two redis-py RedisCluster threads, a
+REPLICAS (the environment, 0 or 1) is stuart's --replicas. With 1, N
+nodes are ceil(N / 2) primaries, each with a replica (one may lack one).
+
+`run` waits until stuart's N nodes are laid out (the primaries hold even
+shares of the slots, nothing moves, every replica synced with its
+primary), empties them (FLUSHALL), writes the filler keys, starts the writers (two redis-py RedisCluster threads, a
 redis-cli -c process, a redis-py thread on the hot counters, and with --lettuce a Lettuce client
-for each of LettuceLoad's modes given (comma separated); all seeded
+for each of LettuceLoad's modes given (comma separated); with replicas,
+redis-py writers sending each INCR, and SET/DEL, with a WAIT 1; all seeded
 with the speedvault-seed Service), prints `writing`, and reports progress
 every 10 s. Meanwhile kind_check.sh scales, restarts or deletes pods.
 
 `lossy POD` notes that pod's slots now (before kind_check.sh kills it
 without letting it drain): their keys may be lost, and INCRs may fail.
+With replicas, only writes the replica hadn't got: no filler key may be
+lost, nor an INCR or a SET/DEL that WAIT said the replica had. `lossy-zone
+ZONE` notes the slots of every node in that zone (a Kubernetes node about
+to be stopped).
+
+`pairs` lists the primaries and their replicas with their zones, and
+fails if a replica is in its primary's zone. `primary` prints the pod
+name of a primary (the first by name). `failover ZONE` waits until no
+node in ZONE serves a slot (its primaries' replicas promoted) and says
+how long that took. `counts` prints stuart's counters: slots moved,
+handovers, demotions.
 
 `fill RATIO` writes m:0, m:1, ... (16 KiB values) until the nodes' used
 memory averages RATIO of their maxmemory (none past 0.98): the load of the
 memory autoscaling scenario. `run`'s check reads them back too.
 
-`even N` waits until N nodes hold even shares and nothing moves, and says
-how long that took.
+`even N` waits until N nodes are laid out (see `run`), and says how long
+that took.
 
 `load` summarizes memtier_benchmark's --json-out-file: its throughput and
 p99 latency over every 10 s, and in all.
 
-`stop N` tells `run` to finish: it waits until N nodes hold even shares and
-nothing moves, stops the writers and reads every node directly, as
+`stop N` tells `run` to finish: it waits until N nodes are laid out,
+stops the writers and reads every node directly, as
 migrate_check.py does: no key at two nodes or at a node whose table doesn't
 give it its slot, every filler key there with its value, each counter at
 least its acknowledged INCRs and at most those plus the ones in doubt (only
-bounded above in the lossy slots), and no INCR failed unless some slots are
-lossy. It prints OK or the problems, and exits 0 or 1.
+bounded above in the lossy slots), no INCR failed unless some slots are
+lossy, and no -ASK or -TRYAGAIN (slots move by snapshot). With replicas
+the replicas are left out of that and compared with their primaries key
+by key instead, once caught up, and the WAIT writers' keys checked (see
+migrate_check.py). It prints OK or the problems, and exits 0 or 1.
 """
 
 from __future__ import annotations
@@ -57,6 +81,7 @@ SEED = os.environ.get("SEED", "speedvault-seed")
 STUART = os.environ.get("STUART", "stuart")
 PORT = 7000
 CTL = os.environ.get("CTL", "/tmp/kcheck")
+REPLICAS = int(os.environ.get("REPLICAS", "0"))
 
 
 class K8sCluster(mc.Cluster):
@@ -94,6 +119,61 @@ def say(msg: str):
     print(msg, flush=True)
 
 
+def host_of(line: str) -> str:
+    return line.split()[1].rsplit(":", 1)[0]
+
+
+def field(line: str, name: str) -> str:
+    m = re.search(rf" {name}=(\S+)", line)
+    return m.group(1) if m else ""
+
+
+def current(cluster: K8sCluster) -> Dict[str, str]:
+    """STUART NODES by node id, the nodes leaving left out."""
+    return {i: l for i, l in mc.stuart_lines(cluster).items() if " leaving" not in l}
+
+
+def replica_hosts(cluster: K8sCluster) -> Dict[str, str]:
+    """Replica host -> its primary's host."""
+    lines = current(cluster)
+    return {host_of(l): host_of(lines[p]) for l in lines.values() if (p := field(l, "replica-of")) in lines}
+
+
+def not_laid_out(cluster: K8sCluster, n: int) -> str:
+    """Why `n` nodes aren't laid out yet (see `run`); empty once they are."""
+    lines = list(current(cluster).values())
+    if len(lines) != n:
+        return f"{len(lines)} nodes"
+    primaries = [l for l in lines if "replica-of" not in l]
+    want = -(-n // (1 + REPLICAS))
+    if len(primaries) != want:
+        return f"{len(primaries)} primaries, not {want}"
+    counts = [int(field(l, "slots")) for l in primaries]
+    if sum(counts) != mc.SLOTS or max(counts) - min(counts) > 1:
+        return f"the primaries' slots: {counts}"
+    if cluster.migrations():
+        return "slots moving"
+    for host in replica_hosts(cluster):
+        info = cluster.node(host).info("replication")
+        if info.get("master_link_status") != "up" or info.get("master_sync_in_progress"):
+            return f"replica {host} not synced"
+    return ""
+
+
+def wait_laid_out(cluster: K8sCluster, n: int, timeout: float = 600):
+    cluster.wait_settled(timeout)
+    why = ["?"]
+
+    def done():
+        why[0] = not_laid_out(cluster, n)
+        return not why[0]
+    try:
+        mc.wait_for(f"{n} nodes laid out", done, timeout, 0.2)
+    except mc.Fail:
+        raise mc.Fail(f"{n} nodes not laid out after {timeout:.0f} s: {why[0]}")
+    cluster.wait_settled(timeout)
+
+
 def ctl(name: str) -> str:
     return os.path.join(CTL, name)
 
@@ -118,17 +198,24 @@ def run(args) -> int:
     os.makedirs(CTL, exist_ok=True)
     cluster = K8sCluster()
     t0 = time.monotonic()
-    mc.wait_even(cluster, args.nodes, 600)
-    say(f"{args.nodes} nodes even after {time.monotonic() - t0:.0f} s: {', '.join(cluster.node_ports())}")
-    # The counters start at 0: the keys of an earlier run go.
+    wait_laid_out(cluster, args.nodes)
+    say(f"{args.nodes} nodes laid out after {time.monotonic() - t0:.0f} s: {', '.join(cluster.node_ports())}")
+    # The counters start at 0: the keys of an earlier run go (from the
+    # primaries, and through their streams from the replicas).
     for host in cluster.node_ports():
-        cluster.node(host).flushall()
+        if host not in replica_hosts(cluster):
+            cluster.node(host).flushall()
     if args.filler:
         cluster.fill(args.filler)
     mc.HOST = SEED
     lettuce = argparse.Namespace(lettuce=open("/opt/lettuce/classpath").read().strip(), lettuce_modes=args.lettuce.split(","),
                                  lettuce_port=PORT) if args.lettuce else argparse.Namespace(lettuce_modes=[])
     writers = mc.make_writers(argparse.Namespace(keys=args.keys, **vars(lettuce)), PORT)
+    dels = None
+    if REPLICAS:
+        writers.append(mc.WaitWriter(writers[0].names, PORT))
+        dels = mc.DelWriter(writers[0].names, PORT)
+        writers.append(dels)
     for j, w in enumerate(writers):
         w.start(j * args.keys // len(writers))
     say("writing")
@@ -143,20 +230,63 @@ def run(args) -> int:
     problems: List[str] = []
     try:
         t0 = time.monotonic()
-        mc.wait_even(cluster, n, 600)
-        say(f"{n} nodes even {time.monotonic() - t0:.1f} s after stop: {', '.join(cluster.node_ports())}")
+        wait_laid_out(cluster, n)
+        say(f"{n} nodes laid out {time.monotonic() - t0:.1f} s after stop: {', '.join(cluster.node_ports())}")
         time.sleep(1)
         for w in writers:
             w.stop()
         lossy = lossy_slots()
-        problems += mc.report_writers(writers, may_fail=bool(lossy))
-        problems += mc.check(cluster, writers, args.filler, lossy, mem_keys())
+        replicas = replica_hosts(cluster)
+        mc.wait_for("the replicas to catch up", lambda: mc.caught_up(cluster, replicas), 60, 0.1)
+        # The WAIT writers send to the node they think owns the key: a
+        # primary that handed its slots over answers -MOVED, one gone
+        # drops the connection. Those fail (in doubt, refreshed), nothing
+        # else.
+        waits = [w for w in writers if isinstance(w, (mc.WaitWriter, mc.DelWriter))]
+        problems += mc.report_writers([w for w in writers if w not in waits], may_fail=bool(lossy))
+        problems += mc.report_writers([w for w in waits if w is not dels], may_fail=True)
+        for w in waits:
+            other = [e for e in w.errors if not re.search(r"MOVED|Moved|Connection|connection|Timeout|timed out|Broken pipe", e)]
+            if other and not lossy:
+                problems.append(f"{w.name}: {len(other)} writes failed otherwise than on a node gone: {other[:3]}")
+        problems += mc.check(cluster, writers, args.filler, lossy, mem_keys(), replicas=set(replicas))
+        if dels:
+            problems += mc.check_deletes(cluster, dels, lossy)
+        if replicas:
+            problems += mc.compare_replicas(cluster, replicas)
+        if REPLICAS and lossy:
+            problems += filler_kept(args.filler)
+        # Moves by snapshot send only -MOVED (counted at the nodes still up:
+        # one that left or restarted took its counts along).
+        asked = mc.redirect_counts(cluster, ("ask", "tryagain"))
+        if asked:
+            problems.append(f"{asked} -ASK/-TRYAGAIN with moves by snapshot")
+        problems += [f"{w.name}: {w.client_bugs} failed on -ASK" for w in writers if w.client_bugs]
     except mc.Fail as e:
         problems.append(str(e))
     for p in problems:
         say(f"FAIL: {p}")
     say("OK" if not problems else "FAILED")
     return 1 if problems else 0
+
+
+def filler_kept(n: int) -> List[str]:
+    """With replicas, a node killed loses no filler key: written before,
+    its replica had them."""
+    rc = mc.RedisCluster(host=SEED, port=PORT)
+    lost = wrong = 0
+    for start in range(0, n, 2000):
+        p = rc.pipeline()
+        for i in range(start, min(n, start + 2000)):
+            p.get(f"f:{i}")
+        for i, v in zip(range(start, n), p.execute()):
+            if v is None:
+                lost += 1
+            elif v != mc.filler_value(i):
+                wrong += 1
+    rc.close()
+    say(f"  filler keys after the kill: {n - lost - wrong} of {n} kept")
+    return [f"{lost} filler keys lost, {wrong} wrong, with a replica for each"] if lost or wrong else []
 
 
 def lossy(pod: str) -> int:
@@ -170,6 +300,76 @@ def lossy(pod: str) -> int:
     with open(ctl("lossy"), "a") as f:
         f.write(" ".join(map(str, sorted(slots))) + "\n")
     say(f"{pod}: {len(slots)} slots noted as lossy")
+    return 0
+
+
+def lossy_zone(zone: str) -> int:
+    """Notes the slots of every node in `zone`."""
+    cluster = K8sCluster()
+    nodes = [(i, l) for i, l in current(cluster).items() if field(l, "zone") == zone]
+    slots: Set[int] = set()
+    for i, _ in nodes:
+        slots |= mc.slots_of(cluster, i)
+    with open(ctl("lossy"), "a") as f:
+        f.write(" ".join(map(str, sorted(slots))) + "\n")
+    primaries = [field(l, "name") for _, l in nodes if "replica-of" not in l]
+    replicas = [field(l, "name") for _, l in nodes if "replica-of" in l]
+    say(f"{zone}: primaries {', '.join(primaries) or 'none'}, replicas {', '.join(replicas) or 'none'}; "
+        f"{len(slots)} slots noted as lossy")
+    return 0
+
+
+def pairs() -> int:
+    """The primaries and their replicas, with their zones: 1 if a replica
+    is in its primary's zone."""
+    lines = current(K8sCluster())
+    bad = 0
+    for i, l in sorted(lines.items(), key=lambda il: field(il[1], "name")):
+        if "replica-of" in l:
+            continue
+        mine = [r for r in lines.values() if field(r, "replica-of") == i]
+        shown = ", ".join(f"{field(r, 'name')} ({field(r, 'zone')})" for r in mine) or "no replica"
+        say(f"{field(l, 'name')} ({field(l, 'zone')}, {field(l, 'slots')} slots): {shown}")
+        bad += sum(field(r, "zone") == field(l, "zone") for r in mine)
+    if bad:
+        say(f"{bad} replicas in their primary's zone")
+    return 1 if bad else 0
+
+
+def primary() -> int:
+    names = sorted(field(l, "name") for l in current(K8sCluster()).values()
+                   if "replica-of" not in l and int(field(l, "slots") or 0))
+    if not names:
+        return 1
+    say(names[0])
+    return 0
+
+
+def failover(zone: str) -> int:
+    """Waits until no node in `zone` owns a slot, and every owner is up."""
+    cluster = K8sCluster()
+    t0 = time.monotonic()
+
+    def served():
+        lines = mc.stuart_lines(cluster).values()
+        owners = [l for l in lines if "replica-of" not in l and int(field(l, "slots") or 0)]
+        return sum(int(field(l, "slots")) for l in owners) == mc.SLOTS and \
+            all(field(l, "zone") != zone and " up " in l for l in owners)
+    mc.wait_for(f"the slots of {zone} served elsewhere", served, 120, 0.1)
+    say(f"every slot served outside {zone} {time.monotonic() - t0:.1f} s after the call")
+    return 0
+
+
+def counts() -> int:
+    """stuart's counters, from its /metrics."""
+    import urllib.request
+    with urllib.request.urlopen(f"http://{STUART}:9121/metrics", timeout=10) as r:
+        body = r.read().decode()
+    got = {}
+    for name in ("slots_moved", "handovers", "demotions"):
+        m = re.search(rf"^stuart_{name}_total (\S+)$", body, re.M)
+        got[name] = int(float(m.group(1))) if m else -1
+    say(" ".join(f"{k}={v}" for k, v in got.items()))
     return 0
 
 
@@ -237,8 +437,13 @@ def main(argv: List[str]) -> int:
     r.add_argument("--filler", type=int, default=20000, help="other keys, so moves take a while")
     r.add_argument("--lettuce", metavar="MODES", help="Lettuce writers too, in these modes (see LettuceLoad.java)")
     sub.add_parser("lossy").add_argument("pod")
+    sub.add_parser("lossy-zone").add_argument("zone")
     sub.add_parser("fill").add_argument("ratio", type=float)
     sub.add_parser("even").add_argument("nodes", type=int)
+    sub.add_parser("pairs")
+    sub.add_parser("primary")
+    sub.add_parser("failover").add_argument("zone")
+    sub.add_parser("counts")
     sub.add_parser("load")
     sub.add_parser("stop").add_argument("nodes", type=int)
     args = ap.parse_args(argv)
@@ -246,14 +451,24 @@ def main(argv: List[str]) -> int:
         return run(args)
     if args.cmd == "lossy":
         return lossy(args.pod)
+    if args.cmd == "lossy-zone":
+        return lossy_zone(args.zone)
+    if args.cmd == "pairs":
+        return pairs()
+    if args.cmd == "primary":
+        return primary()
+    if args.cmd == "failover":
+        return failover(args.zone)
+    if args.cmd == "counts":
+        return counts()
     if args.cmd == "fill":
         return fill(args.ratio)
     if args.cmd == "load":
         return load_summary(json.load(sys.stdin))
     if args.cmd == "even":
         t0 = time.monotonic()
-        mc.wait_even(K8sCluster(), args.nodes, 600)
-        say(f"{args.nodes} nodes even after {time.monotonic() - t0:.1f} s")
+        wait_laid_out(K8sCluster(), args.nodes)
+        say(f"{args.nodes} nodes laid out after {time.monotonic() - t0:.1f} s")
         return 0
     with open(ctl("stop.tmp"), "w") as f:
         f.write(str(args.nodes))

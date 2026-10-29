@@ -31,6 +31,8 @@ enum Closed {
     Quit,
     Idle,
     ProtocolError(ProtocolError),
+    /// It was a replica's (`REPLSYNC`), now gone.
+    Replica,
 }
 
 pub(crate) fn handle(conn: TcpStream, node: &Node) {
@@ -41,6 +43,7 @@ pub(crate) fn handle(conn: TcpStream, node: &Node) {
         Ok(Closed::Quit) => verbose!("Client {peer} sent QUIT"),
         Ok(Closed::Idle) => verbose!("Closing idle client {peer}"),
         Ok(Closed::ProtocolError(e)) => verbose!("{e} from client {peer}, closing it"),
+        Ok(Closed::Replica) => verbose!("Replica {peer} went away"),
         // A client going away mid-write is routine.
         Err(e) if matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe) => {
             verbose!("Client {peer} went away: {e}")
@@ -68,6 +71,28 @@ fn serve(mut conn: &TcpStream, node: &Node) -> io::Result<Closed> {
             match parser.parse(&buf[start..end]) {
                 Ok(Parsed::Complete { consumed }) => {
                     let args = parser.args(&buf[start..end]);
+                    // A replica asking for the stream: the connection is
+                    // its feed from here on (see `repl`).
+                    if args.len() == 4 && args[0].eq_ignore_ascii_case(b"REPLSYNC") {
+                        if let Some(feed) = crate::repl::primary::attach(&args, node, &mut out) {
+                            conn.write_all(out.as_bytes())?;
+                            crate::repl::primary::serve(conn, node, feed)?;
+                            return Ok(Closed::Replica);
+                        }
+                        start += consumed;
+                        continue;
+                    }
+                    // A node syncing slots from here (a slot moving by
+                    // snapshot): the same, a feed of those slots.
+                    if args.len() >= 3 && args[0].eq_ignore_ascii_case(b"SLOTSYNC") {
+                        if let Some(feed) = crate::repl::primary::attach_slots(&args, node, &mut out) {
+                            conn.write_all(out.as_bytes())?;
+                            crate::repl::primary::serve(conn, node, feed)?;
+                            return Ok(Closed::Replica);
+                        }
+                        start += consumed;
+                        continue;
+                    }
                     // No arguments (`*0`, a blank line): nothing to run, no reply.
                     if !args.is_empty() && command::execute(&args, node, client, &mut out) == Flow::Close {
                         closed = Some(Closed::Quit);

@@ -197,7 +197,7 @@ fn a_cluster_node_s_metrics() {
     assert_eq!(value(&m, "speedvault_redirects_total{kind=\"moved\"}"), 1.0);
     assert_eq!(value(&m, "speedvault_redirects_total{kind=\"ask\"}"), 0.0);
     assert_eq!(value(&m, "speedvault_redirects_total{kind=\"tryagain\"}"), 0.0);
-    for counter in ["keys_sent", "batches_sent", "bytes_sent", "keys_imported", "imports_refused"] {
+    for counter in ["keys_sent", "keys_imported", "imports_refused"] {
         assert_eq!(value(&m, &format!("speedvault_migrate_{counter}_total")), 0.0, "{counter}");
     }
     assert_eq!(get(http, "/ready").0, "HTTP/1.1 200 OK");

@@ -206,6 +206,55 @@ fn end_arg(arg: &[u8]) -> Option<End> {
     }
 }
 
+/// `LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT count]`: the key popped
+/// from and its elements, or a nil array.
+pub(super) fn lmpop(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {
+    let numkeys = match parse_i64(&args[1]) {
+        Some(n) if n >= 1 => n as u64,
+        _ => {
+            out.error(b"ERR numkeys should be greater than 0");
+            return Flow::Continue;
+        }
+    };
+    let at = numkeys.saturating_add(2);
+    let Some(end) = (at < args.len() as u64).then(|| end_arg(&args[at as usize])).flatten() else {
+        syntax_error(out);
+        return Flow::Continue;
+    };
+    let mut count = None;
+    let mut i = at as usize + 1;
+    while i < args.len() {
+        if count.is_none() && args[i].eq_ignore_ascii_case(b"count") && i + 1 < args.len() {
+            i += 1;
+            match parse_i64(&args[i]) {
+                Some(n) if n >= 1 => count = Some(n as usize),
+                _ => {
+                    out.error(b"ERR count should be greater than 0");
+                    return Flow::Continue;
+                }
+            }
+        } else {
+            syntax_error(out);
+            return Flow::Continue;
+        }
+        i += 1;
+    }
+    let keys: Vec<&[u8]> = args.iter().skip(2).take(numkeys as usize).collect();
+    match store.mpop(&keys, end, count.unwrap_or(1)) {
+        Ok(Some((key, popped))) => {
+            out.array(2);
+            out.bulk(keys[key]);
+            out.array(popped.len());
+            for e in popped {
+                out.bulk(&e);
+            }
+        }
+        Ok(None) => out.null_array(),
+        Err(e) => store_error(e, out),
+    }
+    Flow::Continue
+}
+
 /// `LMOVE src dst LEFT|RIGHT LEFT|RIGHT`; `RPOPLPUSH src dst`.
 pub(super) fn lmove(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {
     let ends = if args.len() == 3 { Some((End::Right, End::Left)) } else { end_arg(&args[3]).zip(end_arg(&args[4])) };

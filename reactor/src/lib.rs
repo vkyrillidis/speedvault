@@ -27,6 +27,7 @@ use kqueue as poller;
 #[cfg(test)]
 mod poller_tests;
 
+mod notify;
 mod reactor;
 mod registered;
 mod slab;
@@ -34,7 +35,8 @@ mod tcp;
 mod timer;
 pub mod token;
 
-pub use reactor::{busy_time, sleep, sleep_until, spawn, yield_now, PanicPayload, Reactor};
+pub use notify::Notify;
+pub use reactor::{busy_time, sleep, sleep_until, spawn, turn_time, yield_now, PanicPayload, Reactor};
 pub use registered::Registered;
 pub use tcp::{TcpListener, TcpStream};
 pub use token::Token;

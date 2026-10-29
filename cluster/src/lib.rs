@@ -8,7 +8,8 @@
 //!   stuart versions it by. It is checked when built: every slot is either
 //!   owned by exactly one node or explicitly unassigned. Looking a slot up is
 //!   one index into a flat 16384-entry array. It may also list slots
-//!   migrating from their owner to another node ([`Migration`]).
+//!   migrating from their owner to another node ([`Migration`]), and the
+//!   nodes that are replicas of others ([`Replica`], phase 8).
 //! - [`reply`] encodes `CLUSTER SLOTS`, `SHARDS` and `NODES` from a table, in
 //!   RESP2 and RESP3, as Redis 7.0.15 does (checked byte for byte by
 //!   `tools/compat/cluster_compat.sh` against a real Redis Cluster).
@@ -33,4 +34,4 @@ mod slot;
 mod table;
 
 pub use slot::{crc16, key_hash_slot, SLOTS};
-pub use table::{Migration, Node, NodeId, SlotRange, SlotTable, TableError};
+pub use table::{Migration, Node, NodeId, Replica, SlotRange, SlotTable, TableError};

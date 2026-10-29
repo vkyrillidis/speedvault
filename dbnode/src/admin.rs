@@ -133,12 +133,71 @@ pub(crate) fn hello(args: &Args, node: &Node, client: &Client, out: &mut Encoder
     out.integer(i64::from(client.resp.get()));
     out.bulk(b"id");
     out.integer(client.id as i64);
-    for (key, value) in [("mode", mode(node)), ("role", "master")] {
+    let role = if node.cluster.as_ref().and_then(|c| c.primary()).is_some() { "replica" } else { "master" };
+    for (key, value) in [("mode", mode(node)), ("role", role)] {
         out.bulk(key.as_bytes());
         out.bulk(value.as_bytes());
     }
     out.bulk(b"modules");
     out.array(0);
+    Flow::Continue
+}
+
+/// The replicas attached, as the table has them: host, port, and whether
+/// they sync from scratch still.
+/// The replicas attached and in the table: host, port, whether not online,
+/// and their last acknowledgement (offset, seconds ago), 0 and 0 before it.
+fn replicas(node: &Node) -> Vec<(String, u16, bool, u64, u64)> {
+    let Some(c) = &node.cluster else { return Vec::new() };
+    let (table, _) = c.table();
+    node.repl
+        .feeds
+        .borrow()
+        .iter()
+        .filter(|f| f.is_replica())
+        .filter_map(|f| table.position(&f.id).map(|i| (&table.nodes()[i], f)))
+        .map(|(n, f)| {
+            let (offset, ago) = f.acked().map_or((0, 0), |(o, ago)| (o, ago.as_secs()));
+            (n.host().to_string(), n.port(), !f.online(), offset, ago)
+        })
+        .collect()
+}
+
+/// `ROLE`, as Redis 7.0 answers it: a primary `[master, offset, [[host,
+/// port, offset]...]]`, each replica's offset as it last acknowledged it;
+/// a replica `[slave, host, port, state, offset]`, the offset -1 before
+/// its first sync.
+pub(crate) fn role(_: &Args, node: &Node, _: &Client, out: &mut Encoder) -> Flow {
+    match node.cluster.as_ref().and_then(|c| c.primary()) {
+        None => {
+            let replicas = replicas(node);
+            out.array(3);
+            out.bulk(b"master");
+            out.integer(node.repl.offset() as i64);
+            out.array(replicas.len());
+            for (host, port, _, offset, _) in replicas {
+                out.array(3);
+                out.bulk(host.as_bytes());
+                out.bulk(port.to_string().as_bytes());
+                out.bulk(offset.to_string().as_bytes());
+            }
+        }
+        Some(primary) => {
+            use crate::repl::replica::State;
+            let link = &node.repl.link;
+            out.array(5);
+            out.bulk(b"slave");
+            out.bulk(primary.host().as_bytes());
+            out.integer(i64::from(primary.port()));
+            out.bulk(match link.state() {
+                State::Off | State::Down => b"connect".as_slice(),
+                State::Connecting => b"connecting",
+                State::Copying => b"sync",
+                State::Online => b"connected",
+            });
+            out.integer(if link.synced() { link.offset() as i64 } else { -1 });
+        }
+    }
     Flow::Continue
 }
 
@@ -422,11 +481,61 @@ fn info_section(section: &str, node: &Node, text: &mut String) {
             text.push_str("# Stats\r\n");
             field(text, "total_connections_received", node.connections_received.get());
             field(text, "total_commands_processed", node.commands_processed.get());
+            let syncs = &node.repl.syncs;
+            field(text, "sync_full", syncs[0].get());
+            field(text, "sync_partial_ok", syncs[1].get());
+            field(text, "sync_partial_err", syncs[2].get());
         }
         "replication" => {
+            // Redis 7.0's fields. A primary has no backlog until the
+            // stream starts (its first replica); `slaveN`'s offset and lag
+            // (seconds) are its last acknowledgement's.
             text.push_str("# Replication\r\n");
-            field(text, "role", "master");
-            field(text, "connected_slaves", 0);
+            let link = &node.repl.link;
+            let primary = node.cluster.as_ref().and_then(|c| c.primary());
+            match &primary {
+                None => field(text, "role", "master"),
+                Some(primary) => {
+                    use crate::repl::replica::State;
+                    let up = link.state() == State::Online;
+                    field(text, "role", "slave");
+                    field(text, "master_host", primary.host());
+                    field(text, "master_port", primary.port());
+                    field(text, "master_link_status", if up { "up" } else { "down" });
+                    field(text, "master_last_io_seconds_ago", link.last_io_secs());
+                    field(text, "master_sync_in_progress", u8::from(link.loading()));
+                    field(text, "slave_read_repl_offset", link.offset());
+                    field(text, "slave_repl_offset", link.offset());
+                    if !up {
+                        field(text, "master_link_down_since_seconds", link.down_secs());
+                    }
+                    field(text, "slave_priority", 100);
+                    field(text, "slave_read_only", 1);
+                    field(text, "replica_announced", 1);
+                }
+            }
+            let replicas = replicas(node);
+            field(text, "connected_slaves", replicas.len());
+            for (i, (host, port, copying, offset, lag)) in replicas.iter().enumerate() {
+                let state = if *copying { "send_bulk" } else { "online" };
+                field(text, &format!("slave{i}"), format_args!("ip={host},port={port},state={state},offset={offset},lag={lag}"));
+            }
+            field(text, "master_failover_state", "no-failover");
+            let repl = &node.repl;
+            let (first, histlen) = repl.backlog_info();
+            // A replica's stream is its primary's.
+            let (replid, offset) = match (&primary, link.replid()) {
+                (Some(_), Some(id)) => (id, link.offset()),
+                _ => (repl.replid, repl.offset()),
+            };
+            field(text, "master_replid", replid);
+            field(text, "master_replid2", "0".repeat(40));
+            field(text, "master_repl_offset", offset);
+            field(text, "second_repl_offset", -1);
+            field(text, "repl_backlog_active", u8::from(repl.active()));
+            field(text, "repl_backlog_size", repl.backlog_size());
+            field(text, "repl_backlog_first_byte_offset", first);
+            field(text, "repl_backlog_histlen", histlen);
         }
         "cluster" => {
             text.push_str("# Cluster\r\n");
@@ -434,12 +543,7 @@ fn info_section(section: &str, node: &Node, text: &mut String) {
             // Ours: moving slots (phase 5).
             if let Some(c) = &node.cluster {
                 field(text, "migrate_keys_sent", c.stats.keys_sent.get());
-                field(text, "migrate_batches_sent", c.stats.batches_sent.get());
-                field(text, "migrate_bytes_sent", c.stats.bytes_sent.get());
-                field(text, "migrate_parts_sent", c.stats.parts_sent.get());
-                field(text, "migrate_parts_aborted", c.stats.parts_aborted.get());
                 field(text, "migrate_keys_imported", c.stats.keys_imported.get());
-                field(text, "migrate_parts_imported", c.stats.parts_imported.get());
                 field(text, "migrate_imports_refused", c.stats.imports_refused.get());
                 field(text, "cluster_redirects_moved", c.stats.moved.get());
                 field(text, "cluster_redirects_ask", c.stats.ask.get());

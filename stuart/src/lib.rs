@@ -17,7 +17,9 @@
 //! itself whenever the nodes change (phase 6): a node that joins gets its
 //! share, a node leaving (`STUART LEAVE`) is drained, then removed.
 //!
-//! The keepers also read each node's memory (`INFO memory`, every second).
+//! The keepers also read each node's memory and replication offset (`INFO
+//! memory replication`, every second), and give every node the others'
+//! offsets (see `keeper.rs`).
 //! A node at 90% of its `maxmemory` or more is full: no slot moves to it
 //! (the plans leave it out, queued moves to it wait), and a node may leave
 //! only if the others have room below 90% for its keys.
@@ -25,16 +27,23 @@
 //! With `--metrics`, stuart serves `/metrics` and the probes over HTTP
 //! ([`metrics`]).
 //!
+//! A primary leaving with a replica hands its slots to it instead of
+//! draining them ([`handover`], phase 8). With `--auto`, a primary the
+//! nodes no longer need (after a scale-down) is drained and made the
+//! replica of one lacking a replica ([`Stuart::demote`]).
+//!
 //! On SIGTERM stuart serves on a few seconds for the nodes stopping with
 //! it ([`linger`]).
 
 mod conn;
+mod failover;
+mod handover;
 mod keeper;
 mod metrics;
 mod mover;
 pub mod state;
 
-use cluster::NodeId;
+use cluster::{NodeId, SlotTable};
 use dbnode::{notice, warning};
 use reactor::{sleep, spawn, Reactor, TcpListener};
 use state::State;
@@ -62,6 +71,13 @@ pub struct Config {
     /// [`Stuart::replan`]), and make the table at the first join unless
     /// `create_when` says otherwise.
     pub auto: bool,
+    /// `--replicas N`: the replicas each primary is given (see
+    /// [`state`]). 0: every node is a primary.
+    pub replicas: usize,
+    /// `--fail-after SECONDS`: how long a node may be down before it is
+    /// failed: a replica marked (its primary writes without it), a
+    /// primary's replica promoted (see [`failover`]).
+    pub fail_after: Duration,
 }
 
 /// How many slots move at once: out of one node (`--moves-per-source`)
@@ -79,7 +95,7 @@ pub struct Moves {
 
 impl Default for Moves {
     fn default() -> Moves {
-        Moves { per_source: 32, total: 128 }
+        Moves { per_source: 128, total: 512 }
     }
 }
 
@@ -94,19 +110,44 @@ pub(crate) struct Stuart {
     /// For `HELLO`'s `id`.
     pub(crate) next_client_id: Cell<u64>,
     pub(crate) create_when: Option<usize>,
-    /// Keeper fibers running (`INFO`'s `stuart_keepers`): one per node.
+    /// Keeper fibers running (`INFO`'s `stuart_keepers`): one per node,
+    /// and per node that left while it lingers.
     pub(crate) keepers: Cell<usize>,
-    /// Per slot moving, what its source last said was pending, and since
-    /// when it moves (`STUART MIGRATIONS`; lost on a restart).
-    pub(crate) pending: RefCell<HashMap<u16, u64>>,
     pub(crate) moving_since: RefCell<HashMap<u16, Instant>>,
     pub(crate) moves: Moves,
     pub(crate) auto: bool,
+    pub(crate) fail_after: Duration,
     /// Per leaving node that holds nothing any more, the table epoch at
     /// which stuart first saw that: it is removed once it took that table.
     emptied: RefCell<HashMap<NodeId, u64>>,
+    /// The nodes that left (removed by [`retire`](Stuart::retire)), as
+    /// their keeper ([`keeper::linger`]) takes them over.
+    pub(crate) left: RefCell<std::collections::HashSet<NodeId>>,
+    /// Nodes that went first for a table they haven't taken yet, its
+    /// epoch, and since when: no other node gets a newer table until they
+    /// took it, for up to [`FIRST_WAIT`] (see [`change`](Stuart::change)).
+    /// Not in the state file: after a restart, every node gets the table
+    /// as it comes.
+    owed: RefCell<Vec<(NodeId, u64, Instant)>>,
     /// Slots whose move ended since stuart started.
     pub(crate) slots_moved: Cell<u64>,
+    /// Primaries known dead: a pod rejoined under their name or address.
+    /// Their replica is promoted at once ([`failover`]); the pod's join
+    /// waits for it.
+    pub(crate) dead: RefCell<std::collections::HashSet<NodeId>>,
+    /// Dead primaries none of whose replicas could be promoted: the pod
+    /// joins, and their slots are lost, as without replicas.
+    pub(crate) unpromotable: RefCell<std::collections::HashSet<NodeId>>,
+    /// Failovers since stuart started.
+    pub(crate) failovers: Cell<u64>,
+    /// Leaving primaries' slots handed to a replica since stuart started.
+    pub(crate) handovers: Cell<u64>,
+    /// The primary being demoted once it holds nothing, and the table
+    /// epoch at which stuart first saw that: it becomes a replica once it
+    /// took that table.
+    demote_emptied: Cell<Option<(NodeId, u64)>>,
+    /// Primaries made replicas since stuart started.
+    pub(crate) demotions: Cell<u64>,
 }
 
 /// How long a node that must take a table first may be down before the
@@ -114,6 +155,9 @@ pub(crate) struct Stuart {
 /// aren't sent back and forth between it and the source; while it's down
 /// its slots can't be served either way, and the other moves go on.
 const FIRST_WAIT: Duration = Duration::from_secs(2);
+
+/// `--fail-after`'s default.
+pub const FAIL_AFTER: Duration = Duration::from_secs(5);
 
 /// Past this share of its `maxmemory` a node is full: nothing moves to it.
 /// The rest is room for writes while the moves under way end.
@@ -127,7 +171,7 @@ pub(crate) struct Memory {
     pub(crate) max: u64,
     /// What its keys take: `used_memory_dataset`.
     pub(crate) dataset: u64,
-    /// What its next new key would allocate at once (`mem_map_growth`):
+    /// The most its next new key may allocate at once (`mem_map_growth`):
     /// counted as used, since past `maxmemory` with it the node refuses
     /// new keys, and keys moving in.
     pub(crate) growth: u64,
@@ -174,17 +218,34 @@ pub(crate) struct Health {
     /// Whether it was asked for its memory since stuart started: until
     /// then nothing moves to it.
     pub(crate) asked: bool,
+    /// Its replication offset (`master_repl_offset`) as last read, kept
+    /// while it's down; 0 before that. For `CLUSTER SLOTS` and `SHARDS`,
+    /// stuart's and the nodes' (pushed with `CLUSTER SETOFFSETS`).
+    pub(crate) offset: u64,
 }
 
 impl Stuart {
     /// Applies `f` to a copy of the state and saves the copy before it
     /// becomes the state: nothing is acted on (replied, pushed) that the
     /// file doesn't hold. If saving fails, nothing changes.
+    ///
+    /// The nodes the last table went to first that haven't taken it yet
+    /// get the new one before any other node, even those it goes to first:
+    /// else a cutover's source could take the next table (say one starting
+    /// moves from it, which goes to the source first) before its target
+    /// took the cutover, and each would send clients to the other.
     pub(crate) fn change<R>(&self, f: impl FnOnce(&mut State) -> R) -> io::Result<R> {
         let mut next = self.state.borrow().clone();
         let result = f(&mut next);
         if next != *self.state.borrow() {
             next.save(&self.path)?;
+            let epoch = |s: &State| s.table().map_or(0, |t| t.epoch());
+            let last = epoch(&self.state.borrow());
+            if epoch(&next) > last {
+                let first = self.state.borrow().first().to_vec();
+                let owed = first.into_iter().filter(|f| self.is_up(f) && !self.has_taken(f, last));
+                self.owed.borrow_mut().extend(owed.map(|f| (f, last, Instant::now())));
+            }
             *self.state.borrow_mut() = next;
         }
         Ok(result)
@@ -200,27 +261,40 @@ impl Stuart {
         }
         let why = if self.create_when.is_some() { format!("--create-when {n}") } else { "--auto".to_string() };
         match self.change(|s| s.create()) {
-            Ok(Ok(())) => notice!("Created the slot table: 16384 slots over {joined} nodes, epoch 1 ({why})"),
+            Ok(Ok(())) => {
+                let replicas = self.state.borrow().table().map_or(0, |t| t.replicas().len());
+                let over = if replicas == 0 { format!("{joined} nodes") } else { format!("{} primaries ({replicas} replicas)", joined - replicas) };
+                notice!("Created the slot table: 16384 slots over {over}, epoch 1 ({why})")
+            }
             Ok(Err(e)) => warning!("{why}: {e}"),
             Err(e) => warning!("{why}: can't save the state: {e}"),
         }
     }
 
     /// After the nodes changed, and every second while nothing moves: with
-    /// `--auto`, hands out unassigned slots and plans the moves again (as
-    /// `STUART REBALANCE`); without, drains again the leaving nodes that
-    /// got slots meanwhile (moves that were under way to them).
+    /// `--auto`, plans the roles (a primary the nodes don't need is
+    /// demoted, if the others have room for its keys: see [`state`]), hands
+    /// out unassigned slots and plans the moves again (as `STUART
+    /// REBALANCE`); without, drains again the leaving nodes that got slots
+    /// meanwhile (moves that were under way to them).
     pub(crate) fn replan(&self) {
         if self.state.borrow().table().is_none() {
             return;
         }
         let before = self.state.borrow().queue().to_vec();
+        let demoting = self.state.borrow().demoting().copied();
         let auto = self.auto;
         let full = self.full_nodes();
-        match self.change(|s| if auto { (s.assign_unassigned(), s.rebalance(&full).unwrap_or(0)) } else { (0, s.drain_leaving(&full)) }) {
-            Ok((assigned, _)) => {
+        let roomy = |id: &NodeId| self.room_for(id).is_ok();
+        match self.change(|s| if auto { (s.plan_roles(roomy), s.assign_unassigned(), s.rebalance(&full).unwrap_or(0)) } else { (false, 0, s.drain_leaving(&full)) }) {
+            Ok((_, assigned, _)) => {
                 let state = self.state.borrow();
                 let epoch = state.table().map_or(0, |t| t.epoch());
+                match (demoting, state.demoting()) {
+                    (None, Some(d)) => notice!("Primary {d} becomes a replica, the nodes needing fewer primaries: its {} slots move to the others", state.holding(d)),
+                    (Some(d), None) if state.primary_of(&d).is_none() && state.node(&d).is_some() => notice!("Primary {d} stays a primary: the nodes need it again"),
+                    _ => {}
+                }
                 if assigned > 0 {
                     notice!("Assigned {assigned} unassigned slots (their keys are gone); table epoch {epoch}");
                 }
@@ -250,11 +324,106 @@ impl Stuart {
             match self.change(|s| s.remove_left(&id)) {
                 Ok(true) => {
                     self.emptied.borrow_mut().remove(&id);
+                    self.left.borrow_mut().insert(id);
                     let epoch = self.state.borrow().table().map_or(0, |t| t.epoch());
                     notice!("Node {id} left the cluster; table epoch {epoch}");
                 }
                 Ok(false) => {}
                 Err(e) => warning!("Can't save the state: {e}; node {id} leaves later"),
+            }
+        }
+    }
+
+    /// Makes the primary being demoted a replica once it holds nothing and
+    /// took a table in which it holds nothing (so that it redirects clients
+    /// for the slots it had, and has ended its moves), or right away if it
+    /// is down; it stays a primary while no primary lacks a replica.
+    pub(crate) fn demote(&self) {
+        let (epoch, id) = {
+            let state = self.state.borrow();
+            let (Some(t), Some(id)) = (state.table(), state.demoting().copied()) else {
+                self.demote_emptied.set(None);
+                return;
+            };
+            if state.holding(&id) > 0 {
+                self.demote_emptied.set(None);
+                return;
+            }
+            (t.epoch(), id)
+        };
+        let since = match self.demote_emptied.get() {
+            Some((d, since)) if d == id => since,
+            _ => {
+                self.demote_emptied.set(Some((id, epoch)));
+                epoch
+            }
+        };
+        if !(self.has_taken(&id, since) || !self.is_up(&id)) {
+            return;
+        }
+        match self.change(|s| s.demote(&id)) {
+            Ok(true) => {
+                self.demote_emptied.set(None);
+                self.demotions.set(self.demotions.get() + 1);
+                let state = self.state.borrow();
+                let epoch = state.table().map_or(0, |t| t.epoch());
+                let primary = state.primary_of(&id).map_or(String::new(), |p| p.to_string());
+                notice!("Node {id} is now a replica of {primary}; table epoch {epoch}");
+            }
+            Ok(false) => {}
+            Err(e) => warning!("Can't save the state: {e}; node {id} becomes a replica later"),
+        }
+    }
+
+    /// Marks the replicas down for `--fail-after` failed, and clears the
+    /// mark of those up again (a node stuart hasn't reached since it
+    /// started keeps what the table says); a primary failed over that
+    /// answers again becomes a replica ([`State::back`]).
+    pub(crate) fn mark_failed(&self) {
+        let back: Vec<NodeId> = {
+            let state = self.state.borrow();
+            let Some(t) = state.table() else { return };
+            t.failed().iter().map(|&i| *t.nodes()[i].id()).filter(|id| state.primary_of(id).is_none() && self.is_up(id)).collect()
+        };
+        for id in back {
+            match self.change(|s| s.back(&id)) {
+                Ok(true) => {
+                    let state = self.state.borrow();
+                    let epoch = state.table().map_or(0, |t| t.epoch());
+                    match state.primary_of(&id) {
+                        Some(p) => notice!("Node {id}, failed over, is back: a replica of {p}; table epoch {epoch}"),
+                        None => notice!("Node {id}, failed over, is back: a primary without slots; table epoch {epoch}"),
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => warning!("Can't save the state: {e}; node {id} waits to be a replica"),
+            }
+        }
+        let changes: Vec<(NodeId, bool)> = {
+            let state = self.state.borrow();
+            let Some(t) = state.table() else { return };
+            t.replicas()
+                .iter()
+                .map(|r| *t.nodes()[r.replica].id())
+                .filter_map(|id| match t.is_failed(t.position(&id)?) {
+                    false if self.down_for(&id) >= self.fail_after => Some((id, true)),
+                    true if self.is_up(&id) => Some((id, false)),
+                    _ => None,
+                })
+                .collect()
+        };
+        for (id, failed) in changes {
+            match self.change(|s| s.set_failed(&id, failed)) {
+                Ok(true) => {
+                    let epoch = self.state.borrow().table().map_or(0, |t| t.epoch());
+                    if failed {
+                        warning!("Replica {id} is marked failed, down for {} s: its primary writes without it; table epoch {epoch}", self.fail_after.as_secs());
+                    } else {
+                        notice!("Replica {id} is back: no longer marked failed; table epoch {epoch}");
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => warning!("Can't save the state: {e}; replica {id} isn't marked yet"),
             }
         }
     }
@@ -268,12 +437,22 @@ impl Stuart {
         self.health.borrow().get(id).is_some_and(|h| h.up)
     }
 
-    /// Whether node `id` may get the table with `epoch` now: it is one of
-    /// the nodes that get it first, or those took it (or left).
+    /// Whether node `id` may get the table with `epoch` now: it owes an
+    /// earlier table (see `owed`); or none is owed, and it is one of the
+    /// nodes that get it first, or those took it (or left).
     pub(crate) fn may_push(&self, id: &NodeId, epoch: u64) -> bool {
         let state = self.state.borrow();
+        let done = |f: &NodeId, e: u64| state.node(f).is_none() || self.has_taken(f, e) || self.down_for(f) >= FIRST_WAIT;
+        let mut owed = self.owed.borrow_mut();
+        owed.retain(|(f, e, since)| !done(f, *e) && self.is_up(f) && since.elapsed() < FIRST_WAIT);
+        if owed.iter().any(|(f, _, _)| f == id) {
+            return true;
+        }
+        if !owed.is_empty() {
+            return false;
+        }
         let first = state.first();
-        first.contains(id) || first.iter().all(|f| state.node(f).is_none() || self.has_taken(f, epoch) || self.down_for(f) >= FIRST_WAIT)
+        first.contains(id) || first.iter().all(|f| done(f, epoch))
     }
 
     /// How long node `id` has been down (zero if it's up).
@@ -285,7 +464,7 @@ impl Stuart {
     /// goes up or down.
     pub(crate) fn report(&self, id: &NodeId, up: bool, error: Option<String>) {
         let mut health = self.health.borrow_mut();
-        let h = health.entry(*id).or_insert(Health { up: !up, since: Instant::now(), acked: 0, error: None, memory: None, asked: false });
+        let h = health.entry(*id).or_insert(Health { up: !up, since: Instant::now(), acked: 0, error: None, memory: None, asked: false, offset: 0 });
         if h.up != up {
             let addr = self.state.borrow().node(id).map_or("?".to_string(), |n| format!("{}:{}", n.host(), n.port()));
             if up {
@@ -320,6 +499,20 @@ impl Stuart {
         }
     }
 
+    /// Records node `id`'s replication offset; `None` (a node that doesn't
+    /// say) keeps the last one.
+    pub(crate) fn report_offset(&self, id: &NodeId, offset: Option<u64>) {
+        if let (Some(h), Some(offset)) = (self.health.borrow_mut().get_mut(id), offset) {
+            h.offset = offset;
+        }
+    }
+
+    /// The replication offsets of `table`'s nodes, by index, as last read.
+    pub(crate) fn offsets(&self, table: &SlotTable) -> Vec<u64> {
+        let health = self.health.borrow();
+        table.nodes().iter().map(|n| health.get(n.id()).map_or(0, |h| h.offset)).collect()
+    }
+
     /// The nodes that are full: the plans move nothing to them.
     pub(crate) fn full_nodes(&self) -> Vec<NodeId> {
         self.health.borrow().iter().filter(|(_, h)| h.memory.is_some_and(|m| m.full())).map(|(id, _)| *id).collect()
@@ -331,15 +524,27 @@ impl Stuart {
         self.health.borrow().get(id).is_some_and(|h| h.asked && !h.memory.is_some_and(|m| m.full()))
     }
 
-    /// Whether the nodes not leaving, other than `id`, have room (below
-    /// 90% of their `maxmemory`) for `id`'s keys, so that it can leave or
-    /// be drained; an error says how much is missing. Nodes without a
-    /// limit, or that never said, have room for anything. Nothing to check
-    /// if there are no others (the cluster is shutting down).
+    /// Whether primary `id` can hand its slots to a replica rather than
+    /// have them drained (see [`handover`]): it has slots and a replica
+    /// up, not leaving, that could be promoted.
+    pub(crate) fn can_hand_over(&self, id: &NodeId) -> bool {
+        let state = self.state.borrow();
+        state.primary_of(id).is_none()
+            && state.holding(id) > 0
+            && failover::candidates(&state, id, |r| self.is_up(r), |p, e| self.has_taken(p, e)).iter().any(|r| !state.leaving().contains(r.id()))
+    }
+
+    /// Whether the nodes that take slots (primaries not leaving nor being
+    /// demoted), other than `id`, have room (below 90% of their
+    /// `maxmemory`) for `id`'s keys, so that it can leave, be drained or
+    /// demoted; an error says how much is missing. Nodes without a limit,
+    /// or that never said, have room for anything. Nothing to check if
+    /// there are no others (the cluster is shutting down).
     pub(crate) fn room_for(&self, id: &NodeId) -> Result<(), String> {
         let others: Vec<NodeId> = {
             let state = self.state.borrow();
-            state.nodes().iter().map(|n| *n.id()).filter(|n| n != id && !state.leaving().contains(n)).collect()
+            let takes = |n: &NodeId| !state.leaving().contains(n) && state.primary_of(n).is_none() && state.demoting() != Some(n);
+            state.nodes().iter().map(|n| *n.id()).filter(|n| n != id && takes(n)).collect()
         };
         let health = self.health.borrow();
         let Some(need) = health.get(id).and_then(|h| h.memory).map(|m| m.dataset) else { return Ok(()) };
@@ -369,7 +574,8 @@ impl Stuart {
 /// given, until the reactor fails; never returns otherwise. Creates the
 /// thread's reactor, so the thread must not have one.
 pub fn serve(listener: net::TcpListener, metrics: Option<net::TcpListener>, config: Config) -> io::Result<()> {
-    let state = State::load(&config.state)?;
+    let mut state = State::load(&config.state)?;
+    state.set_replicas(config.replicas);
     // Fail now, not at the first join, if the file can't be written.
     state.save(&config.state)?;
     let reactor = Reactor::new()?;
@@ -389,12 +595,20 @@ pub fn serve(listener: net::TcpListener, metrics: Option<net::TcpListener>, conf
         next_client_id: Cell::new(1),
         create_when: config.create_when,
         keepers: Cell::new(0),
-        pending: RefCell::new(HashMap::new()),
         moving_since: RefCell::new(HashMap::new()),
         moves: config.moves,
         auto: config.auto,
+        fail_after: config.fail_after,
         emptied: RefCell::new(HashMap::new()),
+        left: RefCell::default(),
+        owed: RefCell::default(),
         slots_moved: Cell::new(0),
+        dead: RefCell::default(),
+        unpromotable: RefCell::default(),
+        failovers: Cell::new(0),
+        handovers: Cell::new(0),
+        demote_emptied: Cell::new(None),
+        demotions: Cell::new(0),
     });
     for id in ids {
         let s = stuart.clone();
@@ -402,6 +616,10 @@ pub fn serve(listener: net::TcpListener, metrics: Option<net::TcpListener>, conf
     }
     let s = stuart.clone();
     reactor.spawn(move || mover::mover(s))?;
+    let s = stuart.clone();
+    reactor.spawn(move || failover::failover(s))?;
+    let s = stuart.clone();
+    reactor.spawn(move || handover::handover(s))?;
     let s = stuart.clone();
     reactor.spawn(move || linger(s))?;
     if let Some(metrics) = metrics {

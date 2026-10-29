@@ -1,6 +1,9 @@
 //! Cases marked "Redis:" were checked against Redis 7.0.15 with redis-cli.
 
 use super::*;
+use crate::collections::List;
+use crate::kv::NEVER;
+use std::collections::HashMap;
 
 const T0: i64 = 1_700_000_000_000;
 
@@ -28,37 +31,30 @@ fn first_byte(key: &[u8]) -> u16 {
     key.first().map_or(0, |&b| u16::from(b))
 }
 
-/// The expiry index and the map agree.
+/// The expiry index and the tables agree, and every key is in its table.
 pub(super) fn check(s: &Store) {
-    for (i, key) in s.expiring.iter().enumerate() {
-        let e = s.map.get(&**key).expect("indexed key not in the map");
-        assert_eq!(e.slot as usize, i, "slot of {key:?}");
-        assert_ne!(e.expire_at, NEVER);
+    for (i, &loc) in s.expiring.iter().enumerate() {
+        let e = s.keys.at(loc);
+        assert_eq!(e.ttl_slot(), Some(i as u32), "place of {:?}", e.key());
+        assert_ne!(e.expire_at(), NEVER);
     }
-    let with_ttl = s.map.values().filter(|e| e.slot != NO_SLOT).count();
+    let with_ttl = s.keys.iter().filter(|e| e.has_ttl()).count();
     assert_eq!(with_ttl, s.expiring.len());
-    for e in s.map.values().filter(|e| e.slot == NO_SLOT) {
-        assert_eq!(e.expire_at, NEVER);
-    }
-    // The slot index and the map agree: every key once, in its slot.
-    // Standalone: one list of every key, once a SCAN built it.
-    let slots = &s.slots;
-    if !slots.active {
-        assert!(slots.keys.iter().all(Vec::is_empty));
-        return;
+    for e in s.keys.iter().filter(|e| !e.has_ttl()) {
+        assert_eq!(e.expire_at(), NEVER);
     }
     let mut listed = 0;
-    for (slot, keys) in slots.keys.iter().enumerate() {
-        for (i, key) in keys.iter().enumerate() {
-            let e = s.map.get(&**key).expect("key in the slot index not in the map");
-            assert_eq!(e.pos as usize, i, "place of {key:?}");
-            assert_eq!(slots.list_of(key), slot, "slot of {key:?}");
-            assert!(Rc::ptr_eq(key, s.map.get_key_value(&**key).unwrap().0), "the index shares the map's key");
+    for (t, table) in s.keys.tables.iter().enumerate() {
+        table.check();
+        for e in table.entries() {
+            let (home, hash) = s.keys.locate(e.key());
+            assert_eq!((home, hash), (t, e.hash()), "table of {:?}", e.key());
         }
-        listed += keys.len();
+        listed += table.len();
     }
-    assert_eq!(listed, s.map.len());
+    assert_eq!(listed, s.keys.len);
 }
+
 
 fn set(s: &mut Store, key: &str, value: &str) {
     assert_eq!(s.set(key.as_bytes(), value.as_bytes(), SetOptions::default()), Ok(SetReply::Ok));
@@ -82,7 +78,6 @@ fn old(v: &str) -> SetReply {
 
 const FLAGS: ExpireFlags = ExpireFlags { nx: false, xx: false, gt: false, lt: false };
 
-// ---- GET / SET ----
 
 #[test]
 fn get_and_set() {
@@ -477,6 +472,33 @@ fn incr_after_expiry_starts_at_zero() {
     s.set_now(T0 + 11);
     assert_eq!(s.incr_by(b"c", 1), Ok(1));
     assert_eq!(s.ttl(b"c"), -1);
+    check(&s);
+}
+
+#[test]
+fn incrbyfloat() {
+    // Redis 7.0.15: the TTL kept; the type checked first, then the value,
+    // then the increment; nothing changed on an error.
+    let mut s = store();
+    assert_eq!(s.incr_by_float(b"f", b"10.5"), Ok(b"10.5".to_vec()));
+    s.expire(ExpireCmd::Expire, b"f", 100, FLAGS).unwrap();
+    assert_eq!(s.incr_by_float(b"f", b"0.1"), Ok(b"10.6".to_vec()));
+    assert_eq!(s.incr_by_float(b"f", b"5.0e3"), Ok(b"5010.60000000000000009".to_vec()));
+    assert_eq!(get(&mut s, "f").as_deref(), Some("5010.60000000000000009"));
+    assert_eq!(s.ttl(b"f"), 100);
+    assert_eq!(s.incr_by_float(b"f", b"x"), Err(Error::NotFloat));
+    assert_eq!(s.incr_by_float(b"f", b"inf"), Err(Error::NotFinite));
+    set(&mut s, "m", "1.18e4932");
+    assert_eq!(s.incr_by_float(b"m", b"1e4931"), Err(Error::NotFinite));
+    set(&mut s, "n", "abc");
+    assert_eq!(s.incr_by_float(b"n", b"1"), Err(Error::NotFloat));
+    assert_eq!(get(&mut s, "n").as_deref(), Some("abc"));
+    assert_eq!(s.incr_by_float(b"missing", b"x"), Err(Error::NotFloat));
+    assert!(!s.exists(b"missing"));
+    put_other(&mut s, b"l");
+    assert_eq!(s.incr_by_float(b"l", b"x"), Err(Error::WrongType));
+    assert_eq!(Error::NotFloat.to_string(), "ERR value is not a valid float");
+    assert_eq!(Error::NotFinite.to_string(), "ERR increment would produce NaN or Infinity");
     check(&s);
 }
 
@@ -969,9 +991,9 @@ fn count_in_slot_needs_the_index() {
 }
 
 #[test]
-fn entry_stays_small() {
-    // `pos` fills padding: the slot index costs the map nothing.
-    assert_eq!(mem::size_of::<Entry>(), 40);
+fn a_key_is_one_pointer_in_its_table() {
+    assert_eq!(mem::size_of::<Kv>(), 8);
+    assert_eq!(mem::size_of::<Loc>(), 8);
 }
 
 #[test]
@@ -1017,24 +1039,22 @@ fn room_is_given_back_after_deletions() {
         s.set(format!("a{i}").as_bytes(), b"v", opts).unwrap();
         s.set(format!("b{i}").as_bytes(), b"v", opts).unwrap();
     }
-    let (map_cap, exp_cap) = (s.map.capacity(), s.expiring.capacity());
-    assert!(map_cap >= 40_000 && exp_cap >= 20_000);
+    let exp_cap = s.expiring.capacity();
+    assert!(exp_cap >= 20_000);
     assert!(!s.shrink(), "a full store doesn't shrink");
-    assert_eq!(s.map_room, map_cap);
     for i in 0..20_000 {
         s.del(format!("b{i}").as_bytes());
         if i >= 50 {
             s.del(format!("a{i}").as_bytes());
         }
     }
-    let lists = &s.slots.keys;
-    assert_eq!(lists[usize::from(b'b')].capacity(), 0, "an empty slot's list is freed");
-    assert!(lists[usize::from(b'a')].capacity() <= 200, "{}", lists[usize::from(b'a')].capacity());
-    // Deleted entries leave tombstones, which take from what `capacity`
-    // reports, but the table keeps its size until asked.
-    assert!(s.map.capacity() > map_cap / 2, "{} of {map_cap}", s.map.capacity());
+    let (a, b) = (&s.keys.tables[usize::from(b'a')], &s.keys.tables[usize::from(b'b')]);
+    assert_eq!(b.growth_bound(), Indexed::<Kv>::default().growth_bound(), "an empty slot's table is freed");
+    // A table shrinks as keys leave it: 50 keys in no more than 200
+    // places, an index of no more than 128.
+    assert!(a.growth_bound() <= 400 * mem::size_of::<Kv>() + 256 * 4, "{}", a.growth_bound());
+    assert_eq!(a.entries().len(), 50);
     assert!(s.shrink());
-    assert!(s.map.capacity() < 1000, "{}", s.map.capacity());
     assert!(s.expiring.capacity() <= 50, "{}", s.expiring.capacity());
     check(&s);
     assert_eq!(s.dbsize(), 50);
@@ -1042,10 +1062,10 @@ fn room_is_given_back_after_deletions() {
         assert_eq!(s.get(format!("a{i}").as_bytes()), Ok(Some(&b"v"[..])));
     }
     assert_eq!(s.count_in_slot(u16::from(b'a')), 50);
-    // Small tables are left alone.
+    // A small index is left alone.
     let mut small = store();
     for i in 0..500 {
-        small.set(format!("k{i}").as_bytes(), b"v", SetOptions::default()).unwrap();
+        small.set(format!("k{i}").as_bytes(), b"v", SetOptions { expiry: SetExpiry::Px(10), ..SetOptions::default() }).unwrap();
     }
     for i in 0..500 {
         small.del(format!("k{i}").as_bytes());
@@ -1054,25 +1074,29 @@ fn room_is_given_back_after_deletions() {
 }
 
 #[test]
-fn growth_says_when_the_map_would_double() {
-    let mut s = store();
-    assert!(s.growth() > 0, "an empty map allocates on the first key");
-    let mut i = 0;
-    while s.map.len() < 1000 || s.map.len() < s.map.capacity() {
-        if s.map.len() >= 1000 {
-            assert_eq!(s.growth(), 0, "room for {} more", s.map.capacity() - s.map.len());
+fn growth_bounds_any_table_s_next_step() {
+    let mut s = slotted();
+    assert!(s.growth() > 0, "an empty table allocates on the first key");
+    for i in 0..1000 {
+        // Slot 'k' is the largest: whatever any table grows by next is
+        // bounded by the store's growth.
+        for prefix in ["k", "j"] {
+            let key = format!("{prefix}{i}");
+            let table = &s.keys.tables[usize::from(key.as_bytes()[0])];
+            assert!(table.growth_bound() <= s.growth(), "{key}");
+            s.set(key.as_bytes(), b"v", SetOptions::default()).unwrap();
         }
-        s.set(format!("k{i}").as_bytes(), b"v", SetOptions::default()).unwrap();
-        i += 1;
+        s.del(format!("j{i}").as_bytes());
     }
-    let (capacity, growth) = (s.map.capacity(), s.growth());
-    let bucket = mem::size_of::<(Rc<[u8]>, Entry)>() + 1;
-    // The next table: twice the buckets of this one.
-    let buckets = (capacity * 8 / 7).next_power_of_two();
-    assert_eq!(growth, 2 * buckets * bucket, "{capacity} items in {buckets} buckets");
-    s.set(b"one more", b"v", SetOptions::default()).unwrap();
-    assert!(s.map.capacity() > capacity);
-    assert_eq!(s.growth(), 0);
+    assert_eq!(s.growth(), s.keys.tables[usize::from(b'k')].growth_bound());
+    // With expiry, the index's doubling counts too.
+    let mut s = store();
+    s.set(b"k", b"v", SetOptions { expiry: SetExpiry::Px(10), ..SetOptions::default() }).unwrap();
+    while s.expiring.len() < s.expiring.capacity() {
+        let n = s.expiring.len();
+        s.set(format!("k{n}").as_bytes(), b"v", SetOptions { expiry: SetExpiry::Px(10), ..SetOptions::default() }).unwrap();
+    }
+    assert!(s.growth() >= s.expiring.capacity() * 2 * mem::size_of::<Loc>());
 }
 
 #[test]
@@ -1093,7 +1117,275 @@ fn encodings_are_redis_s() {
     }
     s.incr_by(b"n", 1).unwrap();
     assert_eq!(s.encoding(b"n"), Some("int"));
+    // Redis: APPEND makes it raw, whatever it holds, until a SET.
+    s.append(b"n", b"2").unwrap();
+    assert_eq!(s.encoding(b"n"), Some("raw"));
+    assert_eq!(s.get(b"n"), Ok(Some(&b"12"[..])));
+    s.incr_by(b"n", 1).unwrap();
+    assert_eq!(s.encoding(b"n"), Some("int"));
     assert_eq!(s.encoding(b"nope"), None);
     put_other(&mut s, b"l");
     assert_eq!(s.encoding(b"l"), Some("quicklist"));
+}
+
+/// The recorded effects as text, one command per string.
+fn effects(s: &mut Store) -> Vec<String> {
+    s.take_effects()
+        .into_iter()
+        .map(|e| match e {
+            Effect::Expired(k) => format!("expired {}", String::from_utf8_lossy(&k)),
+            Effect::As(args) => args.iter().map(|a| String::from_utf8_lossy(a).to_string()).collect::<Vec<_>>().join(" "),
+            Effect::Nothing => "nothing".to_string(),
+        })
+        .collect()
+}
+
+#[test]
+fn writes_record_their_effects() {
+    let mut s = store();
+    // Not recording: nothing.
+    s.set(b"k", b"v", ex(SetExpiry::Ex(10))).unwrap();
+    assert!(!s.has_effects());
+    s.record_effects(true);
+    assert_eq!(effects(&mut s), Vec::<String>::new());
+
+    // SET: as sent without an expiry; with one, the absolute time.
+    s.set(b"k", b"v", SetOptions::default()).unwrap();
+    assert!(!s.has_effects());
+    s.set(b"k", b"v2", ex(SetExpiry::Ex(10))).unwrap();
+    s.set(b"n", b"v", ex(SetExpiry::Px(5))).unwrap();
+    s.set(b"a", b"v", ex(SetExpiry::ExAt(T0 / 1000 + 1))).unwrap();
+    assert!(s.has_effects());
+    assert_eq!(effects(&mut s), [
+        format!("SET k v2 PXAT {}", T0 + 10_000),
+        format!("SET n v PXAT {}", T0 + 5),
+        format!("SET a v PXAT {}", T0 + 1000),
+    ]);
+    // Blocked, or a time that has come: nothing, or a delete.
+    let nx = SetOptions { expiry: SetExpiry::Ex(10), cond: SetCond::Nx, ..SetOptions::default() };
+    assert_eq!(s.set(b"k", b"x", nx), Ok(SetReply::NotSet));
+    s.set(b"k", b"x", ex(SetExpiry::PxAt(1))).unwrap();
+    s.set(b"gone", b"x", ex(SetExpiry::PxAt(1))).unwrap();
+    let get = SetOptions { expiry: SetExpiry::Px(9), get: true, ..SetOptions::default() };
+    assert_eq!(s.set(b"n", b"w", get), Ok(SetReply::Old(Some(b"v".to_vec()))));
+    assert_eq!(effects(&mut s), ["nothing".to_string(), "DEL k".into(), "nothing".into(), format!("SET n w PXAT {}", T0 + 9)]);
+    // An error records nothing.
+    put_other(&mut s, b"l");
+    assert!(s.set(b"l", b"x", get).is_err());
+    assert!(s.set(b"k", b"x", ex(SetExpiry::Ex(-1))).is_err());
+    assert!(!s.has_effects());
+
+    // EXPIRE and the others: the absolute time, a delete, or nothing.
+    s.set(b"e", b"v", SetOptions::default()).unwrap();
+    s.expire(ExpireCmd::Expire, b"e", 100, FLAGS).unwrap();
+    s.expire(ExpireCmd::PExpire, b"e", 50, ExpireFlags { gt: true, ..FLAGS }).unwrap();
+    s.expire(ExpireCmd::PExpire, b"e", 50, ExpireFlags { lt: true, ..FLAGS }).unwrap();
+    s.expire(ExpireCmd::ExpireAt, b"nope", 1, FLAGS).unwrap();
+    s.expire(ExpireCmd::PExpireAt, b"e", 7, FLAGS).unwrap();
+    assert!(s.expire(ExpireCmd::Expire, b"e", i64::MAX, FLAGS).is_err());
+    assert_eq!(effects(&mut s), [
+        format!("PEXPIREAT e {}", T0 + 100_000),
+        "nothing".to_string(),
+        format!("PEXPIREAT e {}", T0 + 50),
+        "nothing".into(),
+        "DEL e".into(),
+    ]);
+
+    // Reclaimed as expired: by a lookup, by the sweep.
+    s.set(b"t1", b"v", ex(SetExpiry::Px(1))).unwrap();
+    s.set(b"t2", b"v", ex(SetExpiry::Px(1))).unwrap();
+    s.take_effects();
+    s.set_now(T0 + 1000);
+    assert_eq!(s.get(b"t1"), Ok(None));
+    assert_eq!(s.get(b"t1"), Ok(None), "reclaimed once");
+    s.expire_cycle(100);
+    let got = effects(&mut s);
+    assert_eq!(got[0], "expired t1");
+    assert!(got.contains(&"expired t2".to_string()), "{got:?}");
+    assert!(got.contains(&"expired n".to_string()), "{got:?}");
+    assert_eq!(got.iter().filter(|e| *e == "expired t1").count(), 1, "{got:?}");
+
+    // SPOP: the SREM of what it took; nothing if there was nothing.
+    s.sadd(b"s", &[b"1", b"2", b"3", b"4"]).unwrap();
+    let one = s.spop(b"s").unwrap().unwrap();
+    let two = s.spop_count(b"s", 2).unwrap();
+    let rest = s.spop_count(b"s", 10).unwrap();
+    assert_eq!(s.spop(b"s"), Ok(None));
+    assert_eq!(s.spop_count(b"s", 3), Ok(vec![]));
+    let text = |m: &[Box<[u8]>]| m.iter().map(|m| String::from_utf8_lossy(m).to_string()).collect::<Vec<_>>().join(" ");
+    assert_eq!(effects(&mut s), [
+        format!("SREM s {}", String::from_utf8_lossy(&one)),
+        format!("SREM s {}", text(&two)),
+        format!("SREM s {}", text(&rest)),
+        "nothing".to_string(),
+        "nothing".into(),
+    ]);
+    assert_eq!(rest.len(), 1);
+
+    // The floats: the value written.
+    s.set(b"f", b"1.5", ex(SetExpiry::Ex(100))).unwrap();
+    s.take_effects();
+    s.incr_by_float(b"f", b"0.25").unwrap();
+    s.hincr_by_float(b"h", b"x", b"2e3").unwrap();
+    assert!(s.incr_by_float(b"l", b"1").is_err());
+    assert!(s.hincr_by_float(b"h", b"x", b"inf").is_err());
+    assert_eq!(effects(&mut s), ["SET f 1.75 KEEPTTL", "HSET h x 2000"]);
+
+    // Off again: dropped, and nothing more.
+    s.spop(b"none").unwrap();
+    s.record_effects(false);
+    assert!(!s.has_effects());
+    s.expire(ExpireCmd::Expire, b"f", 5, FLAGS).unwrap();
+    assert_eq!(s.take_effects(), vec![]);
+}
+
+#[test]
+fn inspect_sees_expired_keys() {
+    let mut s = store();
+    s.set(b"k", b"v", ex(SetExpiry::Px(5))).unwrap();
+    s.sadd(b"s", &[b"1", b"2"]).unwrap();
+    s.set_now(T0 + 10);
+    let (dump, at, encoding) = s.inspect(b"k").unwrap();
+    assert_eq!((dump.payload(), at, encoding), (&b"v"[..], Some(T0 + 5), "embstr"));
+    assert!(s.dump(b"k").is_none(), "dump leaves expired keys out");
+    let (dump, at, encoding) = s.inspect(b"s").unwrap();
+    assert_eq!((dump.kind(), at, encoding), (Kind::Set, None, "intset"));
+    assert!(s.inspect(b"nope").is_none());
+    assert_eq!(s.dbsize(), 2, "inspect reclaims nothing");
+}
+
+#[test]
+fn a_replica_s_store_hides_expired_keys_without_reclaiming() {
+    let mut s = store();
+    s.record_effects(true);
+    s.set_reclaim(false);
+    s.set(b"k", b"v", ex(SetExpiry::Px(5))).unwrap();
+    s.sadd(b"s", &[b"1"]).unwrap();
+    s.expire(ExpireCmd::PExpire, b"s", 5, FLAGS).unwrap();
+    s.take_effects();
+    s.set_now(T0 + 10);
+    // Gone for reads, still there.
+    assert_eq!(s.get(b"k"), Ok(None));
+    assert_eq!(s.pttl(b"k"), -2);
+    assert!(!s.exists(b"s"));
+    assert_eq!(s.expire_cycle(100), 0);
+    assert_eq!(s.dbsize(), 2);
+    assert!(s.inspect(b"k").is_some());
+    assert!(!s.has_effects(), "nothing reclaimed, nothing recorded");
+    // Applying the stream, before every expiry: there for the writes.
+    s.set_now(BEFORE_TIME);
+    assert_eq!(s.get(b"k"), Ok(Some(&b"v"[..])));
+    assert_eq!(s.sadd(b"s", &[b"2"]), Ok(1));
+    s.expire(ExpireCmd::PExpireAt, b"k", T0 + 100, FLAGS).unwrap();
+    assert_eq!(s.inspect(b"k").unwrap().1, Some(T0 + 100), "an absolute time in the past of the real clock stays");
+    // The primary's DEL removes it.
+    assert!(s.del(b"s"));
+    assert_eq!(s.dbsize(), 1);
+    // Reclaiming again (a replica promoted): expired keys go.
+    s.set_now(T0 + 1000);
+    s.set_reclaim(true);
+    assert_eq!(s.expire_cycle(100), 1);
+    assert_eq!(s.dbsize(), 0);
+}
+
+/// Slots held (a slot copied from another node): their expired keys are
+/// hidden, not reclaimed, the others' reclaimed as usual; `drop_slot`
+/// removes a slot's keys, expired or not, recording nothing.
+#[test]
+fn held_slots_keep_their_expired_keys() {
+    let mut s = slotted();
+    s.record_effects(true);
+    for key in [&b"a1"[..], b"a2", b"b1"] {
+        s.set(key, b"v", ex(SetExpiry::Px(5))).unwrap();
+    }
+    s.set(b"a3", b"v", SetOptions::default()).unwrap();
+    s.take_effects();
+    s.set_held(vec![u16::from(b'a'), u16::from(b'a')]);
+    s.set_now(T0 + 10);
+    assert_eq!(s.get(b"a1"), Ok(None), "hidden");
+    assert_eq!(s.expire_cycle(100), 1, "only b1");
+    assert_eq!(s.take_effects(), [Effect::Expired(b"b1".to_vec())]);
+    assert_eq!(s.dbsize(), 3);
+    assert_eq!(s.count_in_slot(u16::from(b'a')), 3);
+    // Dropped: every key of the slot, expired ones too, and no effect.
+    assert_eq!(s.drop_slot(u16::from(b'a')), 3);
+    assert_eq!(s.dbsize(), 0);
+    assert!(!s.has_effects());
+    assert_eq!(s.drop_slot(u16::from(b'z')), 0);
+    // Held no more: reclaimed again.
+    s.set(b"a1", b"v", ex(SetExpiry::PxAt(T0 + 11))).unwrap();
+    s.set_now(T0 + 20);
+    assert_eq!(s.expire_cycle(100), 0, "still held");
+    s.set_held(Vec::new());
+    assert_eq!(s.expire_cycle(100), 1);
+}
+
+/// A held slot's keys aren't counted or listed (`DBSIZE`, `KEYS`, `SCAN`),
+/// as Redis 8 hides a slot it imports; `dbsize` (`INFO keyspace`) counts
+/// them.
+#[test]
+fn held_slots_are_hidden() {
+    let mut s = slotted();
+    for key in [&b"a1"[..], b"a2", b"b1", b"c1"] {
+        s.set(key, b"v", SetOptions::default()).unwrap();
+    }
+    s.set_held(vec![u16::from(b'a'), u16::from(b'c')]);
+    assert!(s.is_held(u16::from(b'a')) && !s.is_held(u16::from(b'b')));
+    assert_eq!((s.dbsize(), s.dbsize_served()), (4, 1));
+    assert_eq!(s.keys_matching(b"*"), [&b"b1"[..]]);
+    let (mut cursor, mut seen) = (0, Vec::new());
+    loop {
+        let (next, mut keys) = s.scan(cursor, 1, None, None);
+        seen.append(&mut keys);
+        if next == 0 {
+            break;
+        }
+        cursor = next;
+    }
+    assert_eq!(seen, [b"b1".to_vec()]);
+    s.set_held(Vec::new());
+    assert_eq!(s.dbsize_served(), 4);
+    assert_eq!(s.keys_matching(b"*").len(), 4);
+    // Standalone: nothing held, every key.
+    let mut t = store();
+    t.set(b"k", b"v", SetOptions::default()).unwrap();
+    assert_eq!(t.dbsize_served(), 1);
+}
+
+#[test]
+fn expire_times() {
+    // Redis: EXPIRETIME / PEXPIRETIME.
+    let mut s = store();
+    s.set(b"k", b"v", ex(SetExpiry::PxAt(T0 + 1500))).unwrap();
+    s.set(b"p", b"v", SetOptions::default()).unwrap();
+    assert_eq!(s.pexpire_time(b"k"), T0 + 1500);
+    assert_eq!(s.pexpire_time(b"p"), -1);
+    assert_eq!(s.pexpire_time(b"nope"), -2);
+    s.set_now(T0 + 2000);
+    assert_eq!(s.pexpire_time(b"k"), -2);
+}
+
+#[test]
+fn a_slot_given_up_goes_in_parts() {
+    let mut s = slotted();
+    for i in 0..10 {
+        let opts = if i % 3 == 0 { ex(SetExpiry::Px(1000)) } else { SetOptions::default() };
+        s.set(format!("a{i}").as_bytes(), b"v", opts).unwrap();
+    }
+    set(&mut s, "b", "v");
+    s.record_effects(true);
+    let first = s.drop_slot_part(u16::from(b'a'), 4);
+    assert_eq!(first.len(), 4);
+    assert_eq!((s.count_in_slot(u16::from(b'a')), s.dbsize()), (6, 7));
+    check(&s);
+    let rest = s.drop_slot_part(u16::from(b'a'), 100);
+    let mut all: Vec<Vec<u8>> = first.iter().chain(&rest).map(|k| k.to_vec()).collect();
+    all.sort();
+    let mut want: Vec<Vec<u8>> = (0..10).map(|i| format!("a{i}").into_bytes()).collect();
+    want.sort();
+    assert_eq!(all, want, "each key once");
+    assert_eq!((s.count_in_slot(u16::from(b'a')), s.dbsize(), s.expiring_len()), (0, 1, 0));
+    assert!(!s.has_effects());
+    assert_eq!(s.drop_slot_part(u16::from(b'a'), 4), Vec::<Box<[u8]>>::new());
+    check(&s);
 }

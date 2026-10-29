@@ -5,6 +5,9 @@ which builds the binaries).
     python3 migrate_check.py SCENARIO... --bin DIR [--base-port 7880]
         [--keys 2000] [--filler 200000] [--lettuce CLASSPATH]
 
+stuart moves slots by snapshot (since phase 8; phase 5 moved them key by
+key).
+
 Each scenario starts stuart and three dbnodes (four for drain), CREATE,
 fills the cluster with --filler keys (f:<i>, values of 100 bytes, written
 straight to their nodes) so that moves take a few seconds, and starts the
@@ -44,8 +47,8 @@ Then the scenario moves slots:
                SIGTERM while slots move to it
   full-target  stuart --auto and three nodes; a fourth joins with a
                --maxmemory too small for its share: it refuses keys past its
-               limit (CLUSTER IMPORT -OOM) and is full at 90%, so the moves
-               to it stop, the others keep their slots, writes to its keys
+               limit (its slot syncs wait unread) and is full at 90%, so
+               the moves to it stop, the others keep their slots, writes to its keys
                get -OOM (the only failures allowed); its used_memory stays
                within its limit. Then its limit goes (CONFIG SET maxmemory
                0): the moves resume and the four end even
@@ -59,7 +62,81 @@ Then the scenario moves slots:
                mode given): the -MOVED/-ASK/-TRYAGAIN replies the nodes
                send it (INFO cluster) before, during and in 2 s windows
                after a rebalance; redis-py and Lettuce must get none once
-               their slot map is refreshed
+               their slot map is refreshed. By snapshot, -MOVED only: no
+               -ASK or -TRYAGAIN
+  failover     (phase 8) stuart --auto --replicas 1 and six nodes: three
+               primaries with a replica each. One more writer, redis-py,
+               sends each INCR with a WAIT 1 on the same connection. A
+               primary is SIGKILLed: its replica must be promoted
+               (--fail-after 5 s, then the 3 s lease); then the dead node
+               is started again at its address (a new id: it joins as the
+               new primary's replica). Every INCR the WAIT said the replica
+               had must be there; those only acknowledged may be lost on
+               the dead primary's slots (counted). The time from the kill
+               to the first write the new primary takes is printed
+  failover-stop  the same, the primary SIGSTOPped instead, past its
+               failover, then SIGCONT: INCRs sent to it while it was
+               stopped must all be refused once it runs again (its lease
+               ran out: no write taken by both), and it comes back as the
+               new primary's replica (the same id)
+
+  move-source-failover  (phase 8) the failover setup, then a fourth
+               primary and its replica join: slots move to it from the
+               three. A source is SIGKILLed mid-move: its moves are called
+               off (the target drops what it copied, its replica too), its
+               replica promoted, the moves done again from there; the dead
+               node comes back as its replica. Writers as in failover, and
+               one more SETting and DELeting keys with WAIT 1. Every write
+               WAIT confirmed must be there (a confirmed DEL: the key gone,
+               none brought back); then every replica is compared key by
+               key with its primary: type, value, expiry, nothing else
+  move-target-failover  the same, the new primary SIGKILLed mid-move: its
+               replica (holding the copies unserved) promoted
+  move-cutover-failover  the same, the source of a link SIGKILLed as soon
+               as the target lists it landing (the target took the table
+               giving it the slots; the source's last writes on the way)
+  move-cutover-stop  the same, the source SIGSTOPped instead, and SIGCONT
+               once its replica is promoted: back with its keys under its
+               id, marked failed, it must trim nothing (its replica may
+               still be applying its stream) and becomes the new primary's
+               replica
+
+  sigterm-primary  (phase 8) the failover setup, writers as in
+               move-source-failover, stuart serving --metrics on its port
+               + 1000. A primary gets SIGTERM: it hands its slots to its
+               replica (its writes paused until the replica has them all)
+               and exits by itself (status 0); no slot moves (stuart's
+               stuart_slots_moved_total), one handover
+               (stuart_handovers_total), no write lost, not even one only
+               acknowledged
+  sigterm-replica  the same, a replica gets SIGTERM: it leaves at once
+               (exits within --leave-linger + 5 s), no slot moves
+  sigterm-no-replica  the same, a replica gets SIGTERM, then its
+               primary: without a replica, its slots are drained to the
+               other two primaries, as in phase 6 (each of its slots moved)
+  rolling      the same with each node named (--name), SIGTERMed in turn
+               and started again under its name at its address once it
+               exited, as Kubernetes rolls a StatefulSet; the next once it
+               is a replica again, caught up. Each primary hands over, each
+               node back joins as the replica of the primary lacking one:
+               no slot moves, one full sync per node, no write lost
+  scale-down   (phase 8) the rolling setup scaled down as a StatefulSet
+               is, a node SIGTERMed once the last exited: 6 nodes to 4,
+               two replicas of different primaries going (nodes joining one
+               by one pair up in join order, so the highest two would be a
+               pair; a rolling restart shuffles the roles): three primaries
+               are one too many, so one is demoted: its slots move to the
+               other two, and it becomes the replica of the one lacking one
+               (one demotion, stuart_demotions_total); then 4 to 2, the
+               highest two: one primary and its replica remain. Each step
+               ends with every primary having a replica, synced; writers
+               and checks as in sigterm-primary
+  scale-down-up  6 to 4 the same way with slower moves (--moves-per-source
+               16), then, once some of the slots of the primary demoted
+               have moved, two nodes started on new ports (the second one
+               gone still lingers on its own): the demotion is called off
+               (0 demotions), the cluster ends with three primaries even
+               and their replicas
 
 With --collection N (default 20000), each hot slot (below) also holds a
 hash, a set and a list of N elements, so that they move in parts
@@ -69,6 +146,9 @@ numbered in the order sent. At the end every element must be there, in
 order for the lists: the original ones, every acknowledged SADD and RPUSH
 (one in doubt may be there or not, an RPUSH retried twice), each counter
 field within its INCRs as above.
+
+With replicas, the replicas are left out of that and checked against
+their primaries instead: once caught up, the same number of keys.
 
 Once nothing moves and the writers stopped, every node is read directly
 (GETKEYSINSLOT for every slot): no key may be at two nodes or at a node
@@ -92,6 +172,7 @@ import re
 import select
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -188,6 +269,9 @@ class Cluster:
 
     def term_node(self, port: int):
         self.nodes[port].send_signal(signal.SIGTERM)
+
+    def signal_node(self, port: int, sig: int):
+        self.nodes[port].send_signal(sig)
 
     def wait_exit(self, port: int, timeout: float = 120.0) -> int:
         """Waits until node `port` exits by itself; its status. It's no
@@ -388,6 +472,185 @@ class RedisPyWriter(Writer):
         rc.close()
 
 
+class WaitWriter(Writer):
+    """redis-py, each INCR sent with a WAIT 1 on the connection to the
+    key's node: `safe` counts the INCRs WAIT said the replica has, which
+    a failover must keep. A redirect or a failed node (in doubt) makes it
+    refresh its slot map."""
+    name = "redis-py + WAIT"
+
+    def __init__(self, names: List[str], seed_port: int):
+        super().__init__(names, seed_port)
+        self.safe = [0] * len(names)
+
+    def run(self):
+        rc = wait_for("redis-py to connect", lambda: RedisCluster(host=HOST, port=self.seed_port))
+        j = self.offset
+        while not self.stopping.is_set():
+            j = (j + 1) % len(self.indices)
+            i = self.indices[j]
+            try:
+                r = rc.get_redis_connection(rc.get_node_from_key(self.names[i]))
+                p = r.pipeline(transaction=False)
+                p.incr(self.names[i])
+                p.execute_command("WAIT", 1, 2000)
+                _, replicas = p.execute()
+                self.acked[i] += 1
+                if replicas >= 1:
+                    self.safe[i] += 1
+            except Exception as e:  # noqa: BLE001 - in doubt
+                self.failed(i, f"{type(e).__name__}: {e}")
+                try:
+                    rc.nodes_manager.initialize()
+                except Exception:  # noqa: BLE001 - the next try again
+                    time.sleep(0.1)
+            self.ops += 1
+        rc.close()
+
+
+class DelWriter(Writer):
+    """redis-py on the keys d:0 .. d:<n-1>, each in turn SET to its round
+    number and then DELeted, each with a WAIT 1 on the connection to the
+    key's node, as WaitWriter does. For every key, its last write and how
+    it went (WAIT confirmed, acknowledged or in doubt): at the end a key
+    whose last write was a confirmed DEL must be gone (nothing deleted
+    comes back, from a copy sent again or a replica's), one whose last was
+    a confirmed SET must hold its value. Its counts are its own."""
+    name = "redis-py + WAIT (SET/DEL)"
+    KEYS = 500
+
+    def __init__(self, names: List[str], seed_port: int):
+        super().__init__(names, seed_port, [])
+        # key -> (round, "set"|"del", "safe"|"acked"|"doubt")
+        self.last: Dict[str, Tuple[int, str, str]] = {}
+        self.del_failures = 0
+
+    def run(self):
+        rc = wait_for("redis-py to connect", lambda: RedisCluster(host=HOST, port=self.seed_port))
+        n = 0
+        while not self.stopping.is_set():
+            n += 1
+            key, rnd = f"d:{n % self.KEYS}", n // self.KEYS
+            for kind in ("set", "del"):
+                try:
+                    r = rc.get_redis_connection(rc.get_node_from_key(key))
+                    p = r.pipeline(transaction=False)
+                    if kind == "set":
+                        p.set(key, str(rnd))
+                    else:
+                        p.delete(key)
+                    p.execute_command("WAIT", 1, 2000)
+                    _, replicas = p.execute()
+                    self.last[key] = (rnd, kind, "safe" if replicas >= 1 else "acked")
+                except Exception as e:  # noqa: BLE001 - in doubt
+                    self.last[key] = (rnd, kind, "doubt")
+                    self.del_failures += 1
+                    if len(self.errors) < 1000:
+                        self.errors.append(f"{key} {kind}: {type(e).__name__}: {e}")
+                    try:
+                        rc.nodes_manager.initialize()
+                    except Exception:  # noqa: BLE001 - the next try again
+                        time.sleep(0.1)
+                    break
+                self.ops += 1
+        rc.close()
+
+
+def check_deletes(cluster: "Cluster", w: DelWriter, lossy: Set[int]) -> List[str]:
+    """DelWriter's keys, each as its last write left it (see there)."""
+    problems: List[str] = []
+    owners = cluster.owners()
+    back, wrong, checked = [], [], 0
+    for key, (rnd, kind, how) in w.last.items():
+        if how == "doubt" or (how == "acked" and key_slot(key.encode()) in lossy):
+            continue
+        checked += 1
+        v = cluster.node(owners[key_slot(key.encode())]).get(key)
+        if kind == "del" and v is not None:
+            back.append(f"{key}={v.decode()}")
+        elif kind == "set" and v != str(rnd).encode():
+            wrong.append(f"{key}={v!r} (set to {rnd})")
+    if back:
+        problems.append(f"{len(back)} keys deleted came back: {back[:5]}")
+    if wrong:
+        problems.append(f"{len(wrong)} keys set aren't as set: {wrong[:5]}")
+    print(f"  checked {checked} of {len(w.last)} SET/DEL keys as last written ({w.del_failures} writes in doubt)")
+    return problems
+
+
+def fingerprint(r, keys: List[bytes]) -> Dict[bytes, tuple]:
+    """Each key's type, value and absolute expiry, read at node `r`."""
+    p = r.pipeline(transaction=False)
+    for k in keys:
+        p.type(k)
+        p.execute_command("PEXPIRETIME", k)
+    replies = p.execute()
+    types = {k: (replies[2 * i], replies[2 * i + 1]) for i, k in enumerate(keys)}
+    p = r.pipeline(transaction=False)
+    for k in keys:
+        t = types[k][0]
+        t = t.decode() if isinstance(t, bytes) else t
+        if t == "string":
+            p.get(k)
+        elif t == "hash":
+            p.hgetall(k)
+        elif t == "set":
+            p.smembers(k)
+        elif t == "list":
+            p.lrange(k, 0, -1)
+        else:
+            p.exists(k)
+    values = p.execute()
+    out = {}
+    for k, v in zip(keys, values):
+        if isinstance(v, dict):
+            v = tuple(sorted(v.items()))
+        elif isinstance(v, set):
+            v = tuple(sorted(v))
+        elif isinstance(v, list):
+            v = tuple(v)
+        out[k] = (types[k][0], types[k][1], v)
+    return out
+
+
+def compare_replicas(cluster: "Cluster", replicas: Dict[int, int]) -> List[str]:
+    """Every replica holds exactly its primary's keys, key by key: type,
+    value, expiry (read after READONLY), and nothing else."""
+    problems: List[str] = []
+    owners = cluster.owners()
+    compared = 0
+    for rport, pport in sorted(replicas.items()):
+        prim, rep_ = cluster.node(pport), cluster.node(rport)
+        rep_.execute_command("READONLY")
+        slots = [s for s, o in owners.items() if o == pport]
+        differ: List[str] = []
+        for chunk in range(0, len(slots), 256):
+            part = slots[chunk:chunk + 256]
+            keys = {}
+            for name, r in (("primary", prim), ("replica", rep_)):
+                p = r.pipeline(transaction=False)
+                for sl in part:
+                    p.execute_command("CLUSTER", "GETKEYSINSLOT", sl, 1 << 30)
+                keys[name] = sorted(k for ks in p.execute() for k in ks)
+            if keys["primary"] != keys["replica"]:
+                only_p = set(keys["primary"]) - set(keys["replica"])
+                only_r = set(keys["replica"]) - set(keys["primary"])
+                differ.append(f"{len(only_p)} keys only at the primary {sorted(only_p)[:3]}, "
+                              f"{len(only_r)} only at the replica {sorted(only_r)[:3]}")
+                continue
+            a, b = fingerprint(prim, keys["primary"]), fingerprint(rep_, keys["replica"])
+            bad = [k for k in a if a[k] != b[k]]
+            if bad:
+                differ.append(f"{len(bad)} keys differ, e.g. {bad[0]!r}: {str(a[bad[0]])[:80]} vs {str(b[bad[0]])[:80]}")
+            compared += len(a)
+        # Nothing of other slots either.
+        if rep_.dbsize() != prim.dbsize():
+            differ.append(f"DBSIZE {rep_.dbsize()} vs its primary's {prim.dbsize()}")
+        problems += [f"replica {rport} of {pport}: {d}" for d in differ[:5]]
+    print(f"  replicas compared key by key with their primaries: {compared} keys")
+    return problems
+
+
 class RedisCliWriter(Writer):
     """One `redis-cli -c` fed on stdin; it prints `-> Redirected to slot
     ...` for each redirect it follows, then the reply. A redis-cli that
@@ -475,8 +738,12 @@ class LettuceWriter(Writer):
             self.acked[i], self.doubt[i] = acked, doubt
         self.ops = sum(self.acked) + sum(self.doubt)
         if sum(self.doubt):
-            self.errors = [l.strip() for l in self.stderr if " failed: " in l][:5]
+            self.errors = [l.strip() for l in self.stderr if " failed: " in l]
 
+
+# dbnode's --leave-linger default: how long a node that left redirects
+# before it exits.
+LEAVE_LINGER = 10
 
 # Large collections in the hot slots (--collection).
 COLLECTION = 0
@@ -594,10 +861,7 @@ def check_collections(cluster: "Cluster", w: CollectionWriter, lossy: Set[int]) 
         if bad or lost or unknown:
             problems.append(f"{l}: out of order {bad[:5]}, acknowledged RPUSHes lost {lost[:5]}, pushes nobody sent {unknown[:5]}")
     acked = sum(a for a, _ in w.fields.values()) + sum(ok for d in w.sent.values() for ok in d.values())
-    parts = sum(cluster.info(p).get("migrate_parts_sent", 0) for p in cluster.node_ports())
-    aborted = sum(cluster.info(p).get("migrate_parts_aborted", 0) for p in cluster.node_ports())
-    print(f"  checked {3 * len(HOT_SLOTS)} collections of {n}: {acked} writes to them acknowledged, {w.collection_failures} failed; "
-          f"{parts} parts sent, {aborted} moves of a collection given up (by the nodes up now)")
+    print(f"  checked {3 * len(HOT_SLOTS)} collections of {n}: {acked} writes to them acknowledged, {w.collection_failures} failed")
     return problems
 
 
@@ -612,17 +876,18 @@ def make_writers(args, seed_port: int) -> List[Writer]:
     # Lettuce wants a node as its seed (see LettuceWriter): the first one,
     # unless told another.
     for mode in args.lettuce_modes:
-        writers.append(LettuceWriter(names, getattr(args, "lettuce_port", seed_port + 1), args.lettuce, mode))
+        writers.append(LettuceWriter(names, getattr(args, "lettuce_port", None) or seed_port + 1, args.lettuce, mode))
     return writers
 
 
 # The check.
-def check(cluster: Cluster, writers: List[Writer], filler: int, lossy: Set[int], mem_keys: int = 0) -> List[str]:
+def check(cluster: Cluster, writers: List[Writer], filler: int, lossy: Set[int], mem_keys: int = 0,
+          replicas: Set[int] = frozenset()) -> List[str]:
     problems: List[str] = []
     owners = cluster.owners()
     where: Dict[bytes, List[int]] = {}
     values: Dict[Tuple[bytes, int], Optional[bytes]] = {}
-    for port in cluster.node_ports():
+    for port in [p for p in cluster.node_ports() if p not in replicas]:
         r = cluster.node(port)
         p = r.pipeline(transaction=False)
         for s in range(SLOTS):
@@ -678,18 +943,22 @@ def check(cluster: Cluster, writers: List[Writer], filler: int, lossy: Set[int],
 
     names = writers[0].names
     wrong = []
-    lost = 0
+    lost = lost_incrs = 0
     for i, name in enumerate(names):
         k = name.encode()
         acked = sum(w.acked[i] for w in writers)
         doubt = sum(w.doubt[i] for w in writers)
+        safe = sum(w.safe[i] for w in writers if isinstance(w, WaitWriter))
         raw = values[(k, where[k][0])] if k in where else b"0"
         v = int(raw) if raw is not None else -1
         if key_slot(k) in lossy:
             if k not in where:
                 lost += 1
+            lost_incrs += max(0, acked - v)
             if v > acked + RETRIES * doubt:
                 wrong.append(f"{name} = {v}: more than its {acked} INCRs acknowledged + {doubt} in doubt")
+            if v < safe:
+                wrong.append(f"{name} = {v}: fewer than the {safe} INCRs WAIT said the replica had")
         elif not acked <= v <= acked + RETRIES * doubt:
             wrong.append(f"{name} = {v}, {acked} INCRs acknowledged, {doubt} in doubt")
     problems += wrong[:10]
@@ -701,7 +970,8 @@ def check(cluster: Cluster, writers: List[Writer], filler: int, lossy: Set[int],
             problems += check_collections(cluster, w, lossy)
     print(f"  checked: {len(where)} keys on {len(cluster.node_ports())} nodes, {sum(map(len, where.values())) - len(where)} twice; "
           f"{len(names)} counters, {sum(sum(w.acked) for w in writers)} INCRs acknowledged, {sum(sum(w.doubt) for w in writers)} in doubt"
-          + (f"; {len(lossy)} slots of the dead node: {lost} of its {lossy_keys} counters lost" if lossy else ""))
+          + (f"; {len(lossy)} slots of the dead node: {lost} of its {lossy_keys} counters lost, "
+             f"{lost_incrs} acknowledged INCRs" if lossy else ""))
     return problems
 
 
@@ -766,6 +1036,542 @@ def setup(args, n: int) -> Tuple[Cluster, List[int]]:
     return cluster, ports
 
 
+def stuart_lines(cluster: Cluster) -> Dict[str, str]:
+    """STUART NODES by node id."""
+    return {l.split()[0]: l for l in cluster.stuart_nodes() if not l.startswith("unassigned")}
+
+
+def replica_ports(cluster: Cluster) -> Dict[int, int]:
+    """Replica port -> its primary's port, from STUART NODES."""
+    lines = stuart_lines(cluster)
+    port = {i: int(l.split()[1].rsplit(":", 1)[1]) for i, l in lines.items()}
+    return {port[i]: port[m.group(1)] for i, l in lines.items() if (m := re.search(r" replica-of=(\S+)", l))}
+
+
+def caught_up(cluster: Cluster, replicas: Dict[int, int]) -> bool:
+    for r, p in replicas.items():
+        try:
+            if cluster.node(r).info("replication").get("slave_repl_offset") != cluster.node(p).info("replication")["master_repl_offset"]:
+                return False
+        except Exception:  # noqa: BLE001 - not up yet
+            return False
+    return True
+
+
+def pod_name(port: int) -> List[str]:
+    """`--name` for the node at `port`, as a Kubernetes pod's: the same
+    when it restarts."""
+    return ["--name", f"pod-{port}"]
+
+
+def synced(cluster: Cluster, port: int) -> bool:
+    """Whether node `port` is a replica that has its copy and follows its
+    primary's stream (writes go on: its offset trails a little)."""
+    primary = replica_ports(cluster).get(port)
+    if primary is None:
+        return False
+    mine = cluster.node(port).info("replication")
+    if mine.get("master_port") != primary or mine.get("master_link_status") != "up" or mine.get("master_sync_in_progress"):
+        return False
+    theirs = cluster.node(primary).info("replication")
+    return any(isinstance(v, dict) and v.get("port") == port and v.get("state") == "online" for v in theirs.values())
+
+
+def setup_replicas(args, stuart_args: Optional[List[str]] = None, named: bool = False) -> Tuple[Cluster, List[int]]:
+    """stuart --auto --replicas 1 and six nodes joining one after the
+    other: three primaries with the slots, evened out, each with a replica
+    that has caught up. `named`: each node with a --name (pod_name)."""
+    cluster = Cluster(args.bin, args.base_port, args.migrate_args, ["--auto", "--replicas", "1", *(stuart_args or [])])
+    ports = [args.base_port + 1 + i for i in range(6)]
+    try:
+        for port in ports:
+            cluster.start_node(port, pod_name(port) if named else None)
+
+        def even():
+            counts = [int(m.group(1)) for l in stuart_lines(cluster).values() if "replica-of" not in l and (m := re.search(r" slots=(\d+)", l))]
+            return len(counts) == 3 and sum(counts) == SLOTS and max(counts) - min(counts) <= 1 and not cluster.migrations()
+        cluster.wait_settled()
+        wait_for("three primaries to have their share of the slots", even, 120, 0.1)
+        cluster.wait_settled()
+        if args.filler:
+            cluster.fill(args.filler)
+        wait_for("the replicas to catch up", lambda: len(replica_ports(cluster)) == 3 and caught_up(cluster, replica_ports(cluster)), 60, 0.1)
+    except BaseException:
+        cluster.stop(args.keep)
+        raise
+    return cluster, ports
+
+
+def run_failover(name: str, args) -> List[str]:
+    writers = make_writers(args, args.base_port)
+    names = writers[0].names
+    writers.append(WaitWriter(names, args.base_port))
+    cluster, ports = setup_replicas(args)
+    problems: List[str] = []
+    keep = False
+    try:
+        replicas = replica_ports(cluster)
+        # Not the first node: Lettuce's seed.
+        victim = next(p for p in sorted(set(replicas.values())) if p != ports[0])
+        heir = next(r for r, p in replicas.items() if p == victim)
+        victim_id = text(cluster.node(victim).execute_command("CLUSTER", "MYID"))
+        heir_id = text(cluster.node(heir).execute_command("CLUSTER", "MYID"))
+        lossy = slots_of(cluster, victim_id)
+        probe_key = next(f"{{probe{i}}}" for i in range(100000) if key_slot(f"{{probe{i}}}".encode()) in lossy)
+        for j, w in enumerate(writers):
+            w.start(j * args.keys // len(writers))
+        time.sleep(2)
+        probe = None
+        t0 = time.monotonic()
+        if name == "failover":
+            cluster.kill_node(victim)
+            print(f"  primary {victim} SIGKILLed; its replica {heir}")
+        else:
+            probe = socket.create_connection((HOST, victim), timeout=30)
+            cluster.signal_node(victim, signal.SIGSTOP)
+            print(f"  primary {victim} SIGSTOPped; its replica {heir}")
+            time.sleep(0.5)
+            # Sent while it's stopped: read once it runs again.
+            probe.sendall(b"".join(b"*2\r\n$4\r\nINCR\r\n$%d\r\n%s\r\n" % (len(probe_key), probe_key.encode()) for _ in range(100)))
+        heir_node = cluster.node(heir)
+        wait_for("the replica to be promoted", lambda: f" slots={len(lossy)} " in stuart_lines(cluster)[heir_id], 60, 0.02)
+        promoted = time.monotonic() - t0
+
+        def serves() -> bool:
+            try:
+                return heir_node.set(probe_key + ":served", "1") is True
+            except Exception:  # noqa: BLE001 - not yet
+                return False
+        wait_for("the new primary to take a write", serves, 30, 0.01)
+        served = time.monotonic() - t0
+        print(f"  promoted after {promoted:.1f} s, its first write taken after {served:.1f} s")
+        if name == "failover":
+            time.sleep(1)
+            cluster.start_node(victim)
+            print("  the dead node started again at its address (a new id)")
+        else:
+            time.sleep(1)
+            cluster.signal_node(victim, signal.SIGCONT)
+            replies = []
+            buf = b""
+            while len(replies) < 100:
+                chunk = probe.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                *done, buf = buf.split(b"\r\n")
+                replies += done
+            taken = [r for r in replies if r.startswith(b":")]
+            print(f"  after SIGCONT, of the 100 INCRs sent while it was stopped: {len(taken)} taken, "
+                  f"{sum(r.startswith(b'-NOREPLICAS') for r in replies)} -NOREPLICAS, {sum(r.startswith(b'-MOVED') for r in replies)} -MOVED")
+            if taken or len(replies) < 100:
+                problems.append(f"the stopped primary, back, took {len(taken)} of the INCRs sent while it was stopped ({len(replies)} replies)")
+            probe.close()
+        wait_for("the old node to be the new primary's replica", lambda: replica_ports(cluster).get(victim) == heir, 60, 0.1)
+        cluster.wait_settled()
+        time.sleep(1)
+        for w in writers:
+            w.stop()
+        replicas = replica_ports(cluster)
+        wait_for("the replicas to catch up", lambda: caught_up(cluster, replicas), 60, 0.1)
+        for r, p in replicas.items():
+            if cluster.node(r).dbsize() != cluster.node(p).dbsize():
+                problems.append(f"replica {r} has {cluster.node(r).dbsize()} keys, its primary {p} {cluster.node(p).dbsize()}")
+        problems += report_writers(writers, may_fail=True)
+        problems += check(cluster, writers, args.filler, lossy, replicas=set(replicas))
+        if cluster.node(heir).get(probe_key) is not None:
+            problems.append(f"{probe_key}, only ever sent to the stopped primary, is at the new one")
+    except Fail as e:
+        problems.append(str(e))
+    finally:
+        keep = bool(problems) and args.keep
+        for w in writers:
+            if isinstance(w, LettuceWriter) and w.proc.poll() is None:
+                w.proc.kill()
+            w.stopping.set()
+        for p in cluster.nodes.values():
+            if p.poll() is None:
+                p.send_signal(signal.SIGCONT)
+        cluster.stop(keep)
+    return problems
+
+
+def run_move_failover(name: str, args) -> List[str]:
+    """move-source-failover, move-target-failover, move-cutover-failover,
+    move-cutover-stop: see the docs."""
+    writers = make_writers(args, args.base_port)
+    names = writers[0].names
+    writers.append(WaitWriter(names, args.base_port))
+    dels = DelWriter(names, args.base_port)
+    writers.append(dels)
+    # Fewer slots at a time than stuart's default (4096 slots of 50k keys
+    # move in 0.2 s at 128 per source, before the new primary's replica
+    # has synced): the moves must still be under way to be interrupted.
+    cluster, ports = setup_replicas(args, ["--moves-per-source", "16", "--max-moves", "64"])
+    problems: List[str] = []
+    try:
+        for j, w in enumerate(writers):
+            w.start(j * args.keys // len(writers))
+        time.sleep(2)
+        t0 = time.monotonic()
+        # A fourth primary and its replica: slots move to it from the three.
+        target, target_replica = args.base_port + 7, args.base_port + 8
+        target_id = cluster.start_node(target)
+        cluster.start_node(target_replica)
+        wait_for("the new primary's replica", lambda: replica_ports(cluster).get(target_replica) == target, 30, 0.01)
+        ids = {p: text(cluster.node(p).execute_command("CLUSTER", "MYID")) for p in cluster.node_ports()}
+        port_by_id = {i: p for p, i in ids.items()}
+        stop = name == "move-cutover-stop"
+        if name in ("move-cutover-failover", "move-cutover-stop"):
+            # The source of a link landing (the target took the table that
+            # gives it the slots, the source's last writes on the way): it
+            # dies then.
+            watch = redis.Redis(host=HOST, port=target)
+
+            def landing():
+                for line in text(watch.execute_command("CLUSTER", "SLOTSYNCS")).splitlines():
+                    f = line.split()
+                    if f[1] == "landing":
+                        return f[0]
+                return None
+            victim_id = wait_for("a cutover", landing, 60, 0)
+        else:
+            def mid_move():
+                m = [x for x in moving(cluster) if x[2] == target_id]
+                return m if slot_count(cluster, target_id) >= 256 and m else None
+            seen = wait_for("slots moving to the new primary", mid_move, 60, 0.005)
+            victim_id = seen[0][1] if name == "move-source-failover" else target_id
+        victim = port_by_id[victim_id]
+        replicas = replica_ports(cluster)
+        heir = next(r for r, p in replicas.items() if p == victim)
+        lossy = slots_of(cluster, victim_id) | {s for s, f, t in moving(cluster) if victim_id in (f, t)}
+        if stop:
+            cluster.signal_node(victim, signal.SIGSTOP)
+        else:
+            cluster.kill_node(victim)
+        lossy |= slots_of(cluster, victim_id)
+        kind = {"move-source-failover": "a source", "move-target-failover": "the target",
+                "move-cutover-failover": "the source of a link landing",
+                "move-cutover-stop": "the source of a link landing"}[name]
+        print(f"  {kind}, primary {victim}, {'SIGSTOPped' if stop else 'SIGKILLed'} after {time.monotonic() - t0:.1f} s, "
+              f"{slot_count(cluster, target_id)} slots at the new primary; its replica {heir}")
+        heir_id = ids[heir]
+        wait_for("the replica to be promoted", lambda: "replica-of" not in stuart_lines(cluster)[heir_id], 60, 0.02)
+        print(f"  promoted after {time.monotonic() - t0:.1f} s")
+        time.sleep(1)
+        if stop:
+            # Back with its keys (the same id): failed, it trims nothing,
+            # and becomes the new primary's replica.
+            cluster.signal_node(victim, signal.SIGCONT)
+        else:
+            cluster.start_node(victim)
+        wait_for("the old node to be the new primary's replica", lambda: replica_ports(cluster).get(victim) == heir, 60, 0.1)
+
+        def even():
+            counts = [int(m.group(1)) for l in stuart_lines(cluster).values()
+                      if "replica-of" not in l and (m := re.search(r" slots=(\d+)", l))]
+            return len(counts) == 4 and sum(counts) == SLOTS and max(counts) - min(counts) <= 1 and not cluster.migrations()
+        cluster.wait_settled(120)
+        wait_for("four primaries with their share of the slots", even, 120, 0.1)
+        cluster.wait_settled(120)
+        print(f"  moves done in {time.monotonic() - t0:.1f} s")
+        time.sleep(1)
+        for w in writers:
+            w.stop()
+        replicas = replica_ports(cluster)
+        wait_for("the replicas to catch up", lambda: caught_up(cluster, replicas), 60, 0.1)
+        # Slots given up are trimmed in the background: let them go.
+        time.sleep(1)
+        problems += report_writers([w for w in writers if w is not dels], may_fail=True)
+        problems += check(cluster, writers, args.filler, lossy, replicas=set(replicas))
+        problems += check_deletes(cluster, dels, lossy)
+        problems += compare_replicas(cluster, replicas)
+    except Fail as e:
+        problems.append(str(e))
+    finally:
+        keep = bool(problems) and args.keep
+        for w in writers:
+            if isinstance(w, LettuceWriter) and w.proc.poll() is None:
+                w.proc.kill()
+            w.stopping.set()
+        for proc in cluster.nodes.values():
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGCONT)
+        cluster.stop(keep)
+    return problems
+
+
+def primaries(cluster: Cluster) -> Dict[int, str]:
+    """Port -> id of the primaries owning slots, from STUART NODES."""
+    lines = stuart_lines(cluster)
+    return {int(l.split()[1].rsplit(":", 1)[1]): i for i, l in lines.items()
+            if "replica-of" not in l and (m := re.search(r" slots=(\d+)", l)) and int(m.group(1))}
+
+
+class Syncs:
+    """The full syncs the primaries served (INFO stats sync_full), also
+    of the nodes gone: read before each one is stopped."""
+
+    def __init__(self, cluster: Cluster):
+        self.cluster = cluster
+        self.seen: Dict[int, int] = {}  # pid -> its sync_full
+        self.at_start = self.read()
+
+    def read(self) -> int:
+        for port, proc in self.cluster.nodes.items():
+            try:
+                self.seen[proc.pid] = int(self.cluster.node(port).info("stats")["sync_full"])
+            except Exception:  # noqa: BLE001 - gone: its last reading stands
+                pass
+        return sum(self.seen.values())
+
+
+def handover_writers(args) -> Tuple[List[Writer], DelWriter]:
+    writers = make_writers(args, args.base_port)
+    names = writers[0].names
+    writers.append(WaitWriter(names, args.base_port))
+    dels = DelWriter(names, args.base_port)
+    writers.append(dels)
+    return writers, dels
+
+
+def run_handover(name: str, args) -> List[str]:
+    """sigterm-primary, sigterm-replica, sigterm-no-replica, rolling: see
+    the docs."""
+    writers, dels = handover_writers(args)
+    stuart_metrics = metrics_port(args.base_port)
+    rolling = name == "rolling"
+    cluster, ports = setup_replicas(args, ["--metrics", f"{HOST}:{stuart_metrics}"], named=rolling)
+    problems: List[str] = []
+
+    def stuart_counts() -> Tuple[float, float]:
+        m = scrape(stuart_metrics)
+        return one(m, "stuart_slots_moved_total"), one(m, "stuart_handovers_total")
+
+    def stop(port: int, t0: float, what: str) -> float:
+        """SIGTERM to `port`; waits for its exit (status 0); how long it
+        took."""
+        syncs.read()
+        cluster.term_node(port)
+        status = cluster.wait_exit(port)
+        took = time.monotonic() - t0
+        print(f"  {what} {port}: SIGTERM, exited with status {status} after {took:.1f} s")
+        if status != 0:
+            problems.append(f"node {port} exited with status {status}")
+        return took
+
+    # Five or six nodes: three primaries; four (one drained): two.
+    n_primaries = 2 if name == "sigterm-no-replica" else 3
+
+    def primaries_settled():
+        counts = [int(m.group(1)) for l in stuart_lines(cluster).values()
+                  if "replica-of" not in l and (m := re.search(r" slots=(\d+)", l))]
+        return sum(counts) == SLOTS and len([c for c in counts if c]) == n_primaries and not cluster.migrations()
+
+    try:
+        syncs = Syncs(cluster)
+        moved0, handed0 = stuart_counts()
+        for j, w in enumerate(writers):
+            w.start(j * args.keys // len(writers))
+        time.sleep(2)
+        replicas = replica_ports(cluster)
+        # Not the first node (Lettuce's seed), except in a rolling restart.
+        primary = next(p for p in sorted(set(replicas.values())) if p != ports[0])
+        replica = next(r for r, p in replicas.items() if p == primary)
+        expect_moved, expect_handed = 0, 0
+        t0 = time.monotonic()
+        if name == "sigterm-primary":
+            held = slots_of(cluster, primaries(cluster)[primary])
+            stop(primary, t0, "primary")
+            expect_handed = 1
+            heir = stuart_lines(cluster)[text(cluster.node(replica).execute_command("CLUSTER", "MYID"))]
+            if "replica-of" in heir or f" slots={len(held)} " not in heir:
+                problems.append(f"its replica {replica} doesn't own its {len(held)} slots: {heir}")
+        elif name == "sigterm-replica":
+            took = stop(replica, t0, "replica")
+            if took > LEAVE_LINGER + 5:
+                problems.append(f"the replica took {took:.1f} s to leave")
+        elif name == "sigterm-no-replica":
+            # Its replica leaves first: then it has none, and is drained.
+            stop(replica, t0, "replica")
+            expect_moved = len(slots_of(cluster, primaries(cluster)[primary]))
+            stop(primary, time.monotonic(), "primary, without a replica,")
+        else:
+            # Each node in turn, as Kubernetes rolls a StatefulSet: SIGTERM,
+            # restarted under its name once it exited, ready (a replica
+            # caught up) before the next.
+            for port in ports:
+                role = "primary" if port in primaries(cluster) else "replica"
+                expect_handed += role == "primary"
+                t1 = time.monotonic()
+                stop(port, t1, role)
+                cluster.start_node(port, pod_name(port))
+                wait_for(f"node {port} to be a replica again, synced", lambda: synced(cluster, port), 60, 0.05)
+                print(f"    back as the replica of {replica_ports(cluster)[port]} after {time.monotonic() - t1:.1f} s")
+        cluster.wait_settled()
+        wait_for(f"{n_primaries} primaries with all the slots", primaries_settled, 120, 0.1)
+        cluster.wait_settled()
+        print(f"  done after {time.monotonic() - t0:.1f} s")
+        time.sleep(1)
+        for w in writers:
+            w.stop()
+        moved1, handed1 = stuart_counts()
+        full = syncs.read() - syncs.at_start
+        print(f"  {moved1 - moved0:.0f} slots moved, {handed1 - handed0:.0f} handovers, {full} full syncs served")
+        if moved1 - moved0 != expect_moved:
+            problems.append(f"{moved1 - moved0:.0f} slots moved, expected {expect_moved}")
+        if handed1 - handed0 != expect_handed:
+            problems.append(f"{handed1 - handed0:.0f} handovers, expected {expect_handed}")
+        if rolling and full != len(ports):
+            problems.append(f"{full} full syncs in a rolling restart of {len(ports)} nodes, expected one each")
+        replicas = replica_ports(cluster)
+        wait_for("the replicas to catch up", lambda: caught_up(cluster, replicas), 60, 0.1)
+        time.sleep(1)
+        # A node going away: a client that never refreshes its slot map
+        # (Lettuce "off") still sends it what it has in flight then; those
+        # fail, on the connection only (see run_auto). The WAIT writers,
+        # sending to the node they think owns the key, get -MOVED from a
+        # primary that handed its slots over, or lose its connection (in
+        # doubt, refreshed).
+        gone = [w for w in writers if (isinstance(w, LettuceWriter) and w.mode == "off") or isinstance(w, (WaitWriter, DelWriter))]
+        problems += report_writers([w for w in writers if w not in gone and w is not dels], may_fail=False)
+        problems += report_writers([w for w in gone if w is not dels], may_fail=True)
+        for w in gone:
+            other = [e for e in w.errors if not re.search(r"Connection reset|Connection refused|timed out|Connection closed|"
+                                                          r"MOVED|MovedError|Connection|Broken pipe", e)]
+            if other:
+                problems.append(f"{w.name}: {len(other)} writes failed otherwise than on a node gone: {other[:3]}")
+        problems += check(cluster, writers, args.filler, set(), replicas=set(replicas))
+        problems += check_deletes(cluster, dels, set())
+        problems += compare_replicas(cluster, replicas)
+    except Fail as e:
+        problems.append(str(e))
+    finally:
+        keep = bool(problems) and args.keep
+        for w in writers:
+            if isinstance(w, LettuceWriter) and w.proc.poll() is None:
+                w.proc.kill()
+            w.stopping.set()
+        cluster.stop(keep)
+    return problems
+
+
+def run_scale(name: str, args) -> List[str]:
+    """scale-down, scale-down-up: see the docs."""
+    writers, dels = handover_writers(args)
+    stuart_metrics = metrics_port(args.base_port)
+    slow = ["--moves-per-source", "16", "--max-moves", "64"] if name == "scale-down-up" else []
+    cluster, ports = setup_replicas(args, ["--metrics", f"{HOST}:{stuart_metrics}", *slow], named=True)
+    problems: List[str] = []
+
+    def demotions() -> float:
+        return one(scrape(stuart_metrics), "stuart_demotions_total")
+
+    def stop(port: int):
+        """SIGTERM to `port`, as a scale-down: waits for its exit (status 0)."""
+        role = "replica" if port in replica_ports(cluster) else "primary"
+        t1 = time.monotonic()
+        cluster.term_node(port)
+        status = cluster.wait_exit(port)
+        print(f"  {role} {port}: SIGTERM, exited with status {status} after {time.monotonic() - t1:.1f} s")
+        if status != 0:
+            problems.append(f"node {port} exited with status {status}")
+
+    def shape(n_primaries: int):
+        """n primaries holding every slot, each with a replica (as many as
+        there are nodes for), nothing moving, nobody demoting, the
+        replicas synced."""
+        lines = stuart_lines(cluster)
+        counts = [int(re.search(r" slots=(\d+)", l).group(1)) for l in lines.values() if "replica-of" not in l]
+        replicas = replica_ports(cluster)
+        return (len(counts) == n_primaries and sum(counts) == SLOTS and all(counts)
+                and len(set(replicas.values())) == len(replicas) == len(lines) - n_primaries
+                and not any(" demoting" in l for l in lines.values()) and not cluster.migrations()
+                and all(synced(cluster, r) for r in replicas))
+
+    def settle(n_primaries: int, t0: float):
+        wait_for(f"{n_primaries} primaries, each with a replica", lambda: shape(n_primaries), 120, 0.1)
+        cluster.wait_settled()
+        replicas = replica_ports(cluster)
+        print(f"  {n_primaries} primaries with a replica each after {time.monotonic() - t0:.1f} s: {replicas} (replica: primary)")
+
+    try:
+        moved0 = one(scrape(stuart_metrics), "stuart_slots_moved_total")
+        for j, w in enumerate(writers):
+            w.start(j * args.keys // len(writers))
+        time.sleep(2)
+        t0 = time.monotonic()
+        # Nodes joining one by one pair up in join order (7881 and its
+        # replica 7882...), so the highest two would be a pair: after a
+        # rolling restart roles no longer follow the pods' order. Two
+        # replicas of different primaries go, the highest first, the next
+        # once the first exited, as a StatefulSet scales down.
+        replicas = replica_ports(cluster)
+        victims = sorted((r for r, p in replicas.items() if r != ports[0] and p != ports[0]), reverse=True)[:2]
+        stop(victims[0])
+        if name == "scale-down":
+            stop(victims[1])
+            settle(2, t0)
+            if demotions() != 1:
+                problems.append(f"{demotions():.0f} demotions to go from 6 nodes to 4, expected 1")
+            # Then 4 to 2, the highest two: whatever their roles, one
+            # primary and its replica remain.
+            t0 = time.monotonic()
+            for port in sorted(cluster.node_ports(), reverse=True)[:2]:
+                stop(port)
+            settle(1, t0)
+        else:
+            # Scaled up again while a primary is demoted: the demotion is
+            # called off, the new nodes join as replicas. The second
+            # replica left at once, but lingers on its port (--leave-linger)
+            # longer than the demotion takes: the new nodes on new ports.
+            cluster.term_node(victims[1])
+            demoting = wait_for("a primary to be demoted",
+                                lambda: next((i for i, l in stuart_lines(cluster).items() if " demoting" in l), None), 30, 0.005)
+            held = slot_count(cluster, demoting)
+            # Mid-move: some of its slots gone, more to go.
+            wait_for("some of its slots to move", lambda: slot_count(cluster, demoting) < held and moving(cluster), 30, 0.005)
+            print(f"  a primary demoted after {time.monotonic() - t0:.1f} s, {held - slot_count(cluster, demoting)} of its "
+                  f"{held} slots moved; scaling up again")
+            for port in (args.base_port + 7, args.base_port + 8):
+                cluster.start_node(port, pod_name(port))
+            if cluster.wait_exit(victims[1]) != 0:
+                problems.append(f"node {victims[1]} didn't exit with status 0")
+            settle(3, t0)
+            if demotions() != 0:
+                problems.append(f"{demotions():.0f} demotions, expected the one started to be called off")
+        time.sleep(1)
+        for w in writers:
+            w.stop()
+        moved = one(scrape(stuart_metrics), "stuart_slots_moved_total") - moved0
+        print(f"  {moved:.0f} slots moved, {demotions():.0f} demotions")
+        replicas = replica_ports(cluster)
+        wait_for("the replicas to catch up", lambda: caught_up(cluster, replicas), 60, 0.1)
+        time.sleep(1)
+        # Nodes going away, as in run_handover.
+        gone = [w for w in writers if (isinstance(w, LettuceWriter) and w.mode == "off") or isinstance(w, (WaitWriter, DelWriter))]
+        problems += report_writers([w for w in writers if w not in gone and w is not dels], may_fail=False)
+        problems += report_writers([w for w in gone if w is not dels], may_fail=True)
+        for w in gone:
+            other = [e for e in w.errors if not re.search(r"Connection reset|Connection refused|timed out|Connection closed|"
+                                                          r"MOVED|MovedError|Connection|Broken pipe", e)]
+            if other:
+                problems.append(f"{w.name}: {len(other)} writes failed otherwise than on a node gone: {other[:3]}")
+        problems += check(cluster, writers, args.filler, set(), replicas=set(replicas))
+        problems += check_deletes(cluster, dels, set())
+        problems += compare_replicas(cluster, replicas)
+    except Fail as e:
+        problems.append(str(e))
+    finally:
+        keep = bool(problems) and args.keep
+        for w in writers:
+            if isinstance(w, LettuceWriter) and w.proc.poll() is None:
+                w.proc.kill()
+            w.stopping.set()
+        cluster.stop(keep)
+    return problems
+
+
 def moving(cluster: Cluster) -> List[Tuple[int, str, str]]:
     """Slots moving now: (slot, from id, to id)."""
     out = []
@@ -826,8 +1632,11 @@ def run_scenario(name: str, args) -> List[str]:
             # Mid-move: a quarter of the slots moved, more to go.
             quarter = lambda: slot_count(cluster, new_id) >= 1024 and moving(cluster)  # noqa: E731
         print(f"  {moves} slots to move")
+        seen: List[Tuple[int, str, str]] = []
         if name != "rebalance" and name != "drain":
-            wait_for("a quarter of the slots to move", quarter, 30, 0.005)
+            # The moves seen then: by snapshot, none may be listed a moment
+            # later (one table ended them, the next starts more).
+            seen = wait_for("a quarter of the slots to move", quarter, 30, 0.005)
         if name == "stuart-kill":
             moving_then = len(moving(cluster))
             cluster.kill_stuart()
@@ -835,7 +1644,7 @@ def run_scenario(name: str, args) -> List[str]:
             time.sleep(1)
             cluster.start_stuart()
         elif name in ("source-kill", "target-kill", "drain-target-kill"):
-            slot, src, dst = moving(cluster)[0]
+            slot, src, dst = seen[0]
             victim_id = src if name == "source-kill" else dst
             victim = port_of(cluster, victim_id)
             lossy = slots_of(cluster, victim_id)
@@ -948,13 +1757,29 @@ def run_auto(name: str, args) -> List[str]:
                     problems.append(f"node {ports[0]} answers {e} after leaving")
             if any(l.startswith(first) for l in cluster.stuart_nodes()):
                 problems.append(f"node {ports[0]} is still in STUART NODES")
+            # As it would after a SIGTERM: it redirects for --leave-linger
+            # before it goes, so that clients refreshing their slot map now
+            # and then (Lettuce's default) have stopped using it.
+            time.sleep(LEAVE_LINGER)
             cluster.kill_node(ports[0])
             del cluster.nodes[ports[0]]
         time.sleep(1)
         for w in writers:
             w.stop()
         full = name == "full-target"
-        problems += report_writers(writers, may_fail=full)
+        # A node goes away: a client that never refreshes its slot map
+        # (Lettuce "off", Lettuce 6's default) still sends it what it has
+        # in flight then, and its next command for those slots, whatever the
+        # linger. Those fail (in doubt), with a connection error only.
+        gone = [w for w in writers if name.startswith("sigterm") or name == "leave-while-join"
+                if isinstance(w, LettuceWriter) and w.mode == "off"]
+        problems += report_writers([w for w in writers if w not in gone], may_fail=full)
+        if gone:
+            problems += report_writers(gone, may_fail=True)
+            for w in gone:
+                other = [e for e in w.errors if not re.search(r"Connection reset|Connection refused|timed out|Connection closed", e)]
+                if other:
+                    problems.append(f"{w.name}: {len(other)} INCRs failed otherwise than on a node gone: {other[:3]}")
         if full:
             # Refused writes, and only those: -OOM from the full node.
             for w in writers:
@@ -1024,14 +1849,14 @@ def full_target(cluster: Cluster, args, t0: float) -> List[str]:
     return problems
 
 
-def redirect_counts(cluster: Cluster) -> int:
+def redirect_counts(cluster: Cluster, kinds=("moved", "ask", "tryagain")) -> int:
     total = 0
     for port in cluster.node_ports():
         try:
             info = cluster.info(port)
         except Exception:  # noqa: BLE001
             continue
-        total += sum(info.get(f"cluster_redirects_{k}", 0) for k in ("moved", "ask", "tryagain"))
+        total += sum(info.get(f"cluster_redirects_{k}", 0) for k in kinds)
     return total
 
 
@@ -1075,6 +1900,10 @@ def run_redirects(args) -> List[str]:
                 mine.append(f"{client}: {c1 - c0} redirects before any move")
             if client in ("redis-py", "lettuce-default", "lettuce-fast") and any(after[-2:]):
                 mine.append(f"{client}: still redirected {after} after the rebalance")
+            # By snapshot a slot changes owner in one table: -MOVED only.
+            asked = redirect_counts(cluster, ("ask", "tryagain"))
+            if asked:
+                mine.append(f"{client}: {asked} -ASK/-TRYAGAIN with moves by snapshot")
         except Fail as e:
             mine.append(f"{client}: {e}")
         finally:
@@ -1242,7 +2071,10 @@ def run_metrics(args) -> List[str]:
 
 
 SCENARIOS = ["rebalance", "drain", "stuart-kill", "source-kill", "target-kill", "drain-target-kill", "auto-grow",
-             "leave-while-join", "sigterm", "sigterm-two", "sigterm-target", "full-target", "metrics", "redirects"]
+             "leave-while-join", "sigterm", "sigterm-two", "sigterm-target", "full-target", "metrics", "redirects",
+             "failover", "failover-stop", "move-source-failover", "move-target-failover", "move-cutover-failover",
+             "move-cutover-stop", "sigterm-primary", "sigterm-replica", "sigterm-no-replica", "rolling", "scale-down",
+             "scale-down-up"]
 
 
 def main(argv: List[str]) -> int:
@@ -1258,6 +2090,7 @@ def main(argv: List[str]) -> int:
     ap.add_argument("--windows", type=int, default=8, help="redirects: 2 s windows after the rebalance")
     ap.add_argument("--migrate-arg", action="append", default=[], dest="migrate_args",
                     help="passed to each dbnode (e.g. --migrate-arg=--migrate-batch --migrate-arg=10)")
+    ap.add_argument("--lettuce-port", type=int, dest="lettuce_port", help="the node Lettuce takes as its seed (default: the first)")
     ap.add_argument("--keep", action="store_true", help="keep the logs of a failed scenario")
     args = ap.parse_args(argv)
     args.lettuce_modes = args.lettuce_modes.split(",") if args.lettuce else []
@@ -1273,6 +2106,14 @@ def main(argv: List[str]) -> int:
                 problems = run_redirects(args)
             elif name == "metrics":
                 problems = run_metrics(args)
+            elif name in ("failover", "failover-stop"):
+                problems = run_failover(name, args)
+            elif name.startswith("move-"):
+                problems = run_move_failover(name, args)
+            elif name in ("sigterm-primary", "sigterm-replica", "sigterm-no-replica", "rolling"):
+                problems = run_handover(name, args)
+            elif name in ("scale-down", "scale-down-up"):
+                problems = run_scale(name, args)
             elif name in ("auto-grow", "leave-while-join", "sigterm", "sigterm-two", "sigterm-target", "full-target"):
                 problems = run_auto(name, args)
             else:

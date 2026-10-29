@@ -7,11 +7,15 @@ spec:
     apiVersion: apps/v1
     kind: StatefulSet
     name: speedvault
-  # The base's three; scaling by hand below it would be undone.
-  minReplicas: 3
+  # The base's six; scaling by hand below it would be undone.
+  minReplicas: 6
   maxReplicas: 12
-  # 70% leaves room for the moves: a new node relieves the others only
-  # once its slots have arrived.
+  # Averages over every pod, replicas included. Memory: a replica holds
+  # its primary's keys, so the average is the primaries'; 70% leaves room
+  # for the moves (a new node relieves the others only once its slots have
+  # arrived). Busy cores: a replica only applies its primary's writes,
+  # far less work, so with half the pods replicas the average is about
+  # half the primaries': 400m is the primaries at 70-80%.
   metrics:
     - type: Pods
       pods:
@@ -19,7 +23,7 @@ spec:
           name: speedvault_busy_cores
         target:
           type: AverageValue
-          averageValue: 700m
+          averageValue: 400m
     - type: Pods
       pods:
         metric:
@@ -28,7 +32,9 @@ spec:
           type: AverageValue
           averageValue: 700m
   behavior:
-    # After a minute of load, at most two pods per five minutes.
+    # After a minute of load, at most two pods per five minutes: a pair.
+    # (The HPA may ask for one: that node is a primary without a replica
+    # until the next joins as its replica.)
     scaleUp:
       stabilizationWindowSeconds: 60
       selectPolicy: Max

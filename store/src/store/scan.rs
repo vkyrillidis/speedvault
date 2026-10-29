@@ -2,9 +2,9 @@
 //!
 //! A cursor must guarantee what Redis's does: an element present for the
 //! whole scan is returned at least once (maybe more); one added or removed
-//! meanwhile may or may not be. The keys sit in dense lists (one per slot,
-//! or one for a standalone store), a hash's or set's members in its
-//! table's `Vec`; removal is a `swap_remove`, which moves the last element
+//! meanwhile may or may not be. The keys sit in the dense `Vec`s of their
+//! tables, a hash's or set's members in its table's `Vec`; removal is a
+//! `swap_remove`, which moves the last element
 //! into the hole. Walked from the end, that keeps the guarantee: the
 //! element moved is either already returned (then it may come again) or
 //! not reached yet (then it still will be), and new elements land at the
@@ -13,7 +13,8 @@
 //! Collections Redis keeps compact (a listpack hash, an intset) it returns
 //! whole in one reply with cursor 0, in their order; so do these.
 
-use super::{Store, Value};
+use super::Store;
+use crate::kv::Val;
 use crate::glob::glob_match;
 use crate::Error;
 
@@ -60,13 +61,18 @@ impl Store {
     /// cursor (0 when done) and the keys, about `count` of them examined.
     /// Expired keys are reclaimed rather than returned.
     pub fn scan(&mut self, cursor: u64, count: usize, pattern: Option<&[u8]>, kind: Option<&[u8]>) -> (u64, Vec<Vec<u8>>) {
-        self.index_keys();
         let (mut list, mut left) = decode(cursor);
         let mut picked = Vec::new();
-        let lists = &self.slots.keys;
+        let lists = &self.keys.tables;
         while list < lists.len() && picked.len() < count {
-            let keys = &lists[list];
-            let (now_left, mut more) = walk(keys.len(), left, count - picked.len(), |i| std::rc::Rc::clone(&keys[i]));
+            // A held slot's keys aren't listed.
+            if self.table_held(list as u32) {
+                list += 1;
+                left = FRESH;
+                continue;
+            }
+            let keys = lists[list].entries();
+            let (now_left, mut more) = walk(keys.len(), left, count - picked.len(), |i| keys[i].key().to_vec());
             picked.append(&mut more);
             if now_left == 0 {
                 list += 1;
@@ -82,19 +88,21 @@ impl Store {
                 continue;
             }
             let Some(e) = self.live(&key) else { continue };
-            if kind.is_some_and(|k| !k.eq_ignore_ascii_case(e.value.type_name().as_bytes())) {
+            if kind.is_some_and(|k| !k.eq_ignore_ascii_case(e.type_name().as_bytes())) {
                 continue;
             }
-            keys.push(key.to_vec());
+            keys.push(key);
         }
         (next, keys)
     }
 
     /// `KEYS pattern`: every live key matching, in no particular order.
-    /// Expired keys are skipped, not reclaimed, as in Redis.
+    /// Expired keys are skipped, not reclaimed, as in Redis; so are the held
+    /// slots' keys.
     pub fn keys_matching(&self, pattern: &[u8]) -> Vec<&[u8]> {
         let now = self.now;
-        self.map.iter().filter(|(k, e)| now <= e.expire_at && matching(Some(pattern), k)).map(|(k, _)| &**k).collect()
+        let served = self.keys.tables.iter().enumerate().filter(|&(t, _)| !self.table_held(t as u32));
+        served.flat_map(|(_, t)| t.entries()).filter(|e| now <= e.expire_at() && matching(Some(pattern), e.key())).map(|e| e.key()).collect()
     }
 
     /// `HSCAN key cursor [MATCH pattern] [COUNT count]`: the next cursor
@@ -102,7 +110,7 @@ impl Store {
     #[allow(clippy::type_complexity)]
     pub fn hscan(&mut self, key: &[u8], cursor: u64, count: usize, pattern: Option<&[u8]>) -> Result<(u64, Vec<(Vec<u8>, Vec<u8>)>), Error> {
         let Some(e) = self.live(key) else { return Ok((0, Vec::new())) };
-        let Value::Hash(h) = &e.value else { return Err(Error::WrongType) };
+        let Val::Hash(h) = e.value() else { return Err(Error::WrongType) };
         let pair = |(f, v): (&[u8], &[u8])| (f.to_vec(), v.to_vec());
         let keep = |(f, _): &(Vec<u8>, Vec<u8>)| matching(pattern, f);
         if !h.is_big() {
@@ -115,7 +123,7 @@ impl Store {
     /// `SSCAN key cursor [MATCH pattern] [COUNT count]`.
     pub fn sscan(&mut self, key: &[u8], cursor: u64, count: usize, pattern: Option<&[u8]>) -> Result<(u64, Vec<Vec<u8>>), Error> {
         let Some(e) = self.live(key) else { return Ok((0, Vec::new())) };
-        let Value::Set(s) = &e.value else { return Err(Error::WrongType) };
+        let Val::Set(s) = e.value() else { return Err(Error::WrongType) };
         if !s.is_big() {
             return Ok((0, s.members().into_iter().filter(|m| matching(pattern, m)).map(<[u8]>::to_vec).collect()));
         }
@@ -198,25 +206,24 @@ mod tests {
     }
 
     #[test]
-    fn a_standalone_store_lists_its_keys_from_the_first_scan() {
+    fn a_standalone_store_spreads_its_keys_over_the_tables() {
         let mut s = store();
-        for n in 0..100 {
+        for n in 0..1000 {
             s.set(&key(n), b"v", Default::default()).unwrap();
         }
-        assert!(!s.slots.active, "no list before a SCAN");
         check(&s);
-        assert_eq!(s.scan(0, 1000, None, None).1.len(), 100);
-        assert!(s.slots.active);
-        check(&s);
-        for n in 0..50 {
+        let used = s.keys.tables.iter().filter(|t| t.len() > 0).count();
+        assert!(used > 900, "{used} tables for 1000 keys");
+        assert_eq!(s.scan(0, 2000, None, None).1.len(), 1000);
+        for n in 0..500 {
             s.del(&key(n));
             s.set(&key(1000 + n), b"v", Default::default()).unwrap();
         }
         check(&s);
-        assert_eq!(s.scan(0, 1000, None, None).1.len(), 100);
+        assert_eq!(s.scan(0, 2000, None, None).1.len(), 1000);
         s.flush();
-        assert!(!s.slots.active, "a flush drops it");
         check(&s);
+        assert_eq!(s.scan(0, 10, None, None), (0, Vec::new()), "empty tables, all walked");
     }
 
     #[test]

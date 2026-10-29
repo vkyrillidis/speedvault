@@ -103,13 +103,19 @@ fn execute(args: &Args, stuart: &Rc<Stuart>, client: u64, out: &mut Encoder) -> 
         ("client", Some("setname" | "setinfo"), _) => out.ok(),
         ("client", Some("id"), 2) => out.integer(client as i64),
         ("info", _, _) => info(stuart, out),
-        ("cluster", Some("slots"), 2) => reply::slots(&stuart.state.borrow().view(), out),
-        ("cluster", Some("shards"), 2) => reply::shards(&stuart.state.borrow().view(), out),
+        ("cluster", Some("slots"), 2) => {
+            let view = stuart.state.borrow().view();
+            reply::slots(&view, &stuart.offsets(&view), out)
+        }
+        ("cluster", Some("shards"), 2) => {
+            let view = stuart.state.borrow().view();
+            reply::shards(&view, &stuart.offsets(&view), out)
+        }
         ("cluster", Some("nodes"), 2) => reply::nodes(&stuart.state.borrow().view(), None, out),
         ("cluster", Some("info"), 2) => out.verbatim(b"txt", reply::info_text(&stuart.state.borrow().view()).as_bytes()),
         ("cluster", Some("keyslot"), 3) => out.integer(i64::from(key_hash_slot(&args[2]))),
         ("cluster", Some("myid"), 2) => out.error(b"ERR stuart is not a node and has no node id"),
-        ("stuart", Some("join"), 5 | 7) => join(args, stuart, out),
+        ("stuart", Some("join"), 5 | 7 | 9) => join(args, stuart, out),
         ("stuart", Some("create"), 2) => create(stuart, out),
         ("stuart", Some("assign"), 5) => assign(args, stuart, out),
         ("stuart", Some("move"), 5) => move_slots(args, stuart, out),
@@ -235,17 +241,27 @@ fn info(stuart: &Stuart, out: &mut Encoder) {
     out.verbatim(b"txt", text.as_bytes());
 }
 
-/// `STUART JOIN id host port [NAME name]`: from a node starting with
-/// `--stuart` (and `--name`).
+/// `STUART JOIN id host port [NAME name] [ZONE zone]`: from a node starting
+/// with `--stuart` (and `--name`, `--zone`).
 fn join(args: &Args, stuart: &Rc<Stuart>, out: &mut Encoder) {
-    let name = match args.len() {
-        7 if args[5].eq_ignore_ascii_case(b"name") => match std::str::from_utf8(&args[6]) {
-            Ok(name) if dbnode::valid_name(name) => Some(name),
-            _ => return out.error_parts(&[b"ERR Invalid name '", &args[6], b"'"]),
-        },
-        7 => return out.error(b"ERR syntax error"),
-        _ => None,
-    };
+    let (mut name, mut zone) = (None, None);
+    for i in (5..args.len()).step_by(2) {
+        let (key, value) = (&args[i], &args[i + 1]);
+        let (slot, what) = if key.eq_ignore_ascii_case(b"name") {
+            (&mut name, &b"name"[..])
+        } else if key.eq_ignore_ascii_case(b"zone") {
+            (&mut zone, &b"zone"[..])
+        } else {
+            return out.error(b"ERR syntax error");
+        };
+        if slot.is_some() {
+            return out.error(b"ERR syntax error");
+        }
+        match std::str::from_utf8(value) {
+            Ok(value) if dbnode::valid_name(value) => *slot = Some(value),
+            _ => return out.error_parts(&[b"ERR Invalid ", what, b" '", value, b"'"]),
+        }
+    }
     let Some(id) = NodeId::parse(&args[2]) else {
         return out.error_parts(&[b"ERR Invalid node id '", &args[2], b"'"]);
     };
@@ -264,7 +280,30 @@ fn join(args: &Args, stuart: &Rc<Stuart>, out: &mut Encoder) {
         let s = stuart.state.borrow();
         s.nodes().iter().map(|n| *n.id()).filter(|n| name.is_some() && s.name(n) == name).collect()
     };
-    let joined = match stuart.change(|s| s.join_named(node, name)) {
+    // It replaces a primary with replicas (its pod restarted, with a new
+    // id and no keys): the old one is dead. Its replica is promoted first
+    // (no wait: nothing is left to fence), then the pod's next try joins,
+    // replacing a replica.
+    let dying: Vec<NodeId> = {
+        let s = stuart.state.borrow();
+        let replaced = |n: &Node| n.id() != &id && ((n.host(), n.port()) == (node.host(), node.port()) || same_name.contains(n.id()));
+        s.table()
+            .map(|t| {
+                (0..t.nodes().len())
+                    .filter(|&i| t.primary_of(i).is_none() && t.replicas_of(i).next().is_some() && replaced(&t.nodes()[i]))
+                    .map(|i| *t.nodes()[i].id())
+                    .filter(|p| !stuart.unpromotable.borrow().contains(p))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    if let Some(p) = dying.first() {
+        if stuart.dead.borrow_mut().insert(*p) {
+            notice!("Node {id} at {addr}{named} replaces primary {p}: failing it over to its replica first");
+        }
+        return out.error(format!("TRYAGAIN Failing node {p} over to its replica first").as_bytes());
+    }
+    let joined = match stuart.change(|s| s.join_in(node, name, zone)) {
         Ok(joined) => joined,
         Err(e) => {
             warning!("Can't save the state: {e}");
@@ -280,7 +319,8 @@ fn join(args: &Args, stuart: &Rc<Stuart>, out: &mut Encoder) {
         crate::state::Change::Known => verbose!("Node {id} at {addr}{named} joined again"),
         crate::state::Change::Moved => notice!("Node {id}{named} moved to {addr}{epoch}"),
         crate::state::Change::Added => {
-            notice!("Node {id} joined at {addr}{named}{epoch}");
+            let role = joined.primary.map_or(String::new(), |p| format!(" as a replica of {p}"));
+            notice!("Node {id} joined at {addr}{named}{role}{epoch}");
             let s = stuart.clone();
             if let Err(e) = reactor::spawn(move || keeper::keep(s, id)) {
                 warning!("No fiber to keep node {id}: {e}");
@@ -297,24 +337,32 @@ fn join(args: &Args, stuart: &Rc<Stuart>, out: &mut Encoder) {
 
 /// `STUART LEAVE id`: from a node that is stopping (or by hand). Replies
 /// what it still holds, plus one while it is a node: 0 once it has left.
-/// Refused if the other nodes haven't the memory for its keys: the node
-/// then stops at once, rather than wait for room until it's killed.
+/// A primary with a replica that can take over hands its slots to it (see
+/// `handover`); else they are drained, refused if the other nodes haven't
+/// the memory for its keys: the node then stops at once, rather than wait
+/// for room until it's killed. A replica's keys are copies: it just goes.
 fn leave(stuart: &Stuart, id: &NodeId, out: &mut Encoder) {
     let was = stuart.state.borrow().node(id).is_some() && !stuart.state.borrow().leaving().contains(id);
-    if was && stuart.state.borrow().table().is_some() {
+    let replica = stuart.state.borrow().primary_of(id).is_some();
+    let hand = was && stuart.can_hand_over(id);
+    if was && !replica && !hand && stuart.state.borrow().table().is_some() {
         if let Err(e) = stuart.room_for(id) {
             warning!("Node {id} may not leave, its keys would be lost: {e}");
             return out.error(e.as_bytes());
         }
     }
     let full = stuart.full_nodes();
-    match stuart.change(|s| s.leave(id, &full)) {
+    match stuart.change(|s| if hand { s.leave_handing(id, &full) } else { s.leave(id, &full) }) {
         Ok(Ok(n)) => {
             if was {
                 if n == 0 && stuart.state.borrow().shutting_down() {
                     warning!("Node {id} is leaving, and so is every other: the cluster is shutting down, the keys go with the nodes");
                 } else if n == 0 {
                     notice!("Node {id} left (there is no table yet)");
+                } else if hand {
+                    notice!("Primary {id} is leaving: it hands its {} slots to a replica", n - 1);
+                } else if replica {
+                    notice!("Replica {id} is leaving");
                 } else {
                     notice!("Node {id} is leaving: it holds {} slots", n - 1);
                     stuart.replan();
@@ -428,18 +476,16 @@ fn queue_moves(stuart: &Stuart, out: &mut Encoder, what: &str, plan: impl FnOnce
 }
 
 /// `STUART MIGRATIONS`: a line per slot moving, `slot from -> to
-/// pending=N for=Ns` (`pending`: what the source last said it has left,
-/// `?` before it was asked), then `queued: N` when slots wait to move.
+/// for=Ns`, then `queued: N` when slots wait to move.
 fn migrations(stuart: &Stuart, out: &mut Encoder) {
     let state = stuart.state.borrow();
     let mut text = String::new();
     if let Some(t) = state.table() {
-        let (pending, since) = (stuart.pending.borrow(), stuart.moving_since.borrow());
+        let since = stuart.moving_since.borrow();
         for m in t.migrations() {
             let (from, to) = (t.nodes()[m.from].id(), t.nodes()[m.to].id());
-            let pending = pending.get(&m.slot).map_or("?".to_string(), |n| n.to_string());
             let age = since.get(&m.slot).map_or("?".to_string(), |s| s.elapsed().as_secs().to_string());
-            text += &format!("{} {from} -> {to} pending={pending} for={age}s\n", m.slot);
+            text += &format!("{} {from} -> {to} for={age}s\n", m.slot);
         }
     }
     if !state.queue().is_empty() {
@@ -449,8 +495,9 @@ fn migrations(stuart: &Stuart, out: &mut Encoder) {
 }
 
 /// `STUART NODES`: a line per joined node, `id host:port up|down since=Ns
-/// acked=E slots=N [name=NAME] [used=B max=B] [full] [leaving]
-/// [error=...]`, and the slots no node owns, if any.
+/// acked=E slots=N [replica-of=ID] [name=NAME] [zone=ZONE] [used=B max=B]
+/// [full] [leaving] [demoting] [failed] [error=...]`, and the slots no node owns, if
+/// any.
 fn nodes(stuart: &Stuart, out: &mut Encoder) {
     let state = stuart.state.borrow();
     let health = stuart.health.borrow();
@@ -465,8 +512,14 @@ fn nodes(stuart: &Stuart, out: &mut Encoder) {
             None => ("unknown", 0, 0, None),
         };
         text += &format!("{} {}:{} {status} since={since}s acked={acked} slots={slots}", node.id(), node.host(), node.port());
+        if let Some(primary) = state.primary_of(node.id()) {
+            text += &format!(" replica-of={primary}");
+        }
         if let Some(name) = state.name(node.id()) {
             text += &format!(" name={name}");
+        }
+        if let Some(zone) = state.zone(node.id()) {
+            text += &format!(" zone={zone}");
         }
         if let Some(m) = health.get(node.id()).and_then(|h| h.memory) {
             text += &format!(" used={} max={}", m.used, m.max);
@@ -476,6 +529,12 @@ fn nodes(stuart: &Stuart, out: &mut Encoder) {
         }
         if state.leaving().contains(node.id()) {
             text += " leaving";
+        }
+        if state.demoting() == Some(node.id()) {
+            text += " demoting";
+        }
+        if state.is_failed(node.id()) {
+            text += " failed";
         }
         if let Some(e) = error {
             text += &format!(" error={e:?}");

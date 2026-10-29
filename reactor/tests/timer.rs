@@ -430,3 +430,71 @@ fn sleepers_wake_while_another_fiber_yields() {
         .unwrap();
     reactor.run().unwrap();
 }
+
+/// `turn_time()`: the clock outside a reactor; inside, the time of the
+/// turn, which a fiber woken after the thread stalled sees past the stall.
+#[test]
+fn turn_time_is_the_turns_and_past_a_stall() {
+    let before = Instant::now();
+    let t = reactor::turn_time();
+    assert!(t >= before && t <= Instant::now(), "no reactor: the clock");
+    let reactor = Reactor::new().unwrap();
+    let seen = Rc::new(Cell::new(None));
+    let stalled = Rc::new(Cell::new(None));
+    let (s, st) = (seen.clone(), stalled.clone());
+    reactor
+        .spawn(move || {
+            let asked = Instant::now();
+            sleep(20 * MS);
+            assert!(reactor::turn_time() >= asked + 20 * MS, "the turn that woke it");
+            assert!(reactor::turn_time() <= Instant::now());
+            // A fiber woken while another stalls the thread sees the time
+            // after the stall, without reading the clock itself.
+            sleep(MS);
+            s.set(Some(reactor::turn_time()));
+        })
+        .unwrap();
+    reactor
+        .spawn(move || {
+            // Stalls from 10 ms to 110 ms, while the other's 21 ms comes
+            // due: it runs in the turn after.
+            sleep(10 * MS);
+            std::thread::sleep(100 * MS);
+            st.set(Some(Instant::now()));
+        })
+        .unwrap();
+    reactor.run().unwrap();
+    assert!(seen.get().unwrap() >= stalled.get().unwrap(), "{:?} vs {:?}", seen.get(), stalled.get());
+
+    // The same while the loop never waits (a fiber always ready): the
+    // turn's time is read anyway.
+    drop(reactor);
+    let reactor = Reactor::new().unwrap();
+    let (seen, stalled, done) = (Rc::new(Cell::new(None)), Rc::new(Cell::new(None)), Rc::new(Cell::new(false)));
+    let (s, d) = (seen.clone(), done.clone());
+    reactor
+        .spawn(move || {
+            sleep(20 * MS);
+            s.set(Some(reactor::turn_time()));
+            d.set(true);
+        })
+        .unwrap();
+    let st = stalled.clone();
+    reactor
+        .spawn(move || {
+            sleep(10 * MS);
+            std::thread::sleep(100 * MS);
+            st.set(Some(Instant::now()));
+        })
+        .unwrap();
+    let d = done.clone();
+    reactor
+        .spawn(move || {
+            while !d.get() {
+                yield_now();
+            }
+        })
+        .unwrap();
+    reactor.run().unwrap();
+    assert!(seen.get().unwrap() >= stalled.get().unwrap(), "busy: {:?} vs {:?}", seen.get(), stalled.get());
+}

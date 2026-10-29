@@ -9,12 +9,23 @@
 #   4. redis-benchmark --cluster against both;
 #   5. cluster_difftest.py load against ours while stuart is restarted;
 #   6. cluster_difftest.py migrating: a slot migrating, ASK and TRYAGAIN
-#      (last: it pushes a table to our nodes past stuart's epoch).
+#      (it pushes a table to our nodes past stuart's epoch);
+#   7. cluster_difftest.py replicas: a Redis Cluster of three primaries with
+#      a replica each (--cluster-replicas 1) and ours (stuart --replicas 1,
+#      six nodes), the same keys written to both and synced: the layout
+#      replies at every node, reads (READONLY) and redirects at the replicas;
+#   8. cluster_difftest.py failed: a replica SIGKILLed in each (Redis with
+#      cluster-node-timeout 2000, ours marked failed by stuart after 5 s):
+#      the layout replies at the five nodes left, a write at its primary;
+#   9. cluster_difftest.py failover: then a primary SIGKILLed in each, Redis
+#      failing over by itself (cluster-replica-validity-factor 0), ours
+#      through stuart: the layout at the live nodes, a write at the new one.
 # Fails on any difference; stops everything at the end.
 #
 #   tools/compat/cluster_difftest.sh [--base-port 7850]
 #
-# Redis gets the base port + 1..3, stuart + 10, our nodes + 11..13. Needs
+# Redis gets the base port + 1..3, stuart + 10, our nodes + 11..13; with
+# replicas, Redis + 21..26, stuart + 30, our nodes + 31..36. Needs
 # redis-server and redis-cli 7.0.15 (REDIS_SERVER, REDIS_CLI to choose
 # others), redis-benchmark, and redis-py (pip, or REDIS_PY_PATH: a directory
 # holding the package, default ~/venvs/redis-py/site). CARGO_TARGET_DIR
@@ -26,7 +37,7 @@ BASE=7850
 while [ $# -gt 0 ]; do
   case "$1" in
     --base-port) BASE="$2"; shift 2;;
-    -h|--help) sed -n '2,19p' "$0"; exit 0;;
+    -h|--help) sed -n '2,25p' "$0"; exit 0;;
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
 done
@@ -39,16 +50,19 @@ BIN="$CARGO_TARGET_DIR/release"
 R=($((BASE + 1)) $((BASE + 2)) $((BASE + 3)))
 S=$((BASE + 10))
 O=($((BASE + 11)) $((BASE + 12)) $((BASE + 13)))
-for p in "${R[@]}" "$S" "${O[@]}"; do
+R6=($(seq $((BASE + 21)) $((BASE + 26))))
+S6=$((BASE + 30))
+O6=($(seq $((BASE + 31)) $((BASE + 36))))
+for p in "${R[@]}" "$S" "${O[@]}" "${R6[@]}" "$S6" "${O6[@]}"; do
   [ -z "$(ss -ltnH "sport = :$p")" ] || { echo "port $p is taken" >&2; exit 2; }
 done
 
 DIR="$(mktemp -d /tmp/cluster_difftest.XXXXXX)"
-PIDS=(); STUART_PID=
+PIDS=(); STUART_PID=; STUART6_PID=
 cleanup() {
-  for p in "${R[@]}"; do "$REDIS_CLI" -p "$p" shutdown nosave >/dev/null 2>&1 || true; done
+  for p in "${R[@]}" "${R6[@]}"; do "$REDIS_CLI" -p "$p" shutdown nosave >/dev/null 2>&1 || true; done
   # SIGINT: a node that joined stuart leaves the cluster on SIGTERM first.
-  for p in "${PIDS[@]}" $STUART_PID; do kill -INT "$p" 2>/dev/null || true; done
+  for p in "${PIDS[@]}" $STUART_PID $STUART6_PID; do kill -INT "$p" 2>/dev/null || true; done
   rm -rf "$DIR"
 }
 trap cleanup EXIT
@@ -125,4 +139,46 @@ cat "$DIR/load.txt"
 
 echo ">> a slot migrating"
 python3 "$HERE/cluster_difftest.py" migrating --redis "$(IFS=,; echo "${R[*]}")" --ours "$(IFS=,; echo "${O[*]}")"
+
+echo ">> replicas"
+for p in "${R6[@]}"; do
+  mkdir "$DIR/$p"
+  (cd "$DIR/$p" && "$REDIS_SERVER" --port "$p" --cluster-enabled yes --cluster-config-file nodes.conf \
+     --cluster-require-full-coverage no --cluster-node-timeout 2000 --cluster-replica-validity-factor 0 --save '' --appendonly no \
+     --daemonize yes --logfile "$DIR/$p/log")
+done
+for p in "${R6[@]}"; do wait_for "redis $p starts" pings "$p"; done
+"$REDIS_CLI" --cluster create $(for p in "${R6[@]}"; do echo "127.0.0.1:$p"; done) --cluster-replicas 1 --cluster-yes >/dev/null
+three_slaves() { [ "$("$REDIS_CLI" -p "$1" cluster nodes | grep -cE '[ ,]slave ')" = 3 ]; }
+for p in "${R6[@]}"; do
+  wait_for "redis $p ok" bash -c "\"$REDIS_CLI\" -p $p cluster info | grep -q '^cluster_state:ok'"
+  wait_for "redis $p knows the replicas" three_slaves "$p"
+done
+"$BIN/stuart" "127.0.0.1:$S6" --state "$DIR/state6" --replicas 1 --loglevel warning 2>>"$DIR/stuart6.log" & STUART6_PID=$!
+wait_for "stuart (replicas) starts" pings "$S6"
+joined6() { [ "$("$REDIS_CLI" -p "$S6" stuart nodes | grep -c ' up ')" = "$1" ]; }
+for i in 0 1 2 3 4 5; do
+  "$BIN/dbnode" "127.0.0.1:${O6[$i]}" --cluster --stuart "127.0.0.1:$S6" --loglevel warning 2>>"$DIR/node-${O6[$i]}.log" & PIDS+=($!)
+  wait_for "node ${O6[$i]} joins" joined6 $((i + 1))
+done
+[ "$("$REDIS_CLI" -p "$S6" stuart create)" = OK ] || fail "STUART CREATE (replicas)"
+for p in "${O6[@]}"; do wait_for "node $p takes the table" three_slaves "$p"; done
+python3 "$HERE/cluster_difftest.py" replicas --redis "$(IFS=,; echo "${R6[*]}")" --ours "$(IFS=,; echo "${O6[*]}")"
+
+echo ">> a replica killed"
+# The port of the replica of slot 0's primary, as node $1 sees it.
+replica_of_slot_0() {
+  local nodes primary
+  nodes=$("$REDIS_CLI" -p "$1" cluster nodes)
+  primary=$(echo "$nodes" | awk '$9 ~ /^0-/ {print $1}')
+  echo "$nodes" | awk -v p="$primary" '$4 == p {split($2, a, "[:@]"); print a[2]}'
+}
+pid_of() { "$REDIS_CLI" -p "$1" info server | tr -d '\r' | sed -n 's/^process_id://p'; }
+dead_r=$(replica_of_slot_0 "${R6[0]}"); dead_o=$(replica_of_slot_0 "${O6[0]}")
+[ -n "$dead_r" ] && [ -n "$dead_o" ] || fail "no replica of slot 0's primary"
+kill -9 "$(pid_of "$dead_r")" "$(pid_of "$dead_o")"
+python3 "$HERE/cluster_difftest.py" failed --redis "$(IFS=,; echo "${R6[*]}")" --ours "$(IFS=,; echo "${O6[*]}")" --dead "$dead_r,$dead_o"
+
+echo ">> a primary killed"
+python3 "$HERE/cluster_difftest.py" failover --redis "$(IFS=,; echo "${R6[*]}")" --ours "$(IFS=,; echo "${O6[*]}")"
 echo "OK"

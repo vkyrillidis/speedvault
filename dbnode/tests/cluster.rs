@@ -1,7 +1,8 @@
 //! The dbnode in cluster mode over real TCP: the table it starts with,
 //! `CLUSTER SETTABLE` and its epoch rules, and the slot check (`MOVED`,
-//! `CROSSSLOT`, `CLUSTERDOWN`). The errors are Redis 7.0.15's (a cluster
-//! with `cluster-require-full-coverage no`), checked with redis-cli.
+//! `CROSSSLOT`, `CLUSTERDOWN`); a node the table makes a replica (`ROLE`,
+//! `INFO replication`). The errors are Redis 7.0.15's (a cluster with
+//! `cluster-require-full-coverage no`), checked with redis-cli.
 
 mod common;
 
@@ -228,8 +229,8 @@ fn cluster_commands() {
     }
     let needle = b"$4\r\nmode\r\n$7\r\ncluster\r\n$4\r\nrole";
     assert!(hello.windows(needle.len()).any(|w| w == needle), "{}", hello.escape_ascii());
-    let info = "# Cluster\r\ncluster_enabled:1\r\nmigrate_keys_sent:0\r\nmigrate_batches_sent:0\r\nmigrate_bytes_sent:0\r\nmigrate_parts_sent:0\r\n\
-                migrate_parts_aborted:0\r\nmigrate_keys_imported:0\r\nmigrate_parts_imported:0\r\nmigrate_imports_refused:0\r\ncluster_redirects_moved:0\r\ncluster_redirects_ask:0\r\ncluster_redirects_tryagain:0\r\ncluster_leaving:0\r\n";
+    let info = "# Cluster\r\ncluster_enabled:1\r\nmigrate_keys_sent:0\r\n\
+                migrate_keys_imported:0\r\nmigrate_imports_refused:0\r\ncluster_redirects_moved:0\r\ncluster_redirects_ask:0\r\ncluster_redirects_tryagain:0\r\ncluster_leaving:0\r\n";
     c.call(&[b"INFO", b"cluster"], format!("={}\r\ntxt:{info}\r\n", info.len() + 4).as_bytes());
     c.cmd(&[b"INFO", b"server"]);
     assert!(c.read_text().contains("\r\nredis_mode:cluster\r\n"));
@@ -571,4 +572,198 @@ fn joins_stuart_and_retries() {
     assert!(rx.recv_timeout(std::time::Duration::from_millis(2500)).is_err());
     // Joining changes nothing until stuart sends a table.
     c.call(&[b"GET", b"foo"], CLUSTERDOWN);
+}
+
+/// `settable` with `REPLICAS` (and `MIGRATING` before it, if any).
+fn settable_replicas(
+    epoch: &str,
+    nodes: &[(&str, &str, &str)],
+    ranges: &[(&str, &str, &str)],
+    migrating: &[(&str, &str, &str)],
+    replicas: &[(&str, &str)],
+) -> Vec<Vec<u8>> {
+    let mut args = if migrating.is_empty() { settable(epoch, nodes, ranges) } else { settable_migrating(epoch, nodes, ranges, migrating) };
+    args.push(b"REPLICAS".to_vec());
+    args.push(replicas.len().to_string().into());
+    for (replica, primary) in replicas {
+        args.extend([replica.as_bytes().to_vec(), primary.as_bytes().to_vec()]);
+    }
+    args
+}
+
+/// A replica of B, which owns every slot: it redirects every key to B,
+/// after `READONLY` too while it has no data (phase 8 milestone 1); it is
+/// a replica in `CLUSTER NODES`, `SHARDS` (loading: it has taken nothing),
+/// `ROLE`, `INFO replication` and `HELLO`, and not in `CLUSTER SLOTS` (as
+/// Redis lists a replica only once its offset isn't 0). The replies are
+/// Redis 7.0.15's for a replica whose primary is down.
+#[test]
+fn a_replica() {
+    let (mut c, me) = node();
+    let port = c.0.peer_addr().unwrap().port();
+    let p = port.to_string();
+    let nodes = [(&me[..], "127.0.0.1", &p[..]), (B, "10.0.0.2", "7000")];
+    let all_b = [("0", "16383", B)];
+    call_vec(&mut c, &settable_replicas("3", &nodes, &all_b, &[], &[(&me, B)]), OK);
+
+    c.call(&[b"GET", b"foo"], MOVED_FOO);
+    c.call(&[b"SET", b"foo", b"1"], MOVED_FOO);
+    // After READONLY, reads from its copy (empty: nothing synced from a
+    // primary nobody runs), as a Redis replica's; writes go to B.
+    c.call(&[b"READONLY"], OK);
+    c.call(&[b"GET", b"foo"], NIL);
+    c.call(&[b"MGET", b"foo", b"foo"], b"*2\r\n$-1\r\n$-1\r\n");
+    c.call(&[b"SET", b"foo", b"1"], MOVED_FOO);
+    c.call(&[b"READWRITE"], OK);
+    c.call(&[b"GET", b"foo"], MOVED_FOO);
+    c.call(&[b"READONLY", b"x"], b"-ERR wrong number of arguments for 'readonly' command\r\n");
+    c.call(&[b"DBSIZE"], b":0\r\n");
+
+    // Trying to reach B: `connecting`, or `connect` between tries.
+    c.cmd(&[b"ROLE"]);
+    c.expect(b"*5\r\n$5\r\nslave\r\n$8\r\n10.0.0.2\r\n:7000\r\n");
+    let state = c.read_text();
+    assert!(state == "connect" || state == "connecting", "{state}");
+    c.expect(b":-1\r\n");
+    c.call(&[b"ROLE", b"x"], b"-ERR wrong number of arguments for 'role' command\r\n");
+    c.cmd(&[b"INFO", b"replication"]);
+    let info = c.read_text();
+    assert!(
+        info.starts_with(
+            "# Replication\r\nrole:slave\r\nmaster_host:10.0.0.2\r\nmaster_port:7000\r\nmaster_link_status:down\r\n\
+             master_last_io_seconds_ago:-1\r\nmaster_sync_in_progress:0\r\nslave_read_repl_offset:0\r\nslave_repl_offset:0\r\n\
+             master_link_down_since_seconds:-1\r\nslave_priority:100\r\nslave_read_only:1\r\nreplica_announced:1\r\n\
+             connected_slaves:0\r\nmaster_failover_state:no-failover\r\nmaster_replid:"
+        ),
+        "{info}"
+    );
+    c.cmd(&[b"CLUSTER", b"NODES"]);
+    assert_eq!(
+        c.read_text(),
+        format!("{me} 127.0.0.1:{port}@{port} myself,slave {B} 0 0 3 connected\n{B} 10.0.0.2:7000@7000 master - 0 0 3 connected 0-16383\n")
+    );
+    c.call(&[b"CLUSTER", b"SLOTS"], format!("*1\r\n*3\r\n:0\r\n:16383\r\n*4\r\n$8\r\n10.0.0.2\r\n:7000\r\n$40\r\n{B}\r\n*0\r\n").as_bytes());
+    c.cmd(&[b"CLUSTER", b"SHARDS"]);
+    let mut shards = vec![0; 4096];
+    let n = std::io::Read::read(&mut c.0, &mut shards).unwrap();
+    let shards = String::from_utf8_lossy(&shards[..n]).to_string();
+    assert!(shards.starts_with("*1\r\n*4\r\n$5\r\nslots\r\n*2\r\n:0\r\n:16383\r\n$5\r\nnodes\r\n*2\r\n"), "{shards}");
+    assert!(shards.ends_with(&format!("{me}\r\n$4\r\nport\r\n:{port}\r\n$2\r\nip\r\n$9\r\n127.0.0.1\r\n$8\r\nendpoint\r\n$9\r\n127.0.0.1\r\n\
+         $4\r\nrole\r\n$7\r\nreplica\r\n$18\r\nreplication-offset\r\n:0\r\n$6\r\nhealth\r\n$7\r\nloading\r\n")), "{shards}");
+    c.cmd(&[b"HELLO", b"3"]);
+    let hello = c.read_line();
+    assert_eq!(hello, b"%7\r\n");
+    let mut rest = vec![0; 4096];
+    let n = std::io::Read::read(&mut c.0, &mut rest).unwrap();
+    assert!(rest[..n].ends_with(b"$4\r\nrole\r\n$7\r\nreplica\r\n$7\r\nmodules\r\n*0\r\n"), "{}", rest[..n].escape_ascii());
+
+    // A primary again (no REPLICAS): it serves its slots.
+    let mine = [("0", "16383", &me[..])];
+    call_vec(&mut c, &settable("4", &nodes, &mine), OK);
+    c.call(&[b"GET", b"foo"], b"_\r\n");
+    c.call(&[b"ROLE"], b"*3\r\n$6\r\nmaster\r\n:0\r\n*0\r\n");
+    c.cmd(&[b"INFO", b"replication"]);
+    let info = c.read_text();
+    // RESP3 now: a verbatim string.
+    let info = info.strip_prefix("txt:").unwrap();
+    assert!(info.starts_with("# Replication\r\nrole:master\r\nconnected_slaves:0\r\nmaster_failover_state:no-failover\r\nmaster_replid:"), "{info}");
+    assert!(
+        info.ends_with(
+            "\r\nmaster_replid2:0000000000000000000000000000000000000000\r\nmaster_repl_offset:0\r\nsecond_repl_offset:-1\r\n\
+             repl_backlog_active:0\r\nrepl_backlog_size:1048576\r\nrepl_backlog_first_byte_offset:0\r\nrepl_backlog_histlen:0\r\n"
+        ),
+        "{info}"
+    );
+    let replid = info.split("master_replid:").nth(1).unwrap().split("\r\n").next().unwrap();
+    assert!(replid.len() == 40 && replid.bytes().all(|b| b.is_ascii_hexdigit()) && replid != me, "{replid}");
+}
+
+#[test]
+fn settable_replicas_are_checked() {
+    let (mut c, me) = node();
+    let p = c.0.peer_addr().unwrap().port().to_string();
+    let me = &me[..];
+    let nodes = [(me, "127.0.0.1", &p[..]), (B, "10.0.0.2", "7000"), (C, "10.0.0.3", "7000")];
+    let ranges = [("0", "8191", me), ("8192", "16383", B)];
+    let invalid = |e: String| format!("-ERR Invalid table: {e}\r\n").into_bytes();
+    let refused = |c: &mut Client, replicas: &[(&str, &str)], expected: &[u8]| {
+        call_vec(c, &settable_replicas("2", &nodes, &ranges, &[], replicas), expected);
+    };
+    refused(&mut c, &[(C, C)], &invalid(format!("node {C} is a replica of itself")));
+    refused(&mut c, &[(me, C)], &invalid(format!("replica {me} owns slots")));
+    refused(&mut c, &[(C, me), (C, B)], &invalid(format!("node {C} is listed as a replica twice")));
+    refused(&mut c, &[(C, "dddddddddddddddddddddddddddddddddddddddd")], &invalid("unknown node dddddddddddddddddddddddddddddddddddddddd".into()));
+    refused(&mut c, &[(C, "x")], b"-ERR Invalid node id 'x'\r\n");
+    // Nothing was taken: the node is still on its own.
+    c.cmd(&[b"CLUSTER", b"INFO"]);
+    assert!(c.read_text().contains("\r\ncluster_current_epoch:0\r\n"));
+
+    // The shape: pairs, after MIGRATING.
+    let mut odd = settable("2", &nodes, &ranges);
+    odd.extend([b"REPLICAS".to_vec(), b"1".to_vec(), C.as_bytes().to_vec()]);
+    call_vec(&mut c, &odd, b"-ERR syntax error\r\n");
+    let mut before = settable_replicas("2", &nodes, &ranges, &[], &[(C, me)]);
+    before.extend([b"MIGRATING".to_vec(), b"0".to_vec()]);
+    call_vec(&mut c, &before, b"-ERR syntax error\r\n");
+    // A slot can't migrate to a replica.
+    let to_replica = settable_replicas("2", &nodes, &ranges, &[("5", me, C)], &[(C, B)]);
+    call_vec(&mut c, &to_replica, &invalid("slot 5 migrates to a replica".into()));
+
+    // Both, in order; an empty REPLICAS is no replicas.
+    call_vec(&mut c, &settable_replicas("2", &nodes, &ranges, &[("5", me, B)], &[(C, me)]), OK);
+    call_vec(&mut c, &settable_replicas("3", &nodes, &ranges, &[], &[]), OK);
+    c.cmd(&[b"CLUSTER", b"NODES"]);
+    assert!(!c.read_text().contains("slave"));
+}
+
+/// `CLUSTER SETOFFSETS`: the other nodes' offsets, which decide whether
+/// `CLUSTER SLOTS` lists a replica (past 0) and what `SHARDS` shows.
+#[test]
+fn setoffsets() {
+    let (mut c, me) = node();
+    let p = c.0.peer_addr().unwrap().port().to_string();
+    let me = &me[..];
+    let nodes = [(me, "127.0.0.1", &p[..]), (B, "10.0.0.2", "7000"), (C, "10.0.0.3", "7000")];
+    let ranges = [("0", "8191", me), ("8192", "16383", B)];
+    call_vec(&mut c, &settable_replicas("2", &nodes, &ranges, &[], &[(C, me)]), OK);
+    let raw = |c: &mut Client, args: &[&[u8]]| {
+        c.cmd(args);
+        let mut buf = vec![0; 8192];
+        let n = std::io::Read::read(&mut c.0, &mut buf).unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    };
+    let replica = format!("*4\r\n$8\r\n10.0.0.3\r\n:7000\r\n$40\r\n{C}\r\n*0\r\n");
+    // Before any: C's offset is 0, so it isn't listed, and is loading.
+    let slots = raw(&mut c, &[b"CLUSTER", b"SLOTS"]);
+    assert!(slots.starts_with("*2\r\n*3\r\n") && !slots.contains(C), "{slots}");
+    c.call(&[b"CLUSTER", b"SETOFFSETS", C.as_bytes(), b"14"], OK);
+    let slots = raw(&mut c, &[b"CLUSTER", b"SLOTS"]);
+    assert!(slots.starts_with("*2\r\n*4\r\n:0\r\n:8191\r\n") && slots.contains(&replica), "{slots}");
+    let shards = raw(&mut c, &[b"CLUSTER", b"SHARDS"]);
+    assert!(shards.contains(&format!("{C}\r\n")), "{shards}");
+    assert!(shards.contains("$7\r\nreplica\r\n$18\r\nreplication-offset\r\n:14\r\n$6\r\nhealth\r\n$6\r\nonline\r\n"), "{shards}");
+
+    // Refused whole: what was there stays.
+    c.call(&[b"CLUSTER", b"SETOFFSETS", C.as_bytes()], b"-ERR syntax error\r\n");
+    c.call(&[b"CLUSTER", b"SETOFFSETS", C.as_bytes(), b"5", b"x", b"1"], b"-ERR Invalid node id 'x'\r\n");
+    c.call(&[b"CLUSTER", b"SETOFFSETS", C.as_bytes(), b"-1"], b"-ERR Invalid offset '-1'\r\n");
+    c.call(&[b"CLUSTER", b"SETOFFSETS", C.as_bytes(), b"1.5"], b"-ERR Invalid offset '1.5'\r\n");
+    assert!(raw(&mut c, &[b"CLUSTER", b"SLOTS"]).contains(&replica));
+    assert_eq!(raw(&mut c, &[b"CLUSTER", b"SHARDS"]), shards, "C's offset still 14");
+
+    // Each push replaces the last; a node not in the table is ignored.
+    c.call(&[b"CLUSTER", b"SETOFFSETS", b"dddddddddddddddddddddddddddddddddddddddd", b"7"], OK);
+    assert!(!raw(&mut c, &[b"CLUSTER", b"SLOTS"]).contains(C));
+    c.call(&[b"CLUSTER", b"SETOFFSETS", C.as_bytes(), b"14"], OK);
+    c.call(&[b"CLUSTER", b"SETOFFSETS"], OK);
+    assert!(!raw(&mut c, &[b"CLUSTER", b"SLOTS"]).contains(C));
+}
+
+#[test]
+fn role_without_cluster_mode() {
+    let mut c = Client::connect(start());
+    c.call(&[b"ROLE"], b"*3\r\n$6\r\nmaster\r\n:0\r\n*0\r\n");
+    c.call(&[b"READONLY"], b"-ERR This instance has cluster support disabled\r\n");
+    c.cmd(&[b"INFO", b"replication"]);
+    assert!(c.read_text().starts_with("# Replication\r\nrole:master\r\nconnected_slaves:0\r\n"));
 }

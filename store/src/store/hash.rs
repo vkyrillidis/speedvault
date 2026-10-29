@@ -3,32 +3,21 @@
 //! A hash emptied by a command loses its key, as in Redis. The reads hand
 //! out the [`Hash`] itself; the dbnode writes the reply from it.
 
-use super::{Store, Value};
+use super::{Effect, Store, Value};
 use crate::collections::Hash;
+use crate::float::{self, LongDouble, Number};
 use crate::int::{parse_i64, write_i64};
 use crate::Error;
 
-impl Value {
-    fn as_hash(&self) -> Result<&Hash, Error> {
-        match self {
-            Value::Hash(h) => Ok(h),
-            _ => Err(Error::WrongType),
-        }
-    }
+/// A field and its value, copied out.
+type Pair = (Vec<u8>, Vec<u8>);
 
-    fn as_hash_mut(&mut self) -> Result<&mut Hash, Error> {
-        match self {
-            Value::Hash(h) => Ok(h),
-            _ => Err(Error::WrongType),
-        }
-    }
-}
 
 impl Store {
     /// The hash at `key`, `None` if there's none (`HGET`, `HGETALL`, ...).
     pub fn hash(&mut self, key: &[u8]) -> Result<Option<&Hash>, Error> {
         match self.live(key) {
-            Some(e) => Ok(Some(e.value.as_hash()?)),
+            Some(e) => Ok(Some(e.as_hash()?)),
             None => Ok(None),
         }
     }
@@ -39,7 +28,7 @@ impl Store {
         if self.live(key).is_none() {
             self.insert_value(key, Value::Hash(Box::default()), None);
         }
-        self.live(key).expect("just made").value.as_hash_mut()
+        self.live(key).expect("just made").as_hash_mut()
     }
 
     /// `HSET key field value [field value ...]` (and `HMSET`), `pairs` the
@@ -69,7 +58,7 @@ impl Store {
     /// `HDEL`: how many of `fields` were there.
     pub fn hdel(&mut self, key: &[u8], fields: &[&[u8]]) -> Result<usize, Error> {
         let Some(e) = self.live(key) else { return Ok(0) };
-        let h = e.value.as_hash_mut()?;
+        let h = e.as_hash_mut()?;
         let removed = fields.iter().filter(|f| h.remove(f)).count();
         if h.is_empty() {
             self.remove(key);
@@ -82,7 +71,7 @@ impl Store {
         if let Some(e) = self.live(key) {
             // Look before creating: a non-integer field fails without
             // leaving an empty hash behind.
-            if let Some(v) = e.value.as_hash()?.get(field) {
+            if let Some(v) = e.as_hash()?.get(field) {
                 parse_i64(v).ok_or(Error::HashNotInteger)?.checked_add(by).ok_or(Error::Overflow)?;
             }
         }
@@ -93,6 +82,67 @@ impl Store {
         write_i64(&mut buf, new);
         h.insert(field, &buf);
         Ok(new)
+    }
+
+    /// `HINCRBYFLOAT`: the new value, as written. In Redis's order: the
+    /// increment (an infinity refused), the key's type, the field's value.
+    /// A missing field counts as 0; a long result converts the hash, as
+    /// Redis's `hashTypeSet` does.
+    pub fn hincr_by_float(&mut self, key: &[u8], field: &[u8], incr: &[u8]) -> Result<Vec<u8>, Error> {
+        let incr = match float::parse(incr) {
+            None => return Err(Error::NotFloat),
+            Some(Number::Infinite) => return Err(Error::NanOrInfinity),
+            Some(incr) => incr,
+        };
+        // Creating first is safe: only a field already there can fail.
+        let h = self.hash_or_create(key)?;
+        let old = match h.get(field) {
+            Some(v) => float::parse(v).ok_or(Error::HashNotFloat)?,
+            None => Number::Finite(LongDouble::ZERO),
+        };
+        let mut new = Vec::new();
+        old.add(incr).ok_or(Error::NotFinite)?.write(&mut new);
+        h.insert(field, &new);
+        self.effect(|| Effect::As(vec![b"HSET".to_vec(), key.to_vec(), field.to_vec(), new.clone()]));
+        Ok(new)
+    }
+
+    /// `HRANDFIELD key`: a random field.
+    pub fn hrandfield(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        Ok(self.hrandfield_count(key, 1)?.pop().map(|(f, _)| f))
+    }
+
+    /// `HRANDFIELD key count`, fields with their values: `count` > 0
+    /// distinct fields (all of them, in the hash's order, if it covers the
+    /// hash); `count` < 0, `-count` fields that may repeat.
+    pub fn hrandfield_count(&mut self, key: &[u8], count: i64) -> Result<Vec<Pair>, Error> {
+        let len = match self.live(key) {
+            None => return Ok(Vec::new()),
+            Some(e) => e.as_hash()?.len(),
+        };
+        let picks: Vec<usize> = if count < 0 {
+            (0..count.unsigned_abs()).map(|_| self.random_below(len)).collect()
+        } else if count as u64 >= len as u64 {
+            let h = self.live(key).expect("looked up above").as_hash()?;
+            return Ok(h.iter().map(|(f, v)| (f.to_vec(), v.to_vec())).collect());
+        } else {
+            // A partial Fisher-Yates over the positions.
+            let mut all: Vec<usize> = (0..len).collect();
+            for i in 0..count as usize {
+                let j = i + self.random_below(len - i);
+                all.swap(i, j);
+            }
+            all.truncate(count as usize);
+            all
+        };
+        let h = self.live(key).expect("looked up above").as_hash()?;
+        Ok(picks
+            .into_iter()
+            .map(|pos| {
+                let (f, v) = h.iter_from(pos).next().expect("in range");
+                (f.to_vec(), v.to_vec())
+            })
+            .collect())
     }
 }
 
@@ -163,6 +213,63 @@ mod tests {
         assert_eq!(s.hincr_by(b"h", b"s", 1), Err(Error::HashNotInteger));
         assert_eq!(s.hincr_by(b"h", b"m", 1), Err(Error::Overflow));
         assert_eq!(s.hash(b"h").unwrap().unwrap().get(b"m"), Some(&b"9223372036854775807"[..]));
+    }
+
+    #[test]
+    fn hincrbyfloat() {
+        let mut s = store();
+        assert_eq!(s.hincr_by_float(b"h", b"f", b"2.5"), Ok(b"2.5".to_vec()));
+        assert_eq!(s.hincr_by_float(b"h", b"f", b"-0.5"), Ok(b"2".to_vec()));
+        assert_eq!(s.hincr_by_float(b"h", b"f", b"x"), Err(Error::NotFloat));
+        assert_eq!(s.hincr_by_float(b"h", b"f", b"-inf"), Err(Error::NanOrInfinity));
+        assert_eq!(s.hincr_by_float(b"nokey", b"f", b"inf"), Err(Error::NanOrInfinity));
+        assert!(!s.exists(b"nokey"));
+        s.hset(b"h", &[b"s", b"x", b"i", b"inf"]).unwrap();
+        assert_eq!(s.hincr_by_float(b"h", b"s", b"1"), Err(Error::HashNotFloat));
+        assert_eq!(s.hincr_by_float(b"h", b"i", b"1"), Err(Error::NotFinite));
+        assert_eq!(s.encoding(b"h"), Some("listpack"));
+        assert_eq!(s.hincr_by_float(b"h", b"f", b"1e300").map(|v| v.len()), Ok(301));
+        assert_eq!(s.encoding(b"h"), Some("hashtable"));
+        put_other(&mut s, b"l");
+        assert_eq!(s.hincr_by_float(b"l", b"f", b"1"), Err(Error::WrongType));
+        assert_eq!(s.hincr_by_float(b"l", b"f", b"x"), Err(Error::NotFloat));
+    }
+
+    #[test]
+    fn hrandfield() {
+        let mut s = store();
+        assert_eq!(s.hrandfield(b"h"), Ok(None));
+        assert_eq!(s.hrandfield_count(b"h", 3), Ok(Vec::new()));
+        s.hset(b"h", &[b"b", b"1", b"a", b"2", b"c", b"3"]).unwrap();
+        let all = vec![(b"b".to_vec(), b"1".to_vec()), (b"a".to_vec(), b"2".to_vec()), (b"c".to_vec(), b"3".to_vec())];
+        assert_eq!(s.hrandfield_count(b"h", 3).unwrap(), all);
+        assert_eq!(s.hrandfield_count(b"h", i64::MAX).unwrap(), all);
+        assert_eq!(s.hrandfield_count(b"h", 0), Ok(Vec::new()));
+        for _ in 0..50 {
+            let two = s.hrandfield_count(b"h", 2).unwrap();
+            assert_eq!(two.len(), 2);
+            assert_ne!(two[0], two[1]);
+            assert!(two.iter().all(|p| all.contains(p)));
+            let many = s.hrandfield_count(b"h", -7).unwrap();
+            assert_eq!(many.len(), 7);
+            assert!(many.iter().all(|p| all.contains(p)));
+            let one = s.hrandfield(b"h").unwrap().unwrap();
+            assert!(all.iter().any(|(f, _)| *f == one));
+        }
+        // Every field turns up, big hashes too.
+        let mut big = Vec::new();
+        for i in 0..600 {
+            big.push(format!("f{i}").into_bytes());
+            big.push(b"v".to_vec());
+        }
+        let args: Vec<&[u8]> = big.iter().map(Vec::as_slice).collect();
+        s.hset(b"big", &args).unwrap();
+        assert_eq!(s.encoding(b"big"), Some("hashtable"));
+        let seen: std::collections::HashSet<Vec<u8>> = s.hrandfield_count(b"big", -20000).unwrap().into_iter().map(|(f, _)| f).collect();
+        assert_eq!(seen.len(), 600);
+        put_other(&mut s, b"l");
+        assert_eq!(s.hrandfield(b"l"), Err(Error::WrongType));
+        assert_eq!(s.hrandfield_count(b"l", 1), Err(Error::WrongType));
     }
 
     #[test]

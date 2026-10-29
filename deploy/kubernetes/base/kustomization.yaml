@@ -1,8 +1,9 @@
-# A speedvault cluster on Kubernetes: stuart and three nodes.
+# A speedvault cluster on Kubernetes: stuart and six nodes, three
+# primaries with a replica each.
 #
 #   kubectl apply -k deploy/kubernetes/base            # in the current namespace
-#   kubectl scale statefulset speedvault --replicas 5  # stuart gives them slots
-#   kubectl scale statefulset speedvault --replicas 3  # the last two drain first
+#   kubectl scale statefulset speedvault --replicas 8  # a new pair: stuart gives it slots
+#   kubectl scale statefulset speedvault --replicas 6  # the last two go (their slots move first)
 #
 # Clients in the Kubernetes cluster use speedvault-seed:7000 as their seed
 # (any namespace: speedvault-seed.<namespace>.svc:7000) and are redirected
@@ -10,7 +11,8 @@
 #
 # Pick the image with Kustomize (an overlay, or `kustomize edit set image
 # speedvault=registry.example/speedvault:TAG`); the nodes' size is in
-# nodes.yaml (one CPU, 1 GiB, 75% of it for keys).
+# nodes.yaml (one CPU, 1 GiB, 75% of it for keys). Without replicas (half
+# the pods, no copy of any key): components/no-replicas.
 
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization

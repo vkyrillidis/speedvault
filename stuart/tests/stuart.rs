@@ -52,7 +52,13 @@ impl Stuart {
             .unwrap();
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         wait_until("stuart listens", || TcpStream::connect(addr).is_ok());
-        let stuart = Stuart(child, addr, state.with_extension("log"));
+        let mut stuart = Stuart(child, addr, state.with_extension("log"));
+        if let Err(e) = TcpStream::connect(addr) {
+            thread::sleep(Duration::from_millis(300));
+            let status = stuart.0.try_wait();
+            let log = std::fs::read_to_string(&stuart.2).unwrap_or_default();
+            panic!("stuart on {addr} answered once, then: {e}; the process: {status:?}; its log: {log}");
+        }
         let info = stuart.client().text(&["INFO"]);
         let pid = format!("\r\nprocess_id:{}\r\n", stuart.0.id());
         assert!(info.contains(&pid), "another process listens on {addr}: {info:?}");
@@ -77,11 +83,17 @@ impl Drop for Stuart {
 
 /// A dbnode in cluster mode joining `stuart`, on a thread.
 fn node(stuart: SocketAddr) -> SocketAddr {
+    node_in(stuart, None)
+}
+
+/// A dbnode joining `stuart` from `zone` (`--zone`).
+fn node_in(stuart: SocketAddr, zone: Option<&str>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let config = dbnode::Config {
         cluster: Some(dbnode::Announce { host: "127.0.0.1".into(), port: addr.port() }),
         stuart: Some(stuart.to_string()),
+        zone: zone.map(str::to_string),
         ..dbnode::Config::default()
     };
     thread::spawn(move || dbnode::serve(listener, None, config).unwrap());
@@ -614,7 +626,8 @@ fn slots_move_with_their_keys() {
 fn moves_survive_a_stuart_restart() {
     let dir = temp_dir("move-restart");
     let (port, state) = (free_port(), dir.join("state"));
-    let stuart = Stuart::start(port, &state);
+    // A few slots at a time, so that some still wait when it's killed.
+    let stuart = Stuart::start_with(port, &state, &["--moves-per-source", "8"]);
     let mut s = stuart.client();
     let mut nodes = Vec::new();
     for i in 1..=2 {
@@ -656,20 +669,25 @@ fn moves_survive_a_stuart_restart() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A table a fake node got: its epoch, its MIGRATING section (as slot,
-/// from, to), when it arrived and when the node acknowledged it.
+/// A table a fake node got: its epoch, its moves (as slot, from, to: the
+/// MIGRATING section, then SYNCING), when it arrived and when the node
+/// acknowledged it.
 #[derive(Clone, Debug)]
 struct Pushed {
     epoch: u64,
     migrating: Vec<(String, String, String)>,
     got: Instant,
     acked: Instant,
+    /// Whether the table gives the node slots, and makes it a replica.
+    holds: bool,
+    replica: bool,
 }
 
 /// A fake node that answers like a dbnode for stuart: `CLUSTER MYID`,
-/// `PING`, `CLUSTER PENDING` (always 0: no keys), and `CLUSTER SETTABLE`,
-/// acknowledging a table `delay(epoch)` after it arrived. Every table goes
-/// to `log`.
+/// `PING`, `CLUSTER SETTABLE`, acknowledging a table `delay(epoch)` after
+/// it arrived, and for its moves `CLUSTER SLOTSYNCS` (each source of the last table's moves to
+/// it streaming, at offset 100) and `CLUSTER PAUSESLOTS` (`:100`).
+/// Every table goes to `log`.
 fn slow_node(id: &'static str, delay: fn(u64) -> Duration, log: std::sync::Arc<std::sync::Mutex<Vec<Pushed>>>) -> String {
     slow_node_down(id, delay, log, Default::default())
 }
@@ -686,9 +704,54 @@ type Mem = std::sync::Arc<std::sync::Mutex<String>>;
 
 /// The same, answering `INFO memory` with `memory`.
 fn memory_node(id: &'static str, delay: fn(u64) -> Duration, log: Log, down: std::sync::Arc<std::sync::atomic::AtomicBool>, memory: Mem) -> String {
+    lagging_node(id, delay, log, down, memory, Default::default())
+}
+
+/// How far a fake node is, and what it was asked: its `CLUSTER SLOTSYNCS`
+/// offsets, and its offset in a reply to `CLUSTER FENCE` (a replica's),
+/// are 0 while `behind` is set (else 100), so it never reaches a paused
+/// node's offset (100); its `CLUSTER FENCE` says its copy isn't complete
+/// (still copying) while `copying` is set, or once it answered more than
+/// `complete_fences` of them if that's not 0 (`fences` counts them); its
+/// `CLUSTER PAUSEWRITES` (a primary's, `:100`) that pause, and those that
+/// lift a pause, each also noted in `paused` (when, and whether it
+/// paused). `down` as in [`lagging_node`] (with [`handing_cluster`]).
+/// From epoch `refuse_from` on (0: never) it refuses each table (`-ERR`),
+/// not logged. Its next `behind_pauses` `CLUSTER PAUSESLOTS` (a source's)
+/// answer `-BEHIND`, pausing nothing.
+#[derive(Clone, Default)]
+struct Lag {
+    refuse_from: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    behind_pauses: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    behind: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    copying: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    complete_fences: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    fences: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pauses: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    resumes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    paused: std::sync::Arc<std::sync::Mutex<Vec<(Instant, bool)>>>,
+    down: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Lag {
+    fn behind() -> Lag {
+        let lag = Lag::default();
+        lag.behind.store(true, std::sync::atomic::Ordering::SeqCst);
+        lag
+    }
+
+    fn count(n: &std::sync::atomic::AtomicUsize) -> usize {
+        n.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// The same, as `lag` says.
+fn lagging_node(id: &'static str, delay: fn(u64) -> Duration, log: Log, down: std::sync::Arc<std::sync::atomic::AtomicBool>, memory: Mem, lag: Lag) -> String {
     let fake = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = fake.local_addr().unwrap().port().to_string();
     let is_down = move || down.load(std::sync::atomic::Ordering::SeqCst);
+    // The last table's moves by snapshot to this node, as (slot, from).
+    let syncs: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
     thread::spawn(move || {
         for conn in fake.incoming() {
             let conn = conn.unwrap();
@@ -698,6 +761,8 @@ fn memory_node(id: &'static str, delay: fn(u64) -> Duration, log: Log, down: std
             let log = log.clone();
             let is_down = is_down.clone();
             let memory = memory.clone();
+            let syncs = syncs.clone();
+            let lag = lag.clone();
             thread::spawn(move || {
                 let mut r = BufReader::new(conn.try_clone().unwrap());
                 let mut w = conn;
@@ -717,17 +782,69 @@ fn memory_node(id: &'static str, delay: fn(u64) -> Duration, log: Log, down: std
                     }
                     let reply = match (args[0].as_str(), args.get(1).map(String::as_str)) {
                         ("CLUSTER", Some("MYID")) => format!("$40\r\n{id}\r\n"),
-                        ("CLUSTER", Some("PENDING")) => ":0\r\n".to_string(),
                         ("CLUSTER", Some("SETTABLE")) => {
                             let got = Instant::now();
                             let epoch: u64 = args[2].parse().unwrap();
                             thread::sleep(delay(epoch));
-                            let migrating = match args.iter().position(|a| a == "MIGRATING") {
-                                Some(i) => args[i + 2..].chunks(3).map(|c| (c[0].clone(), c[1].clone(), c[2].clone())).collect(),
-                                None => Vec::new(),
+                            let refuse_from = lag.refuse_from.load(std::sync::atomic::Ordering::SeqCst);
+                            if refuse_from > 0 && epoch >= refuse_from {
+                                if is_down() || w.write_all(b"-ERR refused\r\n").is_err() {
+                                    return;
+                                }
+                                continue;
+                            }
+                            let section = |word: &str| -> Vec<(String, String, String)> {
+                                let Some(i) = args.iter().position(|a| a == word) else { return Vec::new() };
+                                let n: usize = args[i + 1].parse().unwrap();
+                                args[i + 2..i + 2 + 3 * n].chunks(3).map(|c| (c[0].clone(), c[1].clone(), c[2].clone())).collect()
                             };
-                            log.lock().unwrap().push(Pushed { epoch, migrating, got, acked: Instant::now() });
+                            let mut migrating = section("MIGRATING");
+                            let syncing = section("SYNCING");
+                            *syncs.lock().unwrap() = syncing.iter().filter(|m| m.2 == id).map(|m| (m.0.clone(), m.1.clone())).collect();
+                            migrating.extend(syncing);
+                            let holds = section("RANGES").iter().any(|r| r.2 == id);
+                            let replica = args.iter().position(|a| a == "REPLICAS").is_some_and(|i| {
+                                let n: usize = args[i + 1].parse().unwrap();
+                                args[i + 2..i + 2 + 2 * n].chunks(2).any(|c| c[0] == id)
+                            });
+                            log.lock().unwrap().push(Pushed { epoch, migrating, got, acked: Instant::now(), holds, replica });
                             "+OK\r\n".to_string()
+                        }
+                        ("CLUSTER", Some("SLOTSYNCS")) => {
+                            let syncs = syncs.lock().unwrap();
+                            let mut sources: Vec<&String> = syncs.iter().map(|(_, from)| from).collect();
+                            sources.sort();
+                            sources.dedup();
+                            let text: String = sources
+                                .iter()
+                                .map(|from| {
+                                    let slots: Vec<&str> = syncs.iter().filter(|(_, f)| f == *from).map(|(slot, _)| slot.as_str()).collect();
+                                    let offset = if lag.behind.load(std::sync::atomic::Ordering::SeqCst) { 0 } else { 100 };
+                                    format!("{from} streaming {} 0 {offset}\n", slots.join(","))
+                                })
+                                .collect();
+                            format!("${}\r\n{text}\r\n", text.len())
+                        }
+                        ("CLUSTER", Some("PAUSESLOTS")) => {
+                            let behind = lag.behind_pauses.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| n.checked_sub(1));
+                            if behind.is_ok() { "-BEHIND 100000\r\n" } else { ":100\r\n" }.to_string()
+                        }
+                        ("CLUSTER", Some("PAUSEWRITES")) if args[2] == "0" => {
+                            lag.resumes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            lag.paused.lock().unwrap().push((Instant::now(), false));
+                            "+OK\r\n".to_string()
+                        }
+                        ("CLUSTER", Some("PAUSEWRITES")) => {
+                            lag.pauses.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            lag.paused.lock().unwrap().push((Instant::now(), true));
+                            ":100\r\n".to_string()
+                        }
+                        ("CLUSTER", Some("FENCE")) => {
+                            let offset = if lag.behind.load(std::sync::atomic::Ordering::SeqCst) { 0 } else { 100 };
+                            let n = lag.fences.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                            let limit = Lag::count(&lag.complete_fences);
+                            let complete = !lag.copying.load(std::sync::atomic::Ordering::SeqCst) && (limit == 0 || n <= limit);
+                            format!("*2\r\n:{offset}\r\n:{}\r\n", u8::from(complete))
                         }
                         ("INFO", _) if !memory.lock().unwrap().is_empty() => {
                             let text = memory.lock().unwrap().clone();
@@ -771,23 +888,26 @@ fn slow_cluster(s: &mut Client, delays: &[fn(u64) -> Duration]) -> Vec<Log> {
     logs
 }
 
-/// A table that starts or ends a move reaches the target first: the
-/// source and the others get it only once the target took it, slow as it
-/// is (here half a second per table).
+/// The table starting a move reaches the source first (it accepts the
+/// target's copy), the one ending it the target first: the others get each
+/// only once that node took it, slow as it is (here half a second per
+/// table).
 #[test]
-fn the_target_takes_each_table_first() {
+fn each_table_reaches_its_first_node_first() {
     let dir = temp_dir("first");
     let stuart = Stuart::start(free_port(), &dir.join("state"));
     let mut s = stuart.client();
-    let logs = slow_cluster(&mut s, &[|_| Duration::ZERO, |e| if e > 1 { Duration::from_millis(500) } else { Duration::ZERO }, |_| Duration::ZERO]);
+    // Both A and B slow, so that the order shows.
+    let slow: fn(u64) -> Duration = |e| if e > 1 { Duration::from_millis(500) } else { Duration::ZERO };
+    let logs = slow_cluster(&mut s, &[slow, slow, |_| Duration::ZERO]);
     // 0-5460 are A's: slot 5 moves to B.
     assert_eq!(s.text(&["STUART", "MOVE", "5", "5", B]), ":1");
-    wait_until("the move is done", || s.text(&["STUART", "MIGRATIONS"]).is_empty() && got(&logs[0], 3).is_some());
-    for epoch in [2, 3] {
-        let at_b = got(&logs[1], epoch).unwrap();
-        for (other, log) in [("A", &logs[0]), ("C", &logs[2])] {
+    wait_until("the move is done", || s.text(&["STUART", "MIGRATIONS"]).is_empty() && got(&logs[0], 3).is_some() && got(&logs[2], 3).is_some());
+    for (epoch, first) in [(2, 0), (3, 1)] {
+        let at_first = got(&logs[first], epoch).unwrap();
+        for (other, log) in [("A", &logs[0]), ("B", &logs[1]), ("C", &logs[2])].into_iter().enumerate().filter(|(i, _)| *i != first).map(|(_, o)| o) {
             let p = got(log, epoch).unwrap_or_else(|| panic!("{other} never got epoch {epoch}"));
-            assert!(p.got >= at_b.acked, "{other} got epoch {epoch} before B took it");
+            assert!(p.got >= at_first.acked, "{other} got epoch {epoch} before node {first} took it");
         }
     }
     assert_eq!(got(&logs[1], 2).unwrap().migrating, [("5".to_string(), A.to_string(), B.to_string())]);
@@ -906,7 +1026,9 @@ fn rebalance_then_drain() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let written = writer.join().unwrap();
 
-    assert_eq!(Client::connect(nodes[0]).text(&["DBSIZE"]), ":0", "the drained node has no keys");
+    // The drained node trims its keys once it took the last table.
+    let mut drained = Client::connect(nodes[0]);
+    wait_until("the drained node has no keys", || drained.text(&["DBSIZE"]) == ":0");
     let mut f = Follower::new(nodes[1]);
     for (k, n) in keys.iter().zip(&written) {
         assert_eq!(f.text(&["GET", k]), n.to_string(), "{k}");
@@ -995,22 +1117,20 @@ fn auto_grows_and_shrinks() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A target that goes down holds up only its own moves: a table that must
-/// reach it first reaches the others after a while, its moves stop
-/// counting against `--moves-per-source`, and other moves out of the same
-/// source go on.
+/// By snapshot, the moves to a target that goes down are called off and
+/// queued again (the source serves the slots all along), and the other
+/// moves out of the same source go on; back, it gets them.
 #[test]
-fn a_target_down_holds_up_only_its_moves() {
-    let dir = temp_dir("target-down");
+fn a_target_down_has_its_moves_by_snapshot_called_off() {
+    let dir = temp_dir("target-down-sync");
     let stuart = Stuart::start_with(free_port(), &dir.join("state"), &["--moves-per-source", "2"]);
     let mut s = stuart.client();
     let down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut logs = Vec::new();
+    let a_log: Log = Default::default();
     for (id, delay) in [(A, (|_| Duration::ZERO) as fn(u64) -> Duration), (B, |_| Duration::ZERO), (C, |e| if e >= 2 { Duration::from_secs(1) } else { Duration::ZERO })] {
-        let log: Log = Default::default();
-        let port = slow_node_down(id, delay, log.clone(), if id == C { down.clone() } else { Default::default() });
+        let log = if id == A { a_log.clone() } else { Default::default() };
+        let port = slow_node_down(id, delay, log, if id == C { down.clone() } else { Default::default() });
         assert_eq!(s.text(&["STUART", "JOIN", id, "127.0.0.1", &port]), "+OK");
-        logs.push(log);
     }
     assert_eq!(s.text(&["STUART", "CREATE"]), "+OK");
     wait_until("they took the table", || up_and_acked(&mut s, 1) == 3);
@@ -1018,22 +1138,289 @@ fn a_target_down_holds_up_only_its_moves() {
     assert_eq!(s.text(&["STUART", "MOVE", "0", "1", C]), ":2");
     thread::sleep(Duration::from_millis(300));
     down.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(a_log.lock().unwrap().iter().any(|p| p.migrating.iter().any(|m| m.2 == C)), "the moves to C started");
     wait_until("C is down", || s.text(&["STUART", "NODES"]).lines().any(|l| l.starts_with(C) && l.contains(" down ")));
-    // Four more of A's slots, to B: they move, with C's two still under way.
     assert_eq!(s.text(&["STUART", "MOVE", "2", "5", B]), ":4");
     wait_until_long("A's slots reached B", Duration::from_secs(30), || {
         let t = s.text(&["STUART", "TABLE"]);
         t.lines().any(|l| l.starts_with(B) && l.contains(" 2-5 "))
     });
     let m = s.text(&["STUART", "MIGRATIONS"]);
-    assert_eq!(m.lines().filter(|l| l.contains(&format!("-> {C}"))).count(), 2, "{m}");
-    for log in &logs[..2] {
-        let with_c = log.lock().unwrap().iter().any(|p| p.migrating.iter().any(|m| m.2 == C));
-        assert!(with_c, "A and B got the tables C had to take first");
-    }
-    // C comes back: its moves end.
+    assert_eq!(m.lines().filter(|l| l.contains(&format!("-> {C}"))).count(), 0, "{m}");
+    assert!(m.contains("queued: 2"), "{m}");
+    // C comes back: its moves start and end.
     down.store(false, std::sync::atomic::Ordering::SeqCst);
-    wait_until("C's moves ended", || s.text(&["STUART", "MIGRATIONS"]).is_empty());
+    wait_until_long("C's moves ended", Duration::from_secs(20), || s.text(&["STUART", "MIGRATIONS"]).is_empty());
+    let t = s.text(&["STUART", "TABLE"]);
+    assert!(t.lines().any(|l| l.starts_with(C) && l.contains(" 0-1 ")), "{t}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// By snapshot, the cutover waits for the target to reach the offset the
+/// paused source answered: a target behind gets no table giving it the
+/// slot, and the pauses it misses are tried again (up to five before the
+/// move is called off); once it catches up, the slot is its.
+#[test]
+fn the_cutover_waits_for_the_target_to_catch_up() {
+    let dir = temp_dir("catch-up");
+    let stuart = Stuart::start(free_port(), &dir.join("state"));
+    let mut s = stuart.client();
+    let behind = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    for id in [A, B] {
+        let b = if id == B { behind.clone() } else { Default::default() };
+        let port = lagging_node(id, |_| Duration::ZERO, Default::default(), Default::default(), Default::default(), Lag { behind: b, ..Lag::default() });
+        assert_eq!(s.text(&["STUART", "JOIN", id, "127.0.0.1", &port]), "+OK");
+    }
+    assert_eq!(s.text(&["STUART", "CREATE"]), "+OK");
+    wait_until("they took the table", || up_and_acked(&mut s, 1) == 2);
+    assert_eq!(s.text(&["STUART", "MOVE", "5", "5", B]), ":1");
+    // Two pauses missed (a second each), the slot still A's.
+    thread::sleep(Duration::from_millis(2500));
+    let m = s.text(&["STUART", "MIGRATIONS"]);
+    assert!(m.starts_with(&format!("5 {A} -> {B}")), "{m}");
+    behind.store(false, std::sync::atomic::Ordering::SeqCst);
+    wait_until("the slot moved", || s.text(&["STUART", "MIGRATIONS"]).is_empty());
+    let t = s.text(&["STUART", "TABLE"]);
+    assert!(t.lines().any(|l| l.starts_with(B) && l.contains(" 5 ")), "{t}");
+    let log = std::fs::read_to_string(&stuart.2).unwrap();
+    assert!(!log.contains("called off"), "{log}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A source answering `-BEHIND` (its target too far behind to pause for)
+/// paused nothing: that isn't a pause missed, however many times; the move
+/// goes on, not called off, once the target is close enough.
+#[test]
+fn a_source_s_behind_is_not_a_missed_pause() {
+    let dir = temp_dir("behind");
+    let stuart = Stuart::start(free_port(), &dir.join("state"));
+    let mut s = stuart.client();
+    let a = Lag::default();
+    a.behind_pauses.store(7, std::sync::atomic::Ordering::SeqCst);
+    for (id, lag) in [(A, a.clone()), (B, Lag::default())] {
+        let port = lagging_node(id, |_| Duration::ZERO, Default::default(), Default::default(), Default::default(), lag);
+        assert_eq!(s.text(&["STUART", "JOIN", id, "127.0.0.1", &port]), "+OK");
+    }
+    assert_eq!(s.text(&["STUART", "CREATE"]), "+OK");
+    wait_until("they took the table", || up_and_acked(&mut s, 1) == 2);
+    assert_eq!(s.text(&["STUART", "MOVE", "5", "5", B]), ":1");
+    wait_until("the slot moved", || s.text(&["STUART", "MIGRATIONS"]).is_empty());
+    assert_eq!(Lag::count(&a.behind_pauses), 0, "A answered -BEHIND each time");
+    let t = s.text(&["STUART", "TABLE"]);
+    assert!(t.lines().any(|l| l.starts_with(B) && l.contains(" 5 ")), "{t}");
+    let log = std::fs::read_to_string(&stuart.2).unwrap();
+    assert!(!log.contains("called off"), "{log}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A, B and C (fake nodes), slot 5 moved from A to B; B takes the tables
+/// from epoch 3 (the cutover) on as `delay`, `down` and `lag` say. Returns
+/// once the cutover table is made, B maybe yet to take it.
+fn cut_over_to_b(name: &str, delay: fn(u64) -> Duration, down: std::sync::Arc<std::sync::atomic::AtomicBool>, lag: Lag) -> (Stuart, PathBuf, Vec<Log>) {
+    let dir = temp_dir(name);
+    let stuart = Stuart::start(free_port(), &dir.join("state"));
+    let mut s = stuart.client();
+    let mut logs = Vec::new();
+    for id in [A, B, C] {
+        let log: Log = Default::default();
+        let port = if id == B {
+            lagging_node(id, delay, log.clone(), down.clone(), Default::default(), lag.clone())
+        } else {
+            lagging_node(id, |_| Duration::ZERO, log.clone(), Default::default(), Default::default(), Default::default())
+        };
+        assert_eq!(s.text(&["STUART", "JOIN", id, "127.0.0.1", &port]), "+OK");
+        logs.push(log);
+    }
+    assert_eq!(s.text(&["STUART", "CREATE"]), "+OK");
+    wait_until("they took the table", || up_and_acked(&mut s, 1) == 3);
+    assert_eq!(s.text(&["STUART", "MOVE", "5", "5", B]), ":1");
+    wait_until("the cutover table", || epoch_of(&mut s) >= 3 && s.text(&["STUART", "MIGRATIONS"]).is_empty());
+    (stuart, dir, logs)
+}
+
+/// The table after a cutover still waits for its target: here the source
+/// starts its next move (a table that goes to the source first) while the
+/// target is slow to take the cutover. Were the source to take it, it
+/// would send clients to the target, and the target back to it. (The next
+/// move is asked for once the cutover table is made: moves the mover can
+/// start then start in the cutover table itself.)
+#[test]
+fn the_next_table_waits_for_the_cutover_s_target() {
+    let delay: fn(u64) -> Duration = |e| if e >= 3 { Duration::from_millis(500) } else { Duration::ZERO };
+    let (stuart, dir, logs) = cut_over_to_b("cutover-first", delay, Default::default(), Default::default());
+    let mut s = stuart.client();
+    // Slot 6 (A's too) to C: a table that goes to A first.
+    assert_eq!(s.text(&["STUART", "MOVE", "6", "6", C]), ":1");
+    wait_until("the moves are done", || epoch_of(&mut s) >= 5 && s.text(&["STUART", "MIGRATIONS"]).is_empty());
+    wait_until("A has the last table", || {
+        let last = epoch_of(&mut s);
+        got(&logs[0], last).is_some()
+    });
+    let moving = |p: &Pushed| p.migrating.iter().any(|m| m.0 == "5");
+    let started = logs[0].lock().unwrap().iter().find(|p| moving(p)).map(|p| p.epoch).expect("A got the move of slot 5");
+    let b = logs[1].lock().unwrap().clone();
+    for p in logs[0].lock().unwrap().iter().filter(|p| p.epoch > started && !moving(p)) {
+        assert!(
+            b.iter().any(|q| q.epoch > started && !moving(q) && q.acked <= p.got),
+            "A got epoch {} (slot 5 B's) before B took a table giving it slot 5",
+            p.epoch
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `f`'s value once it has one, waiting up to 10 s.
+fn wait_until_value<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(v) = f() {
+            return v;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// When `log`'s node got the table with `epoch`, waiting up to `within`.
+fn got_within(log: &Log, epoch: u64, within: Duration) -> Option<Instant> {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        if let Some(p) = got(log, epoch) {
+            return Some(p.got);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    None
+}
+
+/// A target that refuses the cutover table (up, but it never takes it) is
+/// waited for 2 s at most (`FIRST_WAIT`): the next table then goes on.
+#[test]
+fn an_owed_table_is_waited_for_two_seconds_at_most() {
+    let lag = Lag::default();
+    lag.refuse_from.store(3, std::sync::atomic::Ordering::SeqCst);
+    let (stuart, dir, logs) = cut_over_to_b("owed-lapse", |_| Duration::ZERO, Default::default(), lag);
+    let mut s = stuart.client();
+    let cut = epoch_of(&mut s);
+    let asked = Instant::now();
+    assert_eq!(s.text(&["STUART", "MOVE", "6", "6", C]), ":1");
+    let at = got_within(&logs[0], cut + 1, Duration::from_secs(10)).expect("A got the next table within 10 s");
+    let waited = at - asked;
+    assert!(waited >= Duration::from_millis(1500), "A got epoch {} {waited:?} after it was made: B owed epoch {cut}", cut + 1);
+    assert!(waited <= Duration::from_millis(4000), "A got epoch {} only {waited:?} after it was made", cut + 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A target down before it took the cutover table isn't waited for: the
+/// next table goes on at once.
+#[test]
+fn an_owed_table_of_a_node_down_is_not_waited_for() {
+    let down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // B takes 300 ms to answer the cutover table, and by then it's down:
+    // it closes the connection without an answer.
+    let delay: fn(u64) -> Duration = |e| if e >= 3 { Duration::from_millis(300) } else { Duration::ZERO };
+    let (stuart, dir, logs) = cut_over_to_b("owed-down", delay, down.clone(), Lag::default());
+    down.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut s = stuart.client();
+    let cut = epoch_of(&mut s);
+    let asked = Instant::now();
+    assert_eq!(s.text(&["STUART", "MOVE", "6", "6", C]), ":1");
+    let at = got_within(&logs[0], cut + 1, Duration::from_secs(10)).expect("A got the next table within 10 s");
+    assert!(at - asked <= Duration::from_millis(1200), "A got epoch {} {:?} after it was made, B down", cut + 1, at - asked);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// For the test below: C and E take tables slowly once set.
+static SLOW_DEMOTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn slow_demotion(_: u64) -> Duration {
+    if SLOW_DEMOTION.load(std::sync::atomic::Ordering::SeqCst) {
+        Duration::from_millis(300)
+    } else {
+        Duration::ZERO
+    }
+}
+
+/// While a primary is being demoted, a node leaving needs room on the
+/// other primaries: the one being demoted has none to give (its slots go).
+#[test]
+fn a_leave_during_a_demotion_has_no_room_on_the_demoted_one() {
+    let dir = temp_dir("demote-leave-room");
+    let stuart = Stuart::start_with(free_port(), &dir.join("state"), &["--auto", "--replicas", "1"]);
+    let mut s = stuart.client();
+    // No limit at first, so that the demotion starts; C and E slow to take
+    // tables from before it starts, so that it lasts.
+    let (_, [a, c, e]) = demoting_cluster(&mut s, mem(100, 0, 50), slow_demotion);
+    SLOW_DEMOTION.store(true, std::sync::atomic::Ordering::SeqCst);
+    let demoted = wait_until_value("C or E being demoted", || {
+        let nodes = s.text(&["STUART", "NODES"]);
+        [C, E].into_iter().find(|x| nodes.lines().any(|l| l.starts_with(x) && l.contains(" demoting")))
+    });
+    let (kept, kept_mem, demoted_mem) = if demoted == C { (E, &e, &c) } else { (C, &c, &e) };
+    // 400 bytes of room below 90% on A and on the one being demoted, 500
+    // of keys on the other: only A counts.
+    *a.lock().unwrap() = mem(500, 1000, 400);
+    *demoted_mem.lock().unwrap() = mem(500, 1000, 400);
+    *kept_mem.lock().unwrap() = mem(600, 1000, 500);
+    wait_until("stuart read their memory", || {
+        let nodes = s.text(&["STUART", "NODES"]);
+        [(A, 500), (demoted, 500), (kept, 600)].iter().all(|(id, used)| nodes.lines().any(|l| l.starts_with(id) && l.contains(&format!(" used={used} max=1000"))))
+    });
+    let reply = s.text(&["STUART", "LEAVE", kept]);
+    let nodes = s.text(&["STUART", "NODES"]);
+    SLOW_DEMOTION.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(nodes.contains(" demoting"), "the demotion ended before the LEAVE: {nodes}");
+    assert!(reply.starts_with("-ERR Not enough memory") && reply.contains(" the others have 400 "), "{reply}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// For the test below: C takes the tables from this epoch on 300 ms
+/// after it got them (0: at once).
+static C_SLOW_FROM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn c_slow(epoch: u64) -> Duration {
+    let from = C_SLOW_FROM.load(std::sync::atomic::Ordering::SeqCst);
+    if from > 0 && epoch >= from {
+        Duration::from_millis(300)
+    } else {
+        Duration::ZERO
+    }
+}
+
+/// A node that left, lingering, gets the tables that follow in their
+/// order, as the others do: a cutover only once its target took it (else
+/// it would send clients to a target that doesn't serve the slots yet).
+#[test]
+fn a_node_that_left_gets_a_cutover_after_its_target() {
+    let dir = temp_dir("left-cutover");
+    let stuart = Stuart::start_with(free_port(), &dir.join("state"), &["--moves-per-source", "10000", "--max-moves", "10000"]);
+    let mut s = stuart.client();
+    let mut logs = Vec::new();
+    for id in [A, B, C] {
+        let log: Log = Default::default();
+        let delay: fn(u64) -> Duration = if id == C { c_slow } else { |_| Duration::ZERO };
+        let port = lagging_node(id, delay, log.clone(), Default::default(), Default::default(), Default::default());
+        assert_eq!(s.text(&["STUART", "JOIN", id, "127.0.0.1", &port]), "+OK");
+        logs.push(log);
+    }
+    assert_eq!(s.text(&["STUART", "CREATE"]), "+OK");
+    wait_until("they took the table", || up_and_acked(&mut s, 1) == 3);
+    s.text(&["STUART", "LEAVE", A]);
+    wait_until_long("A left", Duration::from_secs(30), || s.text(&["STUART", "LEAVE", A]) == ":0");
+    let removed = epoch_of(&mut s);
+    wait_until("A took the table it was removed with", || got(&logs[0], removed).is_some());
+    // B drained to C, slow from now on: a table starting the moves (B's
+    // first), then the cutover (C's first).
+    C_SLOW_FROM.store(removed + 1, std::sync::atomic::Ordering::SeqCst);
+    s.text(&["STUART", "LEAVE", B]);
+    let cutover = wait_until_value("the cutover", || {
+        let c = logs[2].lock().unwrap().clone();
+        c.windows(2).find(|w| w[0].epoch > removed && !w[0].migrating.is_empty() && w[1].migrating.is_empty()).map(|w| w[1].epoch)
+    });
+    let at = got_within(&logs[0], cutover, Duration::from_secs(10)).expect("A, lingering, got the cutover");
+    let c = got(&logs[2], cutover).unwrap();
+    C_SLOW_FROM.store(0, std::sync::atomic::Ordering::SeqCst);
+    assert!(at >= c.acked, "A got epoch {cutover} {:?} before C, its target, took it", c.acked - at);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1047,10 +1434,48 @@ fn a_node_leaves_once_it_took_its_last_table() {
     let mut s = stuart.client();
     let logs = slow_cluster(&mut s, &[|e| if e >= 2 { Duration::from_millis(300) } else { Duration::ZERO }, |_| Duration::ZERO]);
     assert_eq!(s.text(&["STUART", "LEAVE", A]), ":8193");
-    wait_until("A left", || s.text(&["STUART", "LEAVE", A]) == ":0");
+    wait_until_long("A left", Duration::from_secs(30), || s.text(&["STUART", "LEAVE", A]) == ":0");
     let epoch = epoch_of(&mut s);
     assert!(got(&logs[0], epoch - 1).is_some(), "A was removed in epoch {epoch} before it took epoch {}", epoch - 1);
     assert_eq!(slot_counts(&mut s), [16384]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A node that left gets the tables that follow while it lingers (here:
+/// for good, it never exits), listed in them owning nothing: it advertises
+/// where its slots are now, not the table it was removed with.
+#[test]
+fn a_node_that_left_gets_the_tables_that_follow() {
+    let dir = temp_dir("left-tables");
+    let stuart = Stuart::start(free_port(), &dir.join("state"));
+    let mut s = stuart.client();
+    let (a, _b) = (node(stuart.1), node(stuart.1));
+    wait_until("both joined", || s.text(&["STUART", "NODES"]).lines().count() == 2);
+    assert_eq!(s.text(&["STUART", "CREATE"]), "+OK");
+    let id_a = id_of(a);
+    assert_eq!(s.text(&["STUART", "LEAVE", &id_a]), ":8193");
+    wait_until_long("A left", Duration::from_secs(30), || s.text(&["STUART", "LEAVE", &id_a]) == ":0");
+    let mut c = Client::connect(a);
+    let removed = epoch_of(&mut s);
+    wait_until("A took the table it was removed with, and itself", || epoch_of(&mut c) == removed);
+    let nodes = c.text(&["CLUSTER", "NODES"]);
+    assert_eq!(nodes.lines().count(), 2, "{nodes}");
+    assert!(nodes.lines().any(|l| l.starts_with(&id_a) && l.contains("myself,master") && !l.contains("connected 0-")), "{nodes}");
+    assert!(nodes.contains("connected 0-16383"), "{nodes}");
+
+    // The next tables reach it too: a node joining, slots moving to it.
+    let d = node(stuart.1);
+    let id_d = id_of(d);
+    wait_until("D joined", || s.text(&["STUART", "NODES"]).contains(&id_d));
+    assert_eq!(s.text(&["STUART", "MOVE", "0", "99", &id_d]), ":100");
+    wait_until("the move ended", || slot_counts(&mut s).contains(&100));
+    wait_until("A took the last table", || epoch_of(&mut c) == epoch_of(&mut s));
+    let nodes = c.text(&["CLUSTER", "NODES"]);
+    assert_eq!(nodes.lines().count(), 3, "{nodes}");
+    assert!(nodes.lines().any(|l| l.starts_with(&id_d) && l.ends_with(" 0-99")), "{nodes}");
+    let key = &keys_in(0..=99, 1)[0];
+    assert_eq!(c.text(&["GET", key]), format!("-MOVED {} {d}", cluster::key_hash_slot(key.as_bytes())));
+    assert!(s.text(&["INFO"]).contains("\r\nstuart_keepers:3\r\n"), "A's keeper lingers");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1066,47 +1491,14 @@ fn auto_hands_out_lost_slots() {
     let b = slow_node(B, |_| Duration::ZERO, Default::default());
     assert_eq!(s.text(&["STUART", "JOIN", A, "127.0.0.1", &a]), "+OK");
     assert_eq!(s.text(&["STUART", "JOIN", B, "127.0.0.1", &b]), "+OK");
-    wait_until("A and B even", || slot_counts(&mut s) == [8192, 8192] && s.text(&["STUART", "MIGRATIONS"]).is_empty());
+    wait_until_long("A and B even", Duration::from_secs(30), || slot_counts(&mut s) == [8192, 8192] && s.text(&["STUART", "MIGRATIONS"]).is_empty());
     // C joins at A's address: A is replaced, its 8192 slots lost. (A's fake
     // still answers there, so C is down; it gets the slots all the same.)
     assert_eq!(s.text(&["STUART", "JOIN", C, "127.0.0.1", &a]), "+OK");
-    wait_until("the lost slots given out, and the nodes even", || {
+    wait_until_long("the lost slots given out, and the nodes even", Duration::from_secs(30), || {
         let nodes = s.text(&["STUART", "NODES"]);
         !nodes.contains("unassigned") && slot_counts(&mut s) == [8192, 8192] && s.text(&["STUART", "MIGRATIONS"]).is_empty()
     });
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-/// A table that starts moves to B and to C, C going down before it took
-/// it: A, the source, gets it once C has been down a while, so that the
-/// move to B can end (it waits for the source to take the table).
-#[test]
-fn a_table_for_a_down_target_reaches_the_others_later() {
-    let dir = temp_dir("first-down");
-    let state = dir.join("state");
-    let down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut ports = Vec::new();
-    for id in [A, B, C] {
-        let delay: fn(u64) -> Duration = if id == C { |e| if e >= 2 { Duration::from_secs(1) } else { Duration::ZERO } } else { |_| Duration::ZERO };
-        ports.push(slow_node_down(id, delay, Default::default(), if id == C { down.clone() } else { Default::default() }));
-    }
-    // Both moves queued before stuart starts: one table starts them.
-    let text = format!(
-        "stuart-state 1\nnode {A} 127.0.0.1 {}\nnode {B} 127.0.0.1 {}\nnode {C} 127.0.0.1 {}\ntable 1\n\
-         range 0 5460 {A}\nrange 5461 10922 {B}\nrange 10923 16383 {C}\nqueue 0 {C}\nqueue 1 {B}\n",
-        ports[0], ports[1], ports[2]
-    );
-    std::fs::write(&state, text).unwrap();
-    let stuart = Stuart::start(free_port(), &state);
-    let mut s = stuart.client();
-    wait_until("both moves started", || s.text(&["STUART", "MIGRATIONS"]).lines().count() == 2);
-    thread::sleep(Duration::from_millis(300));
-    down.store(true, std::sync::atomic::Ordering::SeqCst);
-    let started = Instant::now();
-    wait_until("slot 1 is B's", || s.text(&["STUART", "TABLE"]).lines().any(|l| l.starts_with(B) && l.contains(" 1 ")));
-    eprintln!("slot 1 moved {:?} after C went down", started.elapsed());
-    let m = s.text(&["STUART", "MIGRATIONS"]);
-    assert!(m.starts_with(&format!("0 {A} -> {C} ")), "{m}");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1201,7 +1593,7 @@ fn leaving_needs_room_on_the_others() {
     // B without a limit: room for anything.
     *b.lock().unwrap() = mem(500, 0, 400);
     wait_until("A may leave", || s.text(&["STUART", "LEAVE", A]) == ":8193");
-    wait_until("A left", || s.text(&["STUART", "LEAVE", A]) == ":0");
+    wait_until_long("A left", Duration::from_secs(30), || s.text(&["STUART", "LEAVE", A]) == ":0");
     // The last node leaving is a shutdown: nowhere to check.
     *b.lock().unwrap() = mem(950, 1000, 900);
     assert_eq!(s.text(&["STUART", "LEAVE", B]), ":0");
@@ -1242,7 +1634,12 @@ fn stuart_s_metrics() {
     let m = scrape(http);
     let info = format!("stuart_info{{version=\"{}\",auto=\"1\"}}", env!("CARGO_PKG_VERSION"));
     let fresh: Vec<(&str, f64)> = vec![
+        ("stuart_demotions_total", 0.0),
+        ("stuart_failovers_total", 0.0),
+        ("stuart_handovers_total", 0.0),
+        ("stuart_nodes{state=\"demoting\"}", 0.0),
         ("stuart_nodes{state=\"down\"}", 0.0),
+        ("stuart_nodes{state=\"failed\"}", 0.0),
         ("stuart_nodes{state=\"full\"}", 0.0),
         ("stuart_nodes{state=\"leaving\"}", 0.0),
         ("stuart_nodes{state=\"up\"}", 0.0),
@@ -1376,4 +1773,857 @@ fn sigterm_lingers_for_the_nodes_stopping_too() {
         assert!(after < Duration::from_millis(500), "SIGTERM then SIG{second}: {after:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+/// `--replicas 1 --auto`: nodes joining one by one are a primary, its
+/// replica (on another zone if there is a primary there), a primary, its
+/// replica; the slots go to the primaries; the replicas redirect every key
+/// and say so in `ROLE` and `CLUSTER NODES`; a restart keeps the roles.
+#[test]
+fn replicas_are_assigned_as_nodes_join() {
+    let dir = temp_dir("replicas");
+    let state = dir.join("state");
+    let port = free_port();
+    let stuart = Stuart::start_with(port, &state, &["--auto", "--replicas", "1"]);
+    let mut s = stuart.client();
+    let mut ids = Vec::new();
+    let mut addrs = Vec::new();
+    for (i, zone) in ["w1", "w1", "w2", "w1"].into_iter().enumerate() {
+        let addr = node_in(stuart.1, Some(zone));
+        wait_until("the node joins", || s.text(&["STUART", "NODES"]).lines().filter(|l| l.contains(" up ")).count() == i + 1);
+        ids.push(id_of(addr));
+        addrs.push(addr);
+    }
+    // Every node has the last table, and the slots have moved.
+    wait_until_long("the slots are even", Duration::from_secs(30), || {
+        let epoch = epoch_of(&mut s);
+        let nodes = s.text(&["STUART", "NODES"]);
+        up_and_acked(&mut s, epoch) == 4 && nodes.contains(" slots=8192 ") && s.text(&["STUART", "MIGRATIONS"]).is_empty()
+    });
+    let nodes = s.text(&["STUART", "NODES"]);
+    let line = |i: usize| nodes.lines().find(|l| l.starts_with(&ids[i])).unwrap().to_string();
+    assert!(line(0).contains(" slots=8192 ") && !line(0).contains("replica-of") && line(0).contains(" zone=w1"), "{nodes}");
+    assert!(line(1).contains(&format!(" slots=0 replica-of={} zone=w1", ids[0])), "{nodes}");
+    assert!(line(2).contains(" slots=8192 ") && !line(2).contains("replica-of"), "{nodes}");
+    // Node 2 (w2) is the only primary without one.
+    assert!(line(3).contains(&format!(" slots=0 replica-of={} zone=w1", ids[2])), "{nodes}");
+
+    // The replicas, as clients see them.
+    let mut b = Client::connect(addrs[1]);
+    // It syncs from its primary (phase 8 milestone 3).
+    let want = format!("*5\r\n$5\r\nslave\r\n$9\r\n127.0.0.1\r\n:{}\r\n$9\r\nconnected\r\n:", addrs[0].port());
+    wait_until("the replica syncs", || String::from_utf8(b.call(&["ROLE"])).unwrap().starts_with(&want));
+    let cluster_nodes = b.text(&["CLUSTER", "NODES"]);
+    assert!(cluster_nodes.contains(&format!("{} 127.0.0.1:{p}@{p} myself,slave {} ", ids[1], ids[0], p = addrs[1].port())), "{cluster_nodes}");
+    assert_eq!(cluster_nodes.matches(" slave ").count(), 1, "{cluster_nodes}");
+    assert_eq!(b.text(&["READONLY"]), "+OK");
+    let moved = b.text(&["GET", "foo"]);
+    assert!(moved.starts_with("-MOVED 12182 127.0.0.1:"), "{moved}");
+    let mut a = Client::connect(addrs[0]);
+    assert_eq!(a.text(&["ROLE"]), "*3");
+    // CLUSTER SLOTS, here and at stuart: each primary with its replica,
+    // once stuart has read the replicas' offsets (past 0 since the copy,
+    // or the primary's first PING) and pushed them.
+    for c in [&mut a, &mut s] {
+        wait_until("the replicas in CLUSTER SLOTS", || {
+            let slots = String::from_utf8(c.call(&["CLUSTER", "SLOTS"])).unwrap();
+            slots.starts_with("*2\r\n*4\r\n") && slots.contains(&ids[1]) && slots.contains(&ids[3])
+        });
+    }
+    let shards = String::from_utf8(s.call(&["CLUSTER", "SHARDS"])).unwrap();
+    assert_eq!(shards.matches("$7\r\nreplica\r\n").count(), 2, "{shards}");
+    assert_eq!(shards.matches("$7\r\nloading\r\n").count(), 0, "{shards}");
+
+    // The roles are in the state file.
+    let epoch = epoch_of(&mut s);
+    drop(s);
+    drop(stuart);
+    let stuart = Stuart::start_with(port, &state, &["--auto", "--replicas", "1"]);
+    let mut s = stuart.client();
+    assert_eq!(epoch_of(&mut s), epoch);
+    assert!(s.text(&["STUART", "NODES"]).contains(&format!(" replica-of={} zone=w1", ids[0])));
+
+    // JOIN's options.
+    let x = "e".repeat(40);
+    assert_eq!(s.text(&["STUART", "JOIN", &x, "127.0.0.1", "1", "ZONE", "a", "ZONE", "b"]), "-ERR syntax error");
+    assert_eq!(s.text(&["STUART", "JOIN", &x, "127.0.0.1", "1", "NAME", "a", "NAME", "b"]), "-ERR syntax error");
+    assert_eq!(s.text(&["STUART", "JOIN", &x, "127.0.0.1", "1", "PLACE", "a"]), "-ERR syntax error");
+    assert_eq!(s.text(&["STUART", "JOIN", &x, "127.0.0.1", "1", "ZONE", "a b"]), "-ERR Invalid zone 'a b'");
+    assert_eq!(s.text(&["STUART", "JOIN", &x, "127.0.0.1", "1", "zone", "w3", "name", "pod-x"]), "+OK");
+    let nodes = s.text(&["STUART", "NODES"]);
+    assert!(nodes.lines().any(|l| l.starts_with(&x) && l.contains(" name=pod-x zone=w3")), "{nodes}");
+}
+
+/// A dbnode joining `stuart` that announces a proxy's address: once the
+/// proxy is cut, nobody reaches the node (stuart, clients), while it runs
+/// on and its own connections (to its primary) carry on.
+struct Behind {
+    addr: SocketAddr,
+    /// Where the node itself listens: not cut.
+    real: SocketAddr,
+    cut: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Cut too, but for the replication link (a connection whose first
+    /// command is REPLSYNC): stuart and clients can't reach the node, its
+    /// replica can.
+    isolated: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Each connection's two ends, and whether it is a replication link.
+    conns: std::sync::Arc<std::sync::Mutex<Vec<(TcpStream, TcpStream, bool)>>>,
+}
+
+impl Behind {
+    fn node(stuart: SocketAddr) -> Behind {
+        Behind::named(stuart, None)
+    }
+
+    fn named(stuart: SocketAddr, name: Option<&str>) -> Behind {
+        use std::sync::atomic::Ordering;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let real = listener.local_addr().unwrap();
+        let front = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = front.local_addr().unwrap();
+        let config = dbnode::Config {
+            cluster: Some(dbnode::Announce { host: "127.0.0.1".into(), port: addr.port() }),
+            stuart: Some(stuart.to_string()),
+            name: name.map(str::to_string),
+            ..dbnode::Config::default()
+        };
+        thread::spawn(move || dbnode::serve(listener, None, config).unwrap());
+        let behind = Behind { addr, real, cut: Default::default(), isolated: Default::default(), conns: Default::default() };
+        let (cut, isolated, conns) = (behind.cut.clone(), behind.isolated.clone(), behind.conns.clone());
+        thread::spawn(move || {
+            for client in front.incoming() {
+                let Ok(mut client) = client else { continue };
+                let (cut, isolated, conns) = (cut.clone(), isolated.clone(), conns.clone());
+                thread::spawn(move || {
+                    // Its first command says what it is.
+                    let mut first = vec![0; 4096];
+                    let Ok(n) = client.read(&mut first) else { return };
+                    let replication = first[..n].windows(8).any(|w| w == b"REPLSYNC");
+                    if cut.load(Ordering::SeqCst) || (isolated.load(Ordering::SeqCst) && !replication) {
+                        return;
+                    }
+                    let Ok(mut server) = TcpStream::connect(real) else { return };
+                    if server.write_all(&first[..n]).is_err() {
+                        return;
+                    }
+                    conns.lock().unwrap().push((client.try_clone().unwrap(), server.try_clone().unwrap(), replication));
+                    for (mut from, mut to) in [(client.try_clone().unwrap(), server.try_clone().unwrap()), (server, client)] {
+                        thread::spawn(move || {
+                            let _ = std::io::copy(&mut from, &mut to);
+                            let _ = to.shutdown(std::net::Shutdown::Both);
+                        });
+                    }
+                });
+            }
+        });
+        behind
+    }
+
+    fn cut(&self, on: bool) {
+        self.cut.store(on, std::sync::atomic::Ordering::SeqCst);
+        if on {
+            for (a, b, _) in self.conns.lock().unwrap().drain(..) {
+                let _ = (a.shutdown(std::net::Shutdown::Both), b.shutdown(std::net::Shutdown::Both));
+            }
+        }
+    }
+
+    /// Cuts stuart and the clients off, the replication link kept.
+    fn isolate(&self, on: bool) {
+        self.isolated.store(on, std::sync::atomic::Ordering::SeqCst);
+        if on {
+            self.conns.lock().unwrap().retain(|(a, b, replication)| {
+                if !replication {
+                    let _ = (a.shutdown(std::net::Shutdown::Both), b.shutdown(std::net::Shutdown::Both));
+                }
+                *replication
+            });
+        }
+    }
+}
+
+/// A replica stuart can't reach for 5 s is marked failed (phase 8): in
+/// `STUART NODES`, the state file, its primary's `CLUSTER NODES` and
+/// stuart's; once it answers again, the mark goes. The pairing stays.
+#[test]
+fn a_replica_down_is_marked_failed() {
+    let dir = temp_dir("failed");
+    let state = dir.join("state");
+    let http: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let stuart = Stuart::start_with(free_port(), &state, &["--auto", "--replicas", "1", "--metrics", &http.to_string()]);
+    let failed = || scrape(http).get("stuart_nodes{state=\"failed\"}").copied();
+    let mut s = stuart.client();
+    let a = node(stuart.1);
+    wait_until("the primary joins", || s.text(&["STUART", "NODES"]).contains(" up "));
+    let b = Behind::node(stuart.1);
+    let (aid, bid) = (id_of(a), id_of(b.addr));
+    wait_until("the replica joins", || s.text(&["STUART", "NODES"]).contains(&format!(" replica-of={aid}")));
+    let mut pa = Client::connect(a);
+    let want = format!("*5\r\n$5\r\nslave\r\n$9\r\n127.0.0.1\r\n:{}\r\n$9\r\nconnected\r\n:", a.port());
+    wait_until("the replica syncs", || String::from_utf8(Client::connect(b.addr).call(&["ROLE"])).unwrap().starts_with(&want));
+    let line = |s: &mut Client| s.text(&["STUART", "NODES"]).lines().find(|l| l.starts_with(&bid)).unwrap().to_string();
+    assert!(!line(&mut s).contains(" failed"));
+    assert_eq!(failed(), Some(0.0));
+
+    b.cut(true);
+    let cut = Instant::now();
+    wait_until("stuart sees it down", || line(&mut s).contains(" down "));
+    wait_until("it is marked failed", || line(&mut s).contains(" failed"));
+    assert!(cut.elapsed() >= Duration::from_millis(4900), "marked after {:?}", cut.elapsed());
+    assert_eq!(failed(), Some(1.0));
+    assert!(std::fs::read_to_string(&state).unwrap().contains(&format!("\nfailed {bid}\n")));
+    let fail = format!("{bid} 127.0.0.1:{p}@{p} slave,fail {aid} 0 0 ", p = b.addr.port());
+    wait_until("its primary has the mark", || pa.text(&["CLUSTER", "NODES"]).contains(&fail));
+    assert!(pa.text(&["CLUSTER", "NODES"]).lines().any(|l| l.starts_with(&fail) && l.ends_with(" disconnected")));
+    assert!(s.text(&["CLUSTER", "NODES"]).contains(&fail), "stuart's view too");
+    assert_eq!(pa.text(&["SET", "k", "v"]), "+OK");
+    assert!(line(&mut s).contains(&format!(" replica-of={aid}")), "the pairing stays");
+
+    b.cut(false);
+    wait_until("the mark goes", || !line(&mut s).contains(" failed"));
+    wait_until("at its primary too", || !pa.text(&["CLUSTER", "NODES"]).contains("fail"));
+    assert!(!std::fs::read_to_string(&state).unwrap().contains("\nfailed "));
+    assert_eq!(failed(), Some(0.0));
+    assert!(line(&mut s).contains(" up ") && line(&mut s).contains(&format!(" replica-of={aid}")));
+}
+
+/// A primary and its replica (the replica joining second, `--replicas 1`),
+/// the primary behind a proxy; keys written and acknowledged.
+fn primary_and_replica(stuart: &Stuart, name: Option<&str>) -> (Behind, SocketAddr, String, String) {
+    let mut s = stuart.client();
+    let a = Behind::named(stuart.1, name);
+    wait_until("the primary joins", || s.text(&["STUART", "NODES"]).contains(" up "));
+    let b = node(stuart.1);
+    let (aid, bid) = (id_of(a.addr), id_of(b));
+    wait_until("the replica joins", || s.text(&["STUART", "NODES"]).contains(&format!(" replica-of={aid}")));
+    let want = format!("*5\r\n$5\r\nslave\r\n$9\r\n127.0.0.1\r\n:{}\r\n$9\r\nconnected\r\n:", a.addr.port());
+    wait_until("the replica syncs", || String::from_utf8(Client::connect(b).call(&["ROLE"])).unwrap().starts_with(&want));
+    let mut pa = Client::connect(a.real);
+    for i in 0..20 {
+        assert_eq!(pa.text(&["SET", &format!("{{k}}{i}"), &i.to_string()]), "+OK");
+    }
+    assert_eq!(pa.text(&["WAIT", "1", "2000"]), ":1");
+    (a, b, aid, bid)
+}
+
+/// A primary nobody reaches for --fail-after: its replica, fenced, is
+/// promoted once the primary's lease has run out; it has the keys. The old
+/// one, still running, takes no writes meanwhile; reachable again, it is
+/// the new primary's replica.
+#[test]
+fn a_primary_down_fails_over() {
+    let dir = temp_dir("failover");
+    let http: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let stuart = Stuart::start_with(free_port(), &dir.join("state"), &["--auto", "--replicas", "1", "--fail-after", "2", "--metrics", &http.to_string()]);
+    let mut s = stuart.client();
+    let (a, b, aid, bid) = primary_and_replica(&stuart, None);
+    let line = |s: &mut Client, id: &str| s.text(&["STUART", "NODES"]).lines().find(|l| l.starts_with(id)).unwrap().to_string();
+
+    a.cut(true);
+    let cut = Instant::now();
+    wait_until_long("the replica is promoted", Duration::from_secs(15), || line(&mut s, &bid).contains(" slots=16384 "));
+    let took = cut.elapsed();
+    assert!(took >= Duration::from_millis(5000), "promoted after {took:?}: --fail-after 2 and the 3 s lease");
+    assert!(!line(&mut s, &bid).contains("replica-of"));
+    // As Redis shows a failed-over master: a primary without slots, failed.
+    let old = line(&mut s, &aid);
+    assert!(!old.contains("replica-of") && old.contains(" failed") && old.contains(" slots=0 "), "{old}");
+    let nodes = s.text(&["CLUSTER", "NODES"]);
+    assert!(nodes.lines().any(|l| l.starts_with(&aid) && l.contains(" master,fail - 0 0 ") && l.ends_with(" disconnected")), "{nodes}");
+    assert_eq!(scrape(http).get("stuart_failovers_total"), Some(&1.0));
+    let mut pb = Client::connect(b);
+    wait_until("it serves as a primary", || pb.text(&["ROLE"]) == "*3");
+    for i in 0..20 {
+        assert_eq!(pb.text(&["GET", &format!("{{k}}{i}")]), i.to_string());
+    }
+    assert_eq!(pb.text(&["SET", "{k}new", "v"]), "+OK", "writes alone: its replica is marked failed");
+    // The old primary, cut off, takes no writes: its lease ran out.
+    let mut pa = Client::connect(a.real);
+    assert_eq!(pa.text(&["SET", "{k}0", "x"]), "-NOREPLICAS Not enough good replicas to write.");
+
+    // Back: the new primary's replica, with its keys.
+    a.cut(false);
+    wait_until_long("the old primary is a replica", Duration::from_secs(15), || {
+        let l = line(&mut s, &aid);
+        !l.contains(" failed") && l.contains(&format!(" replica-of={bid}")) && pa.text(&["INFO", "replication"]).contains(&format!("master_port:{}", b.port()))
+    });
+    wait_until("it syncs", || pa.text(&["INFO", "replication"]).contains("master_link_status:up"));
+    assert_eq!(pa.text(&["READONLY"]), "+OK");
+    wait_until("it has the new key", || pa.text(&["GET", "{k}new"]) == "v");
+    assert_eq!(pa.text(&["GET", "{k}0"]), "0");
+}
+
+/// A primary back within the lease's wait: the failover is called off,
+/// the fences lifted; it stays the primary and writes again.
+#[test]
+fn a_primary_back_in_time_is_not_failed_over() {
+    let dir = temp_dir("failover-off");
+    let http: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let stuart = Stuart::start_with(free_port(), &dir.join("state"), &["--auto", "--replicas", "1", "--fail-after", "2", "--metrics", &http.to_string()]);
+    let mut s = stuart.client();
+    let (a, _b, aid, bid) = primary_and_replica(&stuart, None);
+    a.cut(true);
+    thread::sleep(Duration::from_millis(3500));
+    a.cut(false);
+    thread::sleep(Duration::from_secs(4));
+    let nodes = s.text(&["STUART", "NODES"]);
+    assert!(nodes.lines().any(|l| l.starts_with(&aid) && l.contains(" slots=16384 ") && !l.contains("replica-of")), "{nodes}");
+    assert!(nodes.lines().any(|l| l.starts_with(&bid) && l.contains(&format!(" replica-of={aid}"))), "{nodes}");
+    assert_eq!(scrape(http).get("stuart_failovers_total"), Some(&0.0));
+    let mut pa = Client::connect(a.real);
+    wait_until("it writes again: the fence lifted", || pa.text(&["SET", "{k}0", "y"]) == "+OK");
+}
+
+/// A pod that joins again under its name (a new id, no keys) replacing a
+/// primary: the old one is dead, its replica is promoted at once, without
+/// --fail-after or the lease's wait; then the pod joins as the new
+/// primary's replica.
+#[test]
+fn a_primary_rejoining_under_its_name_fails_over_at_once() {
+    let dir = temp_dir("failover-rejoin");
+    let stuart = Stuart::start_with(free_port(), &dir.join("state"), &["--auto", "--replicas", "1"]);
+    let mut s = stuart.client();
+    let (_a, b, aid, bid) = primary_and_replica(&stuart, Some("pod-a"));
+    let again = Instant::now();
+    let c = Behind::named(stuart.1, Some("pod-a"));
+    let cid = id_of(c.addr);
+    wait_until("the pod joins as the replica", || {
+        s.text(&["STUART", "NODES"]).lines().any(|l| l.starts_with(&cid) && l.contains(&format!(" replica-of={bid}")))
+    });
+    assert!(again.elapsed() < Duration::from_secs(4), "{:?}: no 5 s detection, no lease wait", again.elapsed());
+    let nodes = s.text(&["STUART", "NODES"]);
+    assert!(!nodes.contains(&aid), "the old one is gone: {nodes}");
+    assert!(nodes.lines().any(|l| l.starts_with(&bid) && l.contains(" slots=16384 ")), "{nodes}");
+    let mut pb = Client::connect(b);
+    for i in 0..20 {
+        assert_eq!(pb.text(&["GET", &format!("{{k}}{i}")]), i.to_string());
+    }
+}
+
+/// A primary cut off from stuart (and its clients) but not from its
+/// replica: stuart can't tell it from a dead one and fails it over, but
+/// first fences the replica, so the primary's lease runs out: it takes no
+/// write from then on, before the promotion and after. No write is taken
+/// by both. Reachable again, it is the new primary's replica.
+#[test]
+fn a_primary_cut_off_from_stuart_stops_writing_before_the_promotion() {
+    let dir = temp_dir("failover-split");
+    let stuart = Stuart::start_with(free_port(), &dir.join("state"), &["--auto", "--replicas", "1", "--fail-after", "2"]);
+    let mut s = stuart.client();
+    let (a, b, aid, bid) = primary_and_replica(&stuart, None);
+    let line = |s: &mut Client, id: &str| s.text(&["STUART", "NODES"]).lines().find(|l| l.starts_with(id)).unwrap().to_string();
+    let mut pa = Client::connect(a.real);
+    a.isolate(true);
+    let cut = Instant::now();
+    // It writes on, its replica acknowledging, until the fence (--fail-after
+    // 2 s after stuart lost it), then refuses within the lease.
+    assert_eq!(pa.text(&["SET", "{k}split", "before"]), "+OK");
+    // Both watched together: the old primary's last write taken, and the
+    // promotion.
+    let (mut last_taken, mut promoted) = (Duration::ZERO, None);
+    while promoted.is_none() {
+        assert!(cut.elapsed() < Duration::from_secs(15), "no promotion");
+        if pa.text(&["SET", "{k}split", "x"]) == "+OK" {
+            last_taken = cut.elapsed();
+        }
+        if line(&mut s, &bid).contains(" slots=16384 ") {
+            promoted = Some(cut.elapsed());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let promoted = promoted.unwrap();
+    assert!(last_taken + Duration::from_millis(100) < promoted, "the old primary took a write {last_taken:?} after the cut, the promotion was at {promoted:?}");
+    assert!(promoted >= Duration::from_millis(5000), "{promoted:?}: --fail-after 2 and the 3 s lease");
+    for _ in 0..20 {
+        assert!(pa.text(&["SET", "{k}split", "after"]).starts_with("-NOREPLICAS"), "the old primary must not write alongside the new");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let mut pb = Client::connect(b);
+    assert_eq!(pb.text(&["SET", "{k}new", "v"]), "+OK");
+    // Reachable again: the new primary's replica.
+    a.isolate(false);
+    wait_until_long("the old primary is a replica", Duration::from_secs(15), || line(&mut s, &aid).contains(&format!(" replica-of={bid}")));
+    assert_eq!(pa.text(&["READONLY"]), "+OK");
+    wait_until("it has the new primary's keys", || pa.text(&["GET", "{k}new"]) == "v");
+}
+
+/// Two replicas: the primary down, one is promoted, the other follows it,
+/// its fence lifted: it acknowledges the new primary's writes at once
+/// (WAIT), not once its fence ran out.
+#[test]
+fn with_two_replicas_the_other_follows_the_new_primary() {
+    let dir = temp_dir("failover-two");
+    let stuart = Stuart::start_with(free_port(), &dir.join("state"), &["--auto", "--replicas", "2", "--fail-after", "2"]);
+    let mut s = stuart.client();
+    let (a, b, aid, bid) = primary_and_replica(&stuart, None);
+    let c = node(stuart.1);
+    let cid = id_of(c);
+    wait_until("the second replica joins", || s.text(&["STUART", "NODES"]).lines().filter(|l| l.contains(&format!(" replica-of={aid}"))).count() == 2);
+    let want = format!("*5\r\n$5\r\nslave\r\n$9\r\n127.0.0.1\r\n:{}\r\n$9\r\nconnected\r\n:", a.addr.port());
+    wait_until("it syncs", || String::from_utf8(Client::connect(c).call(&["ROLE"])).unwrap().starts_with(&want));
+    a.cut(true);
+    let line = |s: &mut Client, id: &str| s.text(&["STUART", "NODES"]).lines().find(|l| l.starts_with(id)).unwrap().to_string();
+    wait_until_long("a replica is promoted", Duration::from_secs(15), || {
+        line(&mut s, &bid).contains(" slots=16384 ") || line(&mut s, &cid).contains(" slots=16384 ")
+    });
+    let (new, other, other_id, new_id) =
+        if line(&mut s, &bid).contains(" slots=16384 ") { (b, c, cid.clone(), bid.clone()) } else { (c, b, bid.clone(), cid.clone()) };
+    wait_until("the other follows it", || line(&mut s, &other_id).contains(&format!(" replica-of={new_id}")));
+    let want = format!("*5\r\n$5\r\nslave\r\n$9\r\n127.0.0.1\r\n:{}\r\n$9\r\nconnected\r\n:", new.port());
+    wait_until("it syncs from it", || String::from_utf8(Client::connect(other).call(&["ROLE"])).unwrap().starts_with(&want));
+    let mut pn = Client::connect(new);
+    assert_eq!(pn.text(&["SET", "{k}after", "v"]), "+OK");
+    let t = Instant::now();
+    assert_eq!(pn.text(&["WAIT", "1", "3000"]), ":1", "its fence lifted");
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+}
+
+/// A primary leaving (STUART LEAVE, as on SIGTERM) with a replica: no slot
+/// moves; its writes are paused, the replica catches up and is promoted at
+/// once, without the lease's wait; the writes that waited are redirected to
+/// it, and a writer following the redirect loses nothing. Then the old
+/// primary leaves.
+#[test]
+fn a_leaving_primary_hands_its_slots_to_its_replica() {
+    let dir = temp_dir("handover");
+    let http: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let stuart = Stuart::start_with(free_port(), &dir.join("state"), &["--auto", "--replicas", "1", "--metrics", &http.to_string()]);
+    let mut s = stuart.client();
+    let (a, b, aid, bid) = primary_and_replica(&stuart, None);
+    let line = |s: &mut Client, id: &str| s.text(&["STUART", "NODES"]).lines().find(|l| l.starts_with(id)).map(str::to_string).unwrap_or_default();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let incrs = {
+        let (stop, real) = (stop.clone(), a.real);
+        thread::spawn(move || {
+            let mut c = Client::connect(real);
+            let mut done = 0;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let r = c.text(&["INCR", "{k}n"]);
+                if r.starts_with(':') {
+                    done += 1;
+                    assert_eq!(r, format!(":{done}"), "no INCR lost or done twice");
+                } else if r.starts_with("-MOVED ") {
+                    c = Client::connect(b);
+                } else {
+                    panic!("{r}");
+                }
+            }
+            done
+        })
+    };
+    thread::sleep(Duration::from_millis(200));
+
+    let left = Instant::now();
+    assert_eq!(s.text(&["STUART", "LEAVE", &aid]), ":16385");
+    wait_until("the replica owns the slots", || line(&mut s, &bid).contains(" slots=16384 ") && !line(&mut s, &bid).contains("replica-of"));
+    let took = left.elapsed();
+    assert!(took < Duration::from_secs(2), "{took:?}: no lease wait");
+    wait_until("the old primary left", || s.text(&["STUART", "LEAVE", &aid]) == ":0");
+    thread::sleep(Duration::from_millis(200));
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let done = incrs.join().unwrap();
+    assert!(done > 0);
+    let mut pb = Client::connect(b);
+    assert_eq!(pb.text(&["GET", "{k}n"]), done.to_string());
+    for i in 0..20 {
+        assert_eq!(pb.text(&["GET", &format!("{{k}}{i}")]), i.to_string());
+    }
+    let m = scrape(http);
+    assert_eq!((m.get("stuart_handovers_total"), m.get("stuart_failovers_total")), (Some(&1.0), Some(&0.0)));
+    assert_eq!(m.get("stuart_slots_moved_total"), Some(&0.0), "no slot moved");
+    let log = std::fs::read_to_string(&stuart.2).unwrap();
+    assert!(log.contains(&format!("Primary {aid} leaving: handed its slots to replica {bid}")), "{log}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A scale-down that leaves more primaries than the nodes need (6 nodes
+/// with `--replicas 1`, two replicas leaving: 3 primaries for 4 nodes,
+/// two without a replica): one of those two is demoted, its slots move to
+/// the others, and it becomes the replica of the other.
+const D: &str = "dddddddddddddddddddddddddddddddddddddddd";
+const E: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+const F: &str = "ffffffffffffffffffffffffffffffffffffffff";
+
+/// The node `id` is a replica of, as STUART NODES says.
+fn primary_of(s: &mut Client, id: &str) -> Option<String> {
+    let nodes = s.text(&["STUART", "NODES"]);
+    let line = nodes.lines().find(|l| l.starts_with(id)).unwrap_or_default().to_string();
+    line.split(' ').find_map(|w| w.strip_prefix("replica-of=")).map(str::to_string)
+}
+
+/// Fake nodes A to F joined to stuart `--auto --replicas 1`, evened out:
+/// A, C and E primaries, B, D and F their replicas; C and E answer `INFO
+/// memory` with `primary` and log their tables, taking each `delay(epoch)`.
+/// Then F and D leave: three primaries where two do. The logs of C and E,
+/// and the memories of A, C and E.
+fn demoting_cluster(s: &mut Client, primary: String, delay: fn(u64) -> Duration) -> ([Log; 2], [Mem; 3]) {
+    let (logs, mut mems) = ([Log::default(), Log::default()], Vec::new());
+    for id in [A, B, C, D, E, F] {
+        match id {
+            C | E => {
+                let m: Mem = std::sync::Arc::new(std::sync::Mutex::new(primary.clone()));
+                let port = memory_node(id, delay, logs[usize::from(id == E)].clone(), Default::default(), m.clone());
+                assert_eq!(s.text(&["STUART", "JOIN", id, "127.0.0.1", &port]), "+OK");
+                mems.push(m);
+            }
+            A => mems.push(join_with_memory(s, id, primary.clone())),
+            _ => drop(join_with_memory(s, id, mem(100, 0, 50))),
+        }
+    }
+    wait_until_long("even over A, C and E", Duration::from_secs(30), || {
+        sorted_counts(s) == [0, 0, 0, 5461, 5461, 5462] && s.text(&["STUART", "MIGRATIONS"]).is_empty()
+    });
+    assert_eq!([B, D, F].map(|r| primary_of(s, r)), [A, C, E].map(|p| Some(p.to_string())));
+    for id in [F, D] {
+        assert_eq!(s.text(&["STUART", "LEAVE", id]), ":1");
+        wait_until("the replica left", || s.text(&["STUART", "LEAVE", id]) == ":0");
+    }
+    (logs, mems.try_into().unwrap())
+}
+
+/// For the test below: C and E take tables slowly once set.
+static SLOW_TABLES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn slow_tables(_: u64) -> Duration {
+    if SLOW_TABLES.load(std::sync::atomic::Ordering::SeqCst) {
+        Duration::from_millis(300)
+    } else {
+        Duration::ZERO
+    }
+}
+
+#[test]
+fn a_primary_the_nodes_dont_need_becomes_a_replica() {
+    let dir = temp_dir("demote");
+    let http: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let stuart = Stuart::start_with(free_port(), &dir.join("state"), &["--auto", "--replicas", "1", "--metrics", &http.to_string()]);
+    let mut s = stuart.client();
+    // C and E take each table 300 ms after they got it, from before the
+    // replicas leave.
+    let (logs, _) = demoting_cluster(&mut s, mem(100, 0, 50), slow_tables);
+    SLOW_TABLES.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Watched closely: listed demoting meanwhile, and when it became a replica.
+    let (mut listed, mut gauge) = (false, false);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let (demoted, became) = loop {
+        assert!(Instant::now() < deadline, "no demotion within 60 s");
+        let nodes = s.text(&["STUART", "NODES"]);
+        if nodes.contains(" demoting") && !listed {
+            listed = true;
+            gauge = scrape(http).get("stuart_nodes{state=\"demoting\"}") == Some(&1.0);
+        }
+        if let Some(x) = [C, E].into_iter().find(|x| nodes.lines().any(|l| l.starts_with(x) && l.contains(" replica-of="))) {
+            break (x, Instant::now());
+        }
+        thread::sleep(Duration::from_millis(2));
+    };
+    SLOW_TABLES.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(listed && gauge, "listed demoting in STUART NODES {listed}, in the gauge {gauge}");
+    // It became a replica only once it had taken a table that left it no
+    // slots (as a primary still).
+    let log = logs[usize::from(demoted == E)].lock().unwrap().clone();
+    let held = log.iter().filter(|p| p.holds).map(|p| p.epoch).max().unwrap();
+    let emptied = log.iter().filter(|p| p.epoch > held && !p.holds && !p.replica).min_by_key(|p| p.epoch).expect("a table leaving it nothing as a primary");
+    assert!(emptied.acked <= became, "epoch {} taken {:?} after it became a replica", emptied.epoch, emptied.acked - became);
+    let took_replica = || logs[usize::from(demoted == E)].lock().unwrap().iter().any(|p| p.replica);
+    wait_until("it took the table making it a replica", took_replica);
+    wait_until_long("C or E demoted: two primaries, each with a replica", Duration::from_secs(30), || {
+        let nodes = s.text(&["STUART", "NODES"]);
+        sorted_counts(&mut s) == [0, 0, 8192, 8192] && !nodes.contains(" demoting") && nodes.lines().filter(|l| l.contains(" replica-of=")).count() == 2
+    });
+    let kept = if demoted == C { E } else { C };
+    assert_eq!(primary_of(&mut s, demoted), Some(kept.to_string()), "the replica of the other one lacking one");
+    assert_eq!(primary_of(&mut s, B), Some(A.to_string()), "B stays A's");
+    let m = scrape(http);
+    assert_eq!(m.get("stuart_demotions_total"), Some(&1.0));
+    assert_eq!(m.get("stuart_nodes{state=\"demoting\"}"), Some(&0.0));
+    assert!(m.get("stuart_slots_moved_total").is_some_and(|&n| n >= 5461.0));
+    let log = std::fs::read_to_string(&stuart.2).unwrap();
+    assert!(log.contains(&format!("Primary {demoted} becomes a replica, the nodes needing fewer primaries")), "{log}");
+    assert!(log.contains(&format!("Node {demoted} is now a replica of {kept}")), "{log}");
+    // Nothing more to change.
+    thread::sleep(Duration::from_millis(2500));
+    assert_eq!(scrape(http).get("stuart_demotions_total"), Some(&1.0));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A primary is demoted only if the other primaries have room for its
+/// keys (the replicas' room doesn't count: they take no slots).
+#[test]
+fn a_primary_is_demoted_only_if_the_others_have_room() {
+    let dir = temp_dir("demote-room");
+    let stuart = Stuart::start_with(free_port(), &dir.join("state"), &["--auto", "--replicas", "1"]);
+    let mut s = stuart.client();
+    // 200 bytes of room each below 90%, 500 of keys: two others have 400.
+    let (_, [a, _, _]) = demoting_cluster(&mut s, mem(700, 1000, 500), |_| Duration::ZERO);
+    thread::sleep(Duration::from_millis(3000));
+    assert!(!s.text(&["STUART", "NODES"]).contains(" demoting"));
+    assert_eq!(sorted_counts(&mut s), [0, 5461, 5461, 5462], "D and F gone, the slots where they were");
+    *a.lock().unwrap() = mem(100, 1000, 50);
+    wait_until_long("C or E demoted", Duration::from_secs(30), || {
+        sorted_counts(&mut s) == [0, 0, 8192, 8192] && s.text(&["STUART", "NODES"]).lines().filter(|l| l.contains(" replica-of=")).count() == 2
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A replica leaving holds nothing: it goes at once, and its primary writes
+/// alone from the table without it.
+#[test]
+fn a_leaving_replica_just_goes() {
+    let dir = temp_dir("replica-leaves");
+    let stuart = Stuart::start_with(free_port(), &dir.join("state"), &["--auto", "--replicas", "1"]);
+    let mut s = stuart.client();
+    let (a, _b, _aid, bid) = primary_and_replica(&stuart, None);
+    let left = Instant::now();
+    assert_eq!(s.text(&["STUART", "LEAVE", &bid]), ":1");
+    wait_until("it left", || s.text(&["STUART", "LEAVE", &bid]) == ":0");
+    assert!(left.elapsed() < Duration::from_secs(2), "{:?}", left.elapsed());
+    assert!(!s.text(&["STUART", "NODES"]).contains(&bid));
+    let mut pa = Client::connect(a.real);
+    wait_until("its primary has no replica", || pa.text(&["INFO", "replication"]).contains("connected_slaves:0"));
+    assert_eq!(pa.text(&["SET", "{k}alone", "v"]), "+OK");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A replica's keys are copies: it may leave whatever room the others have.
+#[test]
+fn a_replica_leaves_whatever_room_the_others_have() {
+    let dir = temp_dir("replica-room");
+    let stuart = Stuart::start_with(free_port(), &dir.join("state"), &["--replicas", "1"]);
+    let mut s = stuart.client();
+    join_with_memory(&mut s, A, mem(600, 1000, 500));
+    join_with_memory(&mut s, B, mem(600, 1000, 500));
+    assert_eq!(s.text(&["STUART", "CREATE"]), "+OK");
+    wait_until("both took the table", || up_and_acked(&mut s, 1) == 2);
+    assert!(s.text(&["STUART", "NODES"]).contains(&format!(" replica-of={A}")));
+    assert_eq!(s.text(&["STUART", "LEAVE", B]), ":1");
+    wait_until("it left", || s.text(&["STUART", "LEAVE", B]) == ":0");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Fake nodes A and B, primaries, and C, A's replica (`--replicas 1`),
+/// each as `lags` says; the table made. Their logs.
+fn handing_cluster(s: &mut Client, lags: [Lag; 3]) -> Vec<Log> {
+    handing_cluster_with(s, lags, |_| Duration::ZERO)
+}
+
+/// The same, C taking each table after `c_delay(epoch)`.
+fn handing_cluster_with(s: &mut Client, lags: [Lag; 3], c_delay: fn(u64) -> Duration) -> Vec<Log> {
+    let mut logs = Vec::new();
+    for (id, lag) in [A, B, C].into_iter().zip(lags) {
+        let log: Log = Default::default();
+        let delay = if id == C { c_delay } else { |_| Duration::ZERO };
+        let port = lagging_node(id, delay, log.clone(), lag.down.clone(), Default::default(), lag);
+        assert_eq!(s.text(&["STUART", "JOIN", id, "127.0.0.1", &port]), "+OK");
+        logs.push(log);
+    }
+    assert_eq!(s.text(&["STUART", "CREATE"]), "+OK");
+    wait_until("they took the table", || up_and_acked(s, 1) == 3);
+    assert!(s.text(&["STUART", "NODES"]).lines().any(|l| l.starts_with(C) && l.contains(&format!(" replica-of={A}"))));
+    logs
+}
+
+/// A replica that missed the paused primary's offset: the pause is lifted,
+/// and it is paused for again; this time the replica catches up. The table
+/// handing it the slots reaches it first; no slot ever moves.
+#[test]
+fn a_handover_is_tried_again_and_reaches_the_replica_first() {
+    let dir = temp_dir("handover-retry");
+    let stuart = Stuart::start_with(free_port(), &dir.join("state"), &["--replicas", "1"]);
+    let mut s = stuart.client();
+    let (a, c) = (Lag::default(), Lag::behind());
+    let logs = handing_cluster(&mut s, [a.clone(), Lag::default(), c.clone()]);
+    let before = epoch_of(&mut s);
+    assert_eq!(s.text(&["STUART", "LEAVE", A]), ":8193");
+    wait_until("the first pause is lifted", || Lag::count(&a.resumes) == 1);
+    c.behind.store(false, std::sync::atomic::Ordering::SeqCst);
+    wait_until("C owns A's slots", || s.text(&["STUART", "NODES"]).lines().any(|l| l.starts_with(C) && l.split(' ').any(|w| w == "slots=8192")));
+    assert_eq!((Lag::count(&a.pauses), Lag::count(&a.resumes)), (2, 1));
+    let paused = a.paused.lock().unwrap().clone();
+    let (lifted, again) = (paused.iter().find(|p| !p.1).unwrap().0, paused.iter().rfind(|p| p.1).unwrap().0);
+    assert!(again.duration_since(lifted) >= Duration::from_millis(100), "paused again {:?} after the pause was lifted", again.duration_since(lifted));
+    let handed = before + 1;
+    // The state shows the handover before the table is pushed.
+    wait_until("A and C got the handover table", || got(&logs[2], handed).is_some() && got(&logs[0], handed).is_some());
+    let (at_c, at_a) = (got(&logs[2], handed).unwrap(), got(&logs[0], handed).unwrap());
+    assert!(at_c.acked <= at_a.got, "A got the handover table before C took it");
+    wait_until("A left", || s.text(&["STUART", "LEAVE", A]) == ":0");
+    assert!(logs.iter().all(|l| l.lock().unwrap().iter().all(|p| p.migrating.is_empty())), "no slot moved");
+    let log = std::fs::read_to_string(&stuart.2).unwrap();
+    assert!(log.contains(&format!("replica {C} didn't reach offset 100 within 1000 ms; trying again")), "{log}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A slot of a primary handing over, queued to move meanwhile (`STUART
+/// MOVE`): it doesn't move from the primary; once the replica has it, it
+/// moves from there.
+#[test]
+fn a_handing_primary_s_slots_queued_meanwhile_wait() {
+    let dir = temp_dir("handover-queued");
+    let stuart = Stuart::start_with(free_port(), &dir.join("state"), &["--replicas", "1"]);
+    let mut s = stuart.client();
+    let (a, c) = (Lag::default(), Lag::behind());
+    let logs = handing_cluster(&mut s, [a.clone(), Lag::default(), c.clone()]);
+    assert_eq!(s.text(&["STUART", "LEAVE", A]), ":8193");
+    wait_until("A paused", || Lag::count(&a.pauses) == 1);
+    let slot = s.text(&["STUART", "TABLE"]).lines().find(|l| l.starts_with(A)).and_then(|l| l.split(' ').next_back()?.split('-').next().map(str::to_string)).unwrap();
+    assert_eq!(s.text(&["STUART", "MOVE", &slot, &slot, B]), ":1");
+    // A missed pause (1 s), and the next one under way: the slot is
+    // queued all that time.
+    thread::sleep(Duration::from_millis(1500));
+    c.behind.store(false, std::sync::atomic::Ordering::SeqCst);
+    wait_until("C owns A's slots", || holds(&mut s, C, 8192) || holds(&mut s, C, 8191));
+    wait_until("the slot moved to B", || s.text(&["STUART", "MIGRATIONS"]).is_empty() && holds(&mut s, C, 8191));
+    for log in &logs {
+        let moved = log.lock().unwrap().iter().find(|p| p.migrating.iter().any(|m| m.1 == A)).map(|p| p.epoch);
+        assert_eq!(moved, None, "a slot moved from A, handing over");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A replica that never catches up: after 5 pauses missed, the leaving
+/// primary's slots are drained instead, as without replicas.
+#[test]
+fn a_handover_that_keeps_missing_drains_instead() {
+    let dir = temp_dir("handover-drain");
+    let stuart = Stuart::start_with(free_port(), &dir.join("state"), &["--replicas", "1", "--moves-per-source", "10000", "--max-moves", "10000"]);
+    let mut s = stuart.client();
+    let a = Lag::default();
+    handing_cluster(&mut s, [a.clone(), Lag::default(), Lag::behind()]);
+    assert_eq!(s.text(&["STUART", "LEAVE", A]), ":8193");
+    wait_until_long("A left, drained", Duration::from_secs(30), || s.text(&["STUART", "LEAVE", A]) == ":0");
+    assert_eq!((Lag::count(&a.pauses), Lag::count(&a.resumes)), (5, 5));
+    let nodes = s.text(&["STUART", "NODES"]);
+    assert!(nodes.lines().any(|l| l.starts_with(B) && l.split(' ').any(|w| w == "slots=16384")), "{nodes}");
+    let log = std::fs::read_to_string(&stuart.2).unwrap();
+    assert!(log.contains("(5 times)); draining them instead, 8192 slots to move"), "{log}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Whether `STUART NODES` gives `id` `slots` slots.
+fn holds(s: &mut Client, id: &str, slots: usize) -> bool {
+    s.text(&["STUART", "NODES"]).lines().any(|l| l.starts_with(id) && l.split(' ').any(|w| w == format!("slots={slots}")))
+}
+
+/// A replica still copying (syncing from scratch) is waited for: no
+/// pause, nothing drained; after 60 s, the slots are drained instead.
+#[test]
+fn a_handover_waits_for_a_replica_still_copying() {
+    let dir = temp_dir("handover-copying");
+    let stuart = Stuart::start_with(free_port(), &dir.join("state"), &["--replicas", "1", "--moves-per-source", "10000", "--max-moves", "10000"]);
+    let mut s = stuart.client();
+    let (a, c) = (Lag::default(), Lag::default());
+    c.copying.store(true, std::sync::atomic::Ordering::SeqCst);
+    handing_cluster(&mut s, [a.clone(), Lag::default(), c]);
+    assert_eq!(s.text(&["STUART", "LEAVE", A]), ":8193");
+    thread::sleep(Duration::from_secs(3));
+    assert_eq!(Lag::count(&a.pauses), 0, "paused for a replica still copying");
+    assert!(holds(&mut s, A, 8192) && s.text(&["STUART", "MIGRATIONS"]).is_empty(), "drained at once");
+    let log = std::fs::read_to_string(&stuart.2).unwrap();
+    assert!(log.contains("its replica is still copying; waiting up to 60 s to hand over"), "{log}");
+    wait_until_long("A left, drained", Duration::from_secs(80), || s.text(&["STUART", "LEAVE", A]) == ":0");
+    assert!(holds(&mut s, B, 16384));
+    let log = std::fs::read_to_string(&stuart.2).unwrap();
+    assert!(log.contains("(its replicas are still copying after 60 s); draining them instead"), "{log}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A replica chosen with a complete copy that, while the primary is
+/// paused, says it's copying again (its link restarted from scratch) at
+/// the offset: not promoted, the pause lifted; then it's waited for.
+#[test]
+fn a_replica_copying_again_mid_catch_up_is_not_promoted() {
+    let dir = temp_dir("handover-recopy");
+    let stuart = Stuart::start_with(free_port(), &dir.join("state"), &["--replicas", "1"]);
+    let mut s = stuart.client();
+    let (a, c) = (Lag::default(), Lag::default());
+    handing_cluster(&mut s, [a.clone(), Lag::default(), c.clone()]);
+    // Complete when chosen, copying from the next FENCE on.
+    c.complete_fences.store(Lag::count(&c.fences) + 1, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(s.text(&["STUART", "LEAVE", A]), ":8193");
+    wait_until("the pause is lifted", || Lag::count(&a.resumes) == 1);
+    thread::sleep(Duration::from_millis(1500));
+    assert_eq!(Lag::count(&a.pauses), 1, "paused again for a replica copying");
+    assert!(holds(&mut s, A, 8192), "{}", s.text(&["STUART", "NODES"]));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// C slow to take tables from the epoch in `SLOW_*` on (1.8 s, within
+/// stuart's 2 s timeout): a replica that has left but isn't removed yet.
+static SLOW_LEAVING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+static SLOW_LEFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+fn slow_leaving(epoch: u64) -> Duration {
+    if epoch >= SLOW_LEAVING.load(std::sync::atomic::Ordering::SeqCst) { Duration::from_millis(1800) } else { Duration::ZERO }
+}
+
+fn slow_left(epoch: u64) -> Duration {
+    if epoch >= SLOW_LEFT.load(std::sync::atomic::Ordering::SeqCst) { Duration::from_millis(1800) } else { Duration::ZERO }
+}
+
+/// Makes replica C leave and stay leaving a while: D joins (B's replica),
+/// C is slow to take that table, and C's LEAVE.
+fn c_leaves_slowly(s: &mut Client, slow: &std::sync::atomic::AtomicU64) {
+    const D: &str = "dddddddddddddddddddddddddddddddddddddddd";
+    slow.store(epoch_of(s) + 1, std::sync::atomic::Ordering::SeqCst);
+    let port = lagging_node(D, |_| Duration::ZERO, Default::default(), Default::default(), Default::default(), Lag::default());
+    assert_eq!(s.text(&["STUART", "JOIN", D, "127.0.0.1", &port]), "+OK");
+    assert_eq!(s.text(&["STUART", "LEAVE", C]), ":1");
+}
+
+/// A primary handing over whose replica, still copying, then leaves:
+/// no replica can take over, its slots are drained.
+#[test]
+fn a_handover_whose_replica_leaves_drains_instead() {
+    let dir = temp_dir("handover-replica-leaves");
+    let stuart = Stuart::start_with(free_port(), &dir.join("state"), &["--replicas", "1", "--moves-per-source", "10000", "--max-moves", "10000"]);
+    let mut s = stuart.client();
+    let c = Lag::default();
+    c.copying.store(true, std::sync::atomic::Ordering::SeqCst);
+    handing_cluster_with(&mut s, [Lag::default(), Lag::default(), c.clone()], slow_leaving);
+    assert_eq!(s.text(&["STUART", "LEAVE", A]), ":8193");
+    c_leaves_slowly(&mut s, &SLOW_LEAVING);
+    // It could take over now, were it not leaving.
+    c.copying.store(false, std::sync::atomic::Ordering::SeqCst);
+    wait_until_long("A left, drained", Duration::from_secs(30), || s.text(&["STUART", "LEAVE", A]) == ":0");
+    let log = std::fs::read_to_string(&stuart.2).unwrap();
+    assert!(!log.contains("handed its slots to replica"), "{log}");
+    assert!(log.contains("can't hand its slots to a replica (no replica up, not marked failed nor leaving"), "{log}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A primary whose only replica is leaving leaves as without replicas:
+/// drained.
+#[test]
+fn a_primary_whose_replica_is_leaving_is_drained() {
+    let dir = temp_dir("leave-replica-leaving");
+    let stuart = Stuart::start_with(free_port(), &dir.join("state"), &["--replicas", "1", "--moves-per-source", "10000", "--max-moves", "10000"]);
+    let mut s = stuart.client();
+    handing_cluster_with(&mut s, [Lag::default(), Lag::default(), Lag::default()], slow_left);
+    c_leaves_slowly(&mut s, &SLOW_LEFT);
+    assert_eq!(s.text(&["STUART", "LEAVE", A]), ":8193");
+    wait_until_long("A left, drained", Duration::from_secs(30), || s.text(&["STUART", "LEAVE", A]) == ":0");
+    let log = std::fs::read_to_string(&stuart.2).unwrap();
+    assert!(log.contains(&format!("Node {A} is leaving: it holds 8192 slots")), "{log}");
+    assert!(!log.contains("hands its 8192 slots to a replica"), "{log}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A primary down while it's to hand over is the failover's: its replica
+/// promoted after --fail-after and the lease, nothing paused or drained.
+#[test]
+fn a_handing_primary_down_fails_over() {
+    let dir = temp_dir("handover-down");
+    let stuart = Stuart::start_with(free_port(), &dir.join("state"), &["--replicas", "1", "--fail-after", "2"]);
+    let mut s = stuart.client();
+    let a = Lag::default();
+    handing_cluster(&mut s, [a.clone(), Lag::default(), Lag::default()]);
+    a.down.store(true, std::sync::atomic::Ordering::SeqCst);
+    wait_until_long("A is down", Duration::from_secs(10), || s.text(&["STUART", "NODES"]).lines().any(|l| l.starts_with(A) && l.contains(" down ")));
+    assert_eq!(s.text(&["STUART", "LEAVE", A]), ":8193");
+    wait_until_long("C owns A's slots", Duration::from_secs(30), || holds(&mut s, C, 8192));
+    assert!(holds(&mut s, B, 8192));
+    let log = std::fs::read_to_string(&stuart.2).unwrap();
+    assert!(!log.contains("can't hand its slots"), "{log}");
+    let _ = std::fs::remove_dir_all(dir);
 }

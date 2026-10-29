@@ -47,6 +47,8 @@ const EVENTS_PER_WAIT: usize = 1024;
 thread_local! {
     /// The reactor of this thread, set while a `Reactor` exists.
     static CURRENT: RefCell<Option<Rc<Core>>> = const { RefCell::new(None) };
+    /// The time of the loop's turn: see [`turn_time`].
+    static TURN: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
 /// The reactor of the calling thread.
@@ -219,6 +221,7 @@ impl Reactor {
 
         let mut events = Events::with_capacity(EVENTS_PER_WAIT);
         core.woke.set(Instant::now());
+        TURN.with(|t| t.set(Some(core.woke.get())));
         let _exit = Exit(core);
         loop {
             // Only the fibers that are ready now. One that yields or is
@@ -247,14 +250,17 @@ impl Reactor {
                 let deadline = core.timers.borrow_mut().next_deadline();
                 core.wait_for_io(&mut events, deadline)?;
             }
+            // The turn's time, for the timers and turn_time(): read once a
+            // turn, not again right after a wait.
+            let now = if waited { core.woke.get() } else { Instant::now() };
+            TURN.with(|t| t.set(Some(now)));
             for event in events.iter() {
                 core.dispatch(event);
             }
             // After the I/O: a fiber whose I/O is ready gets it, even if its
-            // deadline passed meanwhile. Reads the clock only if there are
-            // timers, and not again right after a wait.
+            // deadline passed meanwhile.
             if !core.timers.borrow().is_empty() {
-                core.expire_timers(if waited { core.woke.get() } else { Instant::now() });
+                core.expire_timers(now);
             }
         }
     }
@@ -321,6 +327,7 @@ impl Drop for Reactor {
         }
         core.ready.borrow_mut().clear();
         CURRENT.with(|c| c.borrow_mut().take());
+        TURN.with(|t| t.set(None));
     }
 }
 
@@ -461,6 +468,29 @@ impl Core {
     /// the next turn of the loop.
     pub(crate) fn wait(&self, io: Option<(Token, Direction)>, deadline: Option<Instant>) -> bool {
         assert!(io.is_some() || deadline.is_some(), "a wait nothing can end");
+        self.suspend(io, deadline)
+    }
+
+    /// Suspends the running fiber until [`wake_task`](Core::wake_task)
+    /// wakes it or `deadline` passes (`false` then): for [`Notify`].
+    ///
+    /// [`Notify`]: crate::Notify
+    pub(crate) fn park(&self, deadline: Option<Instant>) -> bool {
+        self.suspend(None, deadline)
+    }
+
+    /// The running fiber's task.
+    pub(crate) fn running(&self) -> Token {
+        self.running_task.get().expect("waiting outside of a fiber spawned on the reactor")
+    }
+
+    /// Wakes a fiber that [`park`](Core::park)ed; nothing if it isn't
+    /// waiting any more.
+    pub(crate) fn wake_task(&self, task: Token) -> bool {
+        self.wake(task, false)
+    }
+
+    fn suspend(&self, io: Option<(Token, Direction)>, deadline: Option<Instant>) -> bool {
         let task = self
             .running_task
             .get()
@@ -557,6 +587,16 @@ pub fn yield_now() {
 /// If the thread has no reactor.
 pub fn busy_time() -> Duration {
     current().busy_time()
+}
+
+/// The time of the reactor's current turn: read when the loop last woke
+/// from waiting, or, in a turn that didn't wait, before its I/O was
+/// dispatched. Every fiber the turn runs was made ready before it, so this
+/// is no older than the moment the fiber got its turn: a fiber woken after
+/// the thread stalled (stopped, swapped out) sees the time after the stall,
+/// without a clock read of its own. Outside a reactor, the clock.
+pub fn turn_time() -> Instant {
+    TURN.with(|t| t.get()).unwrap_or_else(Instant::now)
 }
 
 /// Suspends the fiber for at least `duration`. Other fibers run meanwhile.

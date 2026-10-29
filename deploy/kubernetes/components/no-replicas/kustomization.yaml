@@ -1,0 +1,47 @@
+# The base without replicas, as before phase 8: three nodes, every one a
+# primary, half the pods for the same capacity, but no copy of any key. A
+# pod killed (its machine gone, `--force`) loses its keys, and on SIGTERM
+# a node's slots move to the others, so a rolling update moves every key
+# out and back in. To add to an overlay of the base (after the autoscaling
+# component, if it has it):
+#
+#   components:
+#     - <path to>/deploy/kubernetes/components/no-replicas
+
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+patches:
+  - target:
+      kind: StatefulSet
+      name: stuart
+    patch: |-
+      - op: test
+        path: /spec/template/spec/containers/0/args/4
+        value: --replicas
+      - op: remove
+        path: /spec/template/spec/containers/0/args/5
+      - op: remove
+        path: /spec/template/spec/containers/0/args/4
+  - target:
+      kind: StatefulSet
+      name: speedvault
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 3
+  # With the HPA: three pods at least, and busy cores at 70%, every pod
+  # being a primary. (Matches nothing without the autoscaling component.)
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: speedvault
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 3
+      - op: test
+        path: /spec/metrics/0/pods/metric/name
+        value: speedvault_busy_cores
+      - op: replace
+        path: /spec/metrics/0/pods/target/averageValue
+        value: 700m

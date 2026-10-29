@@ -9,11 +9,15 @@
    layout, with Redis's node ids, addresses and node order, is given to
    `cluster_compat replies`. SLOTS and SHARDS must be byte for byte the same.
    NODES too, after masking what a table doesn't have (see reply.rs): the
-   bus port, ping and pong times, and the config epoch.
+   bus port, ping and pong times, and the config epoch. Two layouts have
+   replicas (CLUSTER REPLICATE): with nothing written, their replication
+   offsets stay 0 (the servers run with a long repl-ping-replica-period),
+   as ours are until replicas copy data: left out of SLOTS, `loading` in
+   SHARDS.
 3. With --dbnode: our node in cluster mode in a Redis node's place
-   (announcing its address, given its view with CLUSTER SETTABLE). The
-   same requests to both must get the same replies, node ids masked:
-   MOVED, CROSSSLOT, CLUSTERDOWN, the CLUSTER commands.
+   (announcing its address, given its view with CLUSTER SETTABLE), a
+   replica's too. The same requests to both must get the same replies,
+   node ids masked: MOVED, CROSSSLOT, CLUSTERDOWN, the CLUSTER commands.
 
     python3 cluster_compat.py --bin PATH --ports 7801,7802,7803,7804 [--keys N] [--dbnode PATH]
 
@@ -100,23 +104,46 @@ def slots_text(ranges: Ranges) -> List[str]:
     return [str(s) if s == e else f"{s}-{e}" for s, e in ranges]
 
 
-def wait_for(port: int, nodes: List[Node], layout: Dict[int, Ranges], timeout: float = 30) -> List[List[str]]:
-    """Until `port` knows every node, connected, with the layout's slots."""
+def wait_for(port: int, nodes: List[Node], layout: Dict[int, Ranges], timeout: float = 30,
+             replicas: Optional[Dict[int, int]] = None) -> List[List[str]]:
+    """Until `port` knows every node, connected, with the layout's slots,
+    and the replicas (port -> primary port) as replicas."""
     want = {n.id: slots_text(layout.get(n.port, [])) for n in nodes}
+    by_port = {n.port: n.id for n in nodes}
+    primaries = {by_port[r]: by_port[p] for r, p in (replicas or {}).items()}
     deadline = time.time() + timeout
     while True:
         view = nodes_view(port)
         got = {f[0]: f[8:] for f in view if f[7] == "connected" and "handshake" not in f[2] and "fail" not in f[2]}
-        if got == want and len(view) == len(nodes):
+        roles = {f[0]: f[3] for f in view if "slave" in f[2]}
+        if got == want and len(view) == len(nodes) and roles == primaries:
             return view
         if time.time() > deadline:
             raise SystemExit(f"cluster didn't converge on {port}: {view}")
         time.sleep(0.2)
 
 
-def table_input(view: List[List[str]], layout: Dict[int, Ranges], by_id: Dict[str, Node], myself: str) -> str:
+def replica_order(port: int) -> List[Tuple[str, str]]:
+    """(replica id, primary id) in the order `port` lists them in CLUSTER
+    SHARDS: each primary's in the order they attached (gossip's, at `port`)."""
+    pairs = []
+    for shard in call(port, "CLUSTER", "SHARDS").value:
+        fields = shard.value
+        nodes = fields[[f.value for f in fields[::2]].index(b"nodes") * 2 + 1].value
+        ids = []
+        for n in nodes:
+            kv = {k.value: v.value for k, v in zip(n.value[::2], n.value[1::2])}
+            ids.append((kv[b"id"].decode(), kv[b"role"]))
+        primary = next(i for i, role in ids if role == b"master")
+        pairs += [(i, primary) for i, role in ids if role == b"replica"]
+    return pairs
+
+
+def table_input(view: List[List[str]], layout: Dict[int, Ranges], by_id: Dict[str, Node], myself: str,
+                replicas: Optional[List[Tuple[str, str]]] = None) -> str:
     """The layout for `cluster_compat replies`: Redis's ids, addresses and
-    order, our own slot ranges (not parsed back from Redis)."""
+    order, our own slot ranges (not parsed back from Redis), and the
+    replicas as given (in Redis's order)."""
     lines = ["epoch 1"]
     owner = [None] * 16384
     for f in view:
@@ -130,6 +157,7 @@ def table_input(view: List[List[str]], layout: Dict[int, Ranges], by_id: Dict[st
         if slot == 16384 or owner[slot] != owner[start]:
             lines.append(f"range {start} {slot - 1} {owner[start] or '-'}")
             start = slot
+    lines += [f"replica {r} {p}" for r, p in replicas or []]
     lines.append(f"myself {myself}")
     return "\n".join(lines) + "\n"
 
@@ -153,14 +181,16 @@ def mask_nodes(raw: bytes) -> Tuple[bytes, str]:
     return kind + (b"ok" if framing_ok else b"BAD FRAMING"), "\n".join(lines)
 
 
-def compare_layout(name: str, binary: str, nodes: List[Node], layout: Dict[int, Ranges], ask: List[int]) -> int:
+def compare_layout(name: str, binary: str, nodes: List[Node], layout: Dict[int, Ranges], ask: List[int],
+                   replicas: Optional[Dict[int, int]] = None) -> int:
     by_id = {n.id: n for n in nodes}
     failures = 0
     for port in ask:
-        view = wait_for(port, nodes, layout)
+        view = wait_for(port, nodes, layout, replicas=replicas)
         myself = next(f[0] for f in view if "myself" in f[2])
         ours = {}
-        out = subprocess.run([binary, "replies"], input=table_input(view, layout, by_id, myself),
+        pairs = replica_order(port) if replicas else []
+        out = subprocess.run([binary, "replies"], input=table_input(view, layout, by_id, myself, pairs),
                              capture_output=True, text=True, check=True).stdout
         for line in out.splitlines():
             if line.startswith("error"):
@@ -244,11 +274,14 @@ def node_probes(keys: Dict[str, List[bytes]], slot_of) -> List[Tuple]:
     return probes
 
 
-def compare_node(name: str, dbnode: str, node_port: int, nodes: List[Node], layout: Dict[int, Ranges], here: int) -> int:
+def compare_node(name: str, dbnode: str, node_port: int, nodes: List[Node], layout: Dict[int, Ranges], here: int,
+                 replicas: Optional[Dict[int, int]] = None) -> int:
     """Our node in Redis node `here`'s place: announcing its address and
     given its view as a table (our id in place of its id). The same
-    requests to both must get the same replies, apart from the node ids."""
-    view = wait_for(here, nodes, layout)
+    requests to both must get the same replies, apart from the node ids.
+    With `here` a replica, no request writes (writes would be replicated:
+    the offsets would move off 0)."""
+    view = wait_for(here, nodes, layout, replicas=replicas)
     # A Redis master that just joined reports `fail` (and refuses keys with
     # "CLUSTERDOWN The cluster is down") for a rejoin delay of up to 5 s
     # after the layout settled; a table has no such phase.
@@ -271,18 +304,23 @@ def compare_node(name: str, dbnode: str, node_port: int, nodes: List[Node], layo
         info = call(here, "CLUSTER", "INFO").value.decode()
         epoch = re.search(r"cluster_current_epoch:(\d+)", info).group(1)
         by_id = {n.id: n for n in nodes}
-        table = table_input(view, layout, by_id, theirs.decode()).replace(theirs.decode(), ours.decode())
+        pairs = replica_order(here) if replicas else []
+        table = table_input(view, layout, by_id, theirs.decode(), pairs).replace(theirs.decode(), ours.decode())
         args = ["CLUSTER", "SETTABLE", epoch, "NODES", str(sum(1 for l in table.splitlines() if l.startswith("node ")))]
         for line in table.splitlines():
             if line.startswith("node "):
                 args += line.split()[1:]
         ranges = [line.split()[1:] for line in table.splitlines() if line.startswith("range ")]
         args += ["RANGES", str(len(ranges))] + [w for r in ranges for w in r]
+        pairs = [line.split()[1:] for line in table.splitlines() if line.startswith("replica ")]
+        if pairs:
+            args += ["REPLICAS", str(len(pairs))] + [w for p in pairs for w in p]
         reply = call(node_port, *args)
         if reply.kind != "+":
             raise SystemExit(f"{name}: our node refused the table: {reply!r}")
-        call(here, "FLUSHALL")
-        call(node_port, "FLUSHALL")
+        if not replicas:
+            call(here, "FLUSHALL")
+            call(node_port, "FLUSHALL")
 
         def mask(raw: bytes) -> bytes:
             raw = HELLO_ID.sub(b"$2\r\nid\r\n:ID\r\n", raw.replace(theirs, b"<MYID>").replace(ours, b"<MYID>"))
@@ -295,6 +333,9 @@ def compare_node(name: str, dbnode: str, node_port: int, nodes: List[Node], layo
 
         failures = 0
         probes = node_probes(keys_by_owner(here, layout, here), lambda k: call(here, "CLUSTER", "KEYSLOT", k).value)
+        # At a replica every key is redirected: no write runs. (What it
+        # would serve after READONLY is left to milestone 3: the probes
+        # send READWRITE right after it.)
         # CLUSTER INFO: the lines a table determines.
         probes.append(("CLUSTER", "INFO"))
         for proto in (2, 3):
@@ -325,10 +366,14 @@ def compare_node(name: str, dbnode: str, node_port: int, nodes: List[Node], layo
         proc.wait()
 
 
-def setup(ports: List[int], layout: Dict[int, Ranges]) -> List[Node]:
-    """Resets every node and builds `layout` (port -> ranges) from scratch."""
+def setup(ports: List[int], layout: Dict[int, Ranges], replicas: Optional[Dict[int, int]] = None) -> List[Node]:
+    """Resets every node and builds `layout` (port -> ranges) from scratch,
+    with `replicas` (port -> primary port) replicating, in that order."""
     for p in ports:
-        call(p, "FLUSHALL")
+        # Only if there are keys: a primary with a backlog would propagate
+        # it, moving its replication offset off 0.
+        if call(p, "ROLE").value[0].value == b"master" and call(p, "DBSIZE").value:
+            call(p, "FLUSHALL")
         call(p, "CLUSTER", "RESET", "HARD")
     for i, p in enumerate(ports):
         call(p, "CLUSTER", "SET-CONFIG-EPOCH", str(i + 1))
@@ -336,7 +381,29 @@ def setup(ports: List[int], layout: Dict[int, Ranges]) -> List[Node]:
             call(p, "CLUSTER", "ADDSLOTSRANGE", str(s), str(e))
     for p in ports[1:]:
         call(ports[0], "CLUSTER", "MEET", "127.0.0.1", str(p))
-    return [Node(p) for p in ports]
+    nodes = [Node(p) for p in ports]
+    by_port = {n.port: n.id for n in nodes}
+    for r, p in (replicas or {}).items():
+        # Once the replica knows its primary.
+        deadline = time.time() + 30
+        while by_port[p] not in call(r, "CLUSTER", "NODES").value.decode():
+            if time.time() > deadline:
+                raise SystemExit(f"{r} never learned of {p}")
+            time.sleep(0.1)
+        reply = call(r, "CLUSTER", "REPLICATE", by_port[p])
+        if reply.kind != "+":
+            raise SystemExit(f"CLUSTER REPLICATE on {r}: {reply!r}")
+    return nodes
+
+
+def offsets_zero(ports: List[int]) -> bool:
+    """Whether every node's replication offset is still 0 (nothing was
+    replicated: the comparisons with replicas assume it)."""
+    for p in ports:
+        info = call(p, "INFO", "replication").value.decode()
+        if re.search(r"^(master_repl_offset|slave_repl_offset):(?!0\r$)", info, re.M):
+            return False
+    return True
 
 
 def main(argv: List[str]) -> int:
@@ -378,6 +445,24 @@ def main(argv: List[str]) -> int:
     failures += compare_layout("unassigned", args.bin, nodes, {}, [a])
     if args.dbnode:
         failures += compare_node("unassigned", args.dbnode, args.node_port, nodes, {}, a)
+
+    # 4. Replicas (phase 8): a and b with a replica each, asked at a
+    #    primary and at the replicas, our node in a replica's place; then a
+    #    with two, b with none. Nothing is written (see offsets_zero).
+    pairs = {c: a, d: b}
+    halves = {a: [(0, 8191)], b: [(8192, 16383)]}
+    nodes = setup(ports, halves, pairs)
+    failures += compare_layout("replicas", args.bin, nodes, halves, [a, c, d], pairs)
+    if args.dbnode:
+        failures += compare_node("replicas", args.dbnode, args.node_port, nodes, halves, c, pairs)
+    two = {c: a, d: a}
+    nodes = setup(ports, halves, two)
+    failures += compare_layout("two replicas", args.bin, nodes, halves, [b, d], two)
+    if args.dbnode:
+        failures += compare_node("two replicas", args.dbnode, args.node_port, nodes, halves, d, two)
+    if not offsets_zero(ports):
+        print("replicas: a replication offset moved off 0 during the checks; they don't hold")
+        failures += 1
 
     print("OK" if failures == 0 else f"FAILED: {failures}")
     return 1 if failures else 0

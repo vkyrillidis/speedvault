@@ -26,17 +26,23 @@ impl Site for Stuart {
             }
             full += usize::from(h.and_then(|h| h.memory).is_some_and(|m| m.full()));
         }
-        family(out, "stuart_nodes", Kind::Gauge, "Joined nodes: up and down (not answering), and of those leaving and full (90% of maxmemory).");
+        let failed = table.map_or(0, |t| t.failed().len());
+        family(out, "stuart_nodes", Kind::Gauge, "Joined nodes: up and down (not answering), and of those leaving, being made a replica (demoting), full (90% of maxmemory) and marked failed.");
         sample(out, "stuart_nodes", &[("state", "up")], up);
         sample(out, "stuart_nodes", &[("state", "down")], down);
         sample(out, "stuart_nodes", &[("state", "leaving")], state.leaving().len());
+        sample(out, "stuart_nodes", &[("state", "demoting")], usize::from(state.demoting().is_some()));
         sample(out, "stuart_nodes", &[("state", "full")], full);
+        sample(out, "stuart_nodes", &[("state", "failed")], failed);
         metric(out, "stuart_table_epoch", Kind::Gauge, "The slot table's epoch; 0: no table yet.", table.map_or(0, |t| t.epoch()));
         metric(out, "stuart_slots_moving", Kind::Gauge, "Slots moving between nodes.", table.map_or(0, |t| t.migrations().len()));
         metric(out, "stuart_slots_queued", Kind::Gauge, "Slots waiting to move.", state.queue().len());
         let unassigned = table.map_or(SLOTS, |t| SLOTS - t.assigned());
         metric(out, "stuart_slots_unassigned", Kind::Gauge, "Slots no node owns (no table yet: all).", unassigned);
         metric(out, "stuart_slots_moved_total", Kind::Counter, "Slots moved since stuart started.", self.slots_moved.get());
+        metric(out, "stuart_failovers_total", Kind::Counter, "Primaries failed over to a replica since stuart started.", self.failovers.get());
+        metric(out, "stuart_handovers_total", Kind::Counter, "Leaving primaries' slots handed to a replica since stuart started.", self.handovers.get());
+        metric(out, "stuart_demotions_total", Kind::Counter, "Primaries made replicas, the nodes needing fewer primaries, since stuart started.", self.demotions.get());
 
         // Per node: the labels tell them apart in dashboards.
         let nodes: Vec<PerNode> = state

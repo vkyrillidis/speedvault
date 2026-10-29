@@ -3,7 +3,8 @@
 # cluster-enabled redis-servers, makes a 3-node cluster of the first three
 # with `redis-cli --cluster create`, builds the crate's cluster_compat
 # example and the dbnode, and runs cluster_compat.py: KEYSLOT on random keys;
-# CLUSTER SLOTS, SHARDS and NODES in RESP2 and RESP3 for several layouts;
+# CLUSTER SLOTS, SHARDS and NODES in RESP2 and RESP3 for several layouts,
+# replicas among them;
 # and our node in cluster mode in a Redis node's place, the same requests to
 # both (MOVED, CROSSSLOT, CLUSTERDOWN, the CLUSTER commands). Stops the
 # servers afterwards.
@@ -52,8 +53,9 @@ cleanup() {
 trap cleanup EXIT
 for p in "${P[@]}"; do
   mkdir "$DIR/$p"
+  # No PING to replicas (they'd move the replication offsets off 0).
   (cd "$DIR/$p" && "$REDIS_SERVER" --port "$p" --cluster-enabled yes --cluster-config-file nodes.conf \
-     --cluster-require-full-coverage no \
+     --cluster-require-full-coverage no --repl-ping-replica-period 3600 \
      --save '' --appendonly no --daemonize yes --logfile "$DIR/$p/log")
 done
 for p in "${P[@]}"; do

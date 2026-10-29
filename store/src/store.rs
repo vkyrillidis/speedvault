@@ -1,9 +1,25 @@
 //! The keyspace: keys to values, with Redis 7's string commands and expiry.
 //!
 //! One `Store` per core, owned by that core's event loop: no locks, every
-//! method takes `&mut self`. The keys are `Rc<[u8]>`, shared between the map
-//! and the expiry index, which makes the store `!Send`: create it on the
-//! thread that uses it.
+//! method takes `&mut self`.
+//!
+//! # Keys
+//!
+//! A key and its value are one heap block, a [`Kv`] (see `kv` for what it
+//! holds), and the blocks sit in [`SLOTS`] tables, built like a large
+//! hash's ([`Indexed`]): a dense `Vec` of the blocks' pointers and an index
+//! of `u32` positions into it. In cluster mode ([`Store::with_slots`]) a
+//! table is a slot's: `CLUSTER COUNTKEYSINSLOT` is its length, and moving
+//! a slot to another node walks its table only, as Redis 8 keeps a dict
+//! per slot. A standalone store spreads its keys over as many tables by the
+//! top bits of their hash. The store doesn't know how keys map to slots:
+//! the dbnode passes the function (`cluster::key_hash_slot`).
+//!
+//! So a key costs its block, a pointer in its table's `Vec` and two to four
+//! `u32`s of its index (a `HashMap` of `Rc` keys cost about 200 bytes), and
+//! a table grows on its own: doubling one rehashes 1/16384 of the keys,
+//! where the one map of every key used to stop the node for 100s of ms.
+//! The price is a fixed 0.8 MB of empty tables.
 //!
 //! # Time
 //!
@@ -19,8 +35,10 @@
 //! `now > expire_at`, so at `now == expire_at` it's alive with a PTTL of 0).
 //!
 //! So that keys nobody reads again are reclaimed too, every key with an
-//! expiry also sits in a dense `Vec` (the entry knows its slot there; removal
-//! is a `swap_remove` that fixes the slot of the key moved into the hole).
+//! expiry also sits in a dense `Vec`, by where it is (its table and its
+//! position there; the block knows its place in the `Vec`). Removal is a
+//! `swap_remove` that fixes the place of the key moved into the hole, and a
+//! key moved in its table (by a `swap_remove` there) has its entry fixed.
 //! [`Store::expire_cycle`] walks that `Vec` round-robin from a cursor and
 //! deletes the expired keys it meets, at most `budget` of them per call.
 //! Compared with Redis's random sampling it's deterministic: every expiring
@@ -29,159 +47,121 @@
 //! common case for sessions and caches) only writes the entry, with no heap
 //! entry to leave behind or compact later, and keys without a TTL cost
 //! nothing. The price is that the sweep also looks at keys that aren't due
-//! yet; a sweep costs one map lookup per key examined.
+//! yet; a sweep reads one block per key examined, without hashing.
 //!
-//! # Keys by slot
+//! # Effects
 //!
-//! In cluster mode ([`Store::with_slots`]) every key also sits in the list
-//! of its slot, built like the expiry index: a dense `Vec` per slot, the
-//! entry knows its place in it, removal is a `swap_remove`. So `CLUSTER
-//! COUNTKEYSINSLOT` is O(1), and moving a slot to another node walks its
-//! keys only. The store doesn't know how keys map to slots: the dbnode
-//! passes the function (`cluster::key_hash_slot`). A key costs one more
-//! `Rc` in a `Vec` (16 bytes, plus the `Vec`'s spare room), and the entry
-//! keeps its place in a field that fills padding: an `Entry` stays 40 bytes.
+//! For a replica (phase 8), what a write did must be told as commands that
+//! do the same wherever they run, at any time. Most writes do that as sent
+//! (`SET`, `HSET`, `LMPOP`, `SMOVE`...); the others record their
+//! [`Effect`] once [`Store::record_effects`] turned recording on, as
+//! Redis's commands rewrite what they propagate: `SPOP` as the `SREM` of
+//! the members it took; an expiry relative to now (`EXPIRE`, `SET ... EX`)
+//! as the absolute time, `PEXPIREAT` or `SET ... PXAT`, and as `DEL` when
+//! that time had come; `INCRBYFLOAT` and `HINCRBYFLOAT` as the value they
+//! wrote. A key reclaimed because it expired, by a lookup or by
+//! [`Store::expire_cycle`], is recorded too (`DEL`): a replica doesn't
+//! expire keys by itself, its primary tells it, in order with the writes.
 //!
-//! A standalone store keeps one such list of every key (phase 7), so that
-//! `SCAN` can walk it: see [`Store::scan`].
+//! A replica's store doesn't reclaim ([`Store::set_reclaim`]): a key whose
+//! time has come is invisible to lookups but stays until its primary's
+//! `DEL`, and `expire_cycle` does nothing, as in a Redis replica. Applying
+//! the stream, the replica sets the time to [`BEFORE_TIME`], before every
+//! expiry: the keys its primary hasn't deleted are there for its writes.
 //!
 //! # Memory
 //!
-//! A `HashMap` or a `Vec` never gives back the room it grew, so after many
-//! deletions (a slot moved away, keys expired) the store would keep its
-//! largest size. [`Store::shrink`], called from a timer, shrinks the map and
-//! the expiry index once they're less than a tenth full (as Redis resizes
-//! its dicts in `serverCron`), to twice what they hold; a slot's list
-//! shrinks as keys leave it, and goes once it's empty. Shrinking the map
-//! rehashes what is left in one go, as growing it does.
+//! A `Vec` never gives back the room it grew, so after many deletions
+//! (keys expired) the expiry index would keep its largest size.
+//! [`Store::shrink`], called from a timer, shrinks it once it's less than a
+//! tenth full (as Redis resizes its dicts in `serverCron`), to twice what
+//! it holds. A table shrinks as keys leave it (see `table`), and gives back
+//! everything once empty (its slot moved away).
 
-use crate::collections::{Hash, List, Set};
-use crate::int::{parse_i64, write_i64};
+use crate::float::{self, LongDouble, Number};
+use crate::int::{format_i64, parse_i64};
+use crate::kv::{Kv, Value};
+use crate::table::Indexed;
 use crate::Error;
-use std::collections::HashMap;
+use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::mem;
-use std::rc::Rc;
 
-/// The `expire_at` of a key without expiry: never `< now`, so the expiry
-/// check on every lookup needs no extra branch.
-const NEVER: i64 = i64::MAX;
-/// The `slot` of a key without expiry.
-const NO_SLOT: u32 = u32::MAX;
+/// A time before every expiry: see the module docs.
+pub const BEFORE_TIME: i64 = i64::MIN;
 /// Redis's default `proto-max-bulk-len`: the longest string `APPEND` makes.
 pub const DEFAULT_MAX_STRING: usize = 512 * 1024 * 1024;
-/// [`Store::shrink`] leaves tables holding fewer entries than this alone:
-/// the room they keep is small, and shrinking them would come back soon.
+/// [`Store::shrink`] leaves an index holding fewer entries than this alone:
+/// the room it keeps is small, and shrinking it would come back soon.
 const SHRINK_MIN: usize = 1024;
-
-/// A value; commands meeting the wrong type fail with [`Error::WrongType`].
-/// The collections are boxed so that a `Value` stays the size of a `Vec`
-/// and an [`Entry`] 40 bytes.
-#[derive(Debug)]
-enum Value {
-    /// Binary-safe. A `Vec` rather than a `Box<[u8]>` so `APPEND` and
-    /// `INCR` grow and rewrite in place.
-    Str(Vec<u8>),
-    Hash(Box<Hash>),
-    Set(Box<Set>),
-    List(Box<List>),
-}
-
-impl Value {
-    fn type_name(&self) -> &'static str {
-        match self {
-            Value::Str(_) => "string",
-            Value::Hash(_) => "hash",
-            Value::Set(_) => "set",
-            Value::List(_) => "list",
-        }
-    }
-
-    /// `OBJECT ENCODING`: what Redis 7.0.15 would call it. A string is
-    /// `int` if it reads as one, `embstr` up to 44 bytes, else `raw`
-    /// (Redis also makes an `embstr` `raw` once it's modified in place, by
-    /// `APPEND` or `SETRANGE`, which this doesn't track).
-    fn encoding(&self) -> &'static str {
-        match self {
-            Value::Str(s) if s.len() <= 20 && parse_i64(s).is_some() => "int",
-            Value::Str(s) if s.len() <= 44 => "embstr",
-            Value::Str(_) => "raw",
-            Value::Hash(h) => h.encoding(),
-            Value::Set(s) => s.encoding(),
-            Value::List(l) => l.encoding(),
-        }
-    }
-
-    fn as_str(&self) -> Result<&Vec<u8>, Error> {
-        match self {
-            Value::Str(s) => Ok(s),
-            _ => Err(Error::WrongType),
-        }
-    }
-
-    fn as_str_mut(&mut self) -> Result<&mut Vec<u8>, Error> {
-        match self {
-            Value::Str(s) => Ok(s),
-            _ => Err(Error::WrongType),
-        }
-    }
-
-    /// Makes this the string `value`, reusing the buffer when it fits
-    /// without wasting much: an overwrite then costs no allocation.
-    fn assign(&mut self, value: &[u8]) {
-        match self {
-            Value::Str(buf) if buf.capacity() >= value.len() && buf.capacity() <= 2 * value.len() + 64 => {
-                buf.clear();
-                buf.extend_from_slice(value);
-            }
-            _ => *self = Value::Str(value.to_vec()),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct Entry {
-    value: Value,
-    /// Unix ms; [`NEVER`] without expiry.
-    expire_at: i64,
-    /// Index in `Store::expiring`; [`NO_SLOT`] without expiry.
-    slot: u32,
-    /// Index in its slot's list of [`Slots::keys`] (the one list of a
-    /// standalone store).
-    pos: u32,
-}
 
 /// The number of slots of a Redis Cluster.
 pub const SLOTS: usize = 16384;
 
-/// The keys of every slot; see the module docs. Without `slot_of` (a
-/// standalone node) one list holds every key, for `SCAN`, built by the
-/// first `SCAN` (until then the store pays nothing for it).
-struct Slots {
-    /// A key's slot, below [`SLOTS`].
+/// Where a key is: its table, and its position there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Loc {
+    table: u32,
+    pos: u32,
+}
+
+/// The tables of keys; see the module docs.
+struct Keys {
+    tables: Box<[Indexed<Kv>]>,
+    /// A key's slot, below [`SLOTS`]: the table of a key in cluster mode.
     slot_of: Option<fn(&[u8]) -> u16>,
-    keys: Vec<Vec<Rc<[u8]>>>,
-    /// Whether the lists are kept: from the start by slot, from the first
-    /// `SCAN` standalone.
-    active: bool,
+    /// SipHash, randomly keyed per store: slower than a plain hash but,
+    /// like Redis's keyed SipHash, it keeps clients from choosing keys
+    /// that collide.
+    hasher: RandomState,
+    /// How many keys, in all the tables.
+    len: usize,
+    /// The table that held the most keys when one was last added: the
+    /// largest to grow next, for [`Store::growth`].
+    largest: usize,
 }
 
-impl Slots {
-    fn new(slot_of: Option<fn(&[u8]) -> u16>) -> Slots {
-        let lists = if slot_of.is_some() { SLOTS } else { 1 };
-        Slots { slot_of, keys: (0..lists).map(|_| Vec::new()).collect(), active: slot_of.is_some() }
+impl Keys {
+    fn new(slot_of: Option<fn(&[u8]) -> u16>) -> Keys {
+        let tables = (0..SLOTS).map(|_| Indexed::default()).collect();
+        Keys { tables, slot_of, hasher: RandomState::new(), len: 0, largest: 0 }
     }
 
-    /// The list `key` belongs in.
-    fn list_of(&self, key: &[u8]) -> usize {
-        self.slot_of.map_or(0, |slot_of| usize::from(slot_of(key)))
+    /// The table of `key`, and its hash there.
+    fn locate(&self, key: &[u8]) -> (usize, u32) {
+        let hash = self.hasher.hash_one(key);
+        // The top bits standalone: the table's index takes the low ones.
+        let table = self.slot_of.map_or((hash >> (64 - SLOTS.trailing_zeros())) as usize, |slot_of| usize::from(slot_of(key)));
+        (table, hash as u32)
+    }
+
+    /// Where `key` is, expired or not.
+    fn find(&self, key: &[u8]) -> Option<Loc> {
+        let (table, hash) = self.locate(key);
+        let pos = self.tables[table].find(hash, key)?;
+        Some(Loc { table: table as u32, pos: pos as u32 })
+    }
+
+    fn at(&self, loc: Loc) -> &Kv {
+        self.tables[loc.table as usize].get(loc.pos as usize).expect("a key where it was")
+    }
+
+    fn at_mut(&mut self, loc: Loc) -> &mut Kv {
+        self.tables[loc.table as usize].get_mut(loc.pos as usize).expect("a key where it was")
+    }
+
+    fn get(&self, key: &[u8]) -> Option<&Kv> {
+        self.find(key).map(|loc| self.at(loc))
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Kv> {
+        self.tables.iter().flat_map(|t| t.entries())
     }
 }
 
-impl std::fmt::Debug for Slots {
+impl std::fmt::Debug for Keys {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let keys: usize = self.keys.iter().map(Vec::len).sum();
-        f.debug_struct("Slots").field("keys", &keys).finish()
+        f.debug_struct("Keys").field("len", &self.len).field("slots", &self.slot_of.is_some()).finish()
     }
 }
 
@@ -289,29 +269,43 @@ impl ExpireFlags {
 }
 
 /// The keyspace of one core. See the [module docs](self) for the design.
-///
-/// The map uses std's default hasher (SipHash, randomly keyed per process):
-/// slower than a plain hash but, like Redis's keyed SipHash, it keeps
-/// clients from choosing keys that collide. Revisit when profiling says so.
 #[derive(Debug)]
 pub struct Store {
-    map: HashMap<Rc<[u8]>, Entry>,
+    keys: Keys,
     /// Every key with an expiry, in no order; see the module docs.
-    expiring: Vec<Rc<[u8]>>,
+    expiring: Vec<Loc>,
     /// Where `expire_cycle` continues.
     cursor: usize,
     /// Unix ms.
     now: i64,
     /// The longest string `APPEND` makes.
     max_string: usize,
-    /// The keys by slot, in cluster mode.
-    slots: Slots,
-    /// The map's largest `capacity` seen by [`Store::shrink`] since it last
-    /// shrank: deletions leave tombstones, which `capacity` subtracts, but
-    /// the table keeps its size.
-    map_room: usize,
     /// For `SPOP`, `SRANDMEMBER`: xorshift64*, seeded at random.
     rng: u64,
+    /// While recording (see the module docs), the effects since they were
+    /// last taken.
+    effects: Option<Vec<Effect>>,
+    /// Whether expired keys are deleted (not at a replica).
+    reclaim: bool,
+    /// Slots whose expired keys are hidden but not deleted, as at a
+    /// replica, whatever `reclaim` says: in cluster mode, the slots a
+    /// node copies from another (moving by snapshot), whose keys the
+    /// other expires. Their keys aren't counted or listed either (`DBSIZE`,
+    /// `KEYS`, `SCAN`), as Redis 8 hides a slot it imports. In order;
+    /// usually empty.
+    held: Vec<u16>,
+}
+
+/// What a write did, when it isn't what the command says as sent, or a key
+/// reclaimed as expired; see the [module docs](self).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Effect {
+    /// The key had expired and is gone: `DEL key`.
+    Expired(Vec<u8>),
+    /// The command did this, as a command's arguments (the name first).
+    As(Vec<Vec<u8>>),
+    /// The command, which records its effect, changed nothing.
+    Nothing,
 }
 
 impl Default for Store {
@@ -320,14 +314,15 @@ impl Default for Store {
         // xorshift's state must not be 0.
         let rng = std::collections::hash_map::RandomState::new().hash_one(0u8) | 1;
         Store {
-            map: HashMap::new(),
+            keys: Keys::new(None),
             expiring: Vec::new(),
             cursor: 0,
             now: 0,
             max_string: DEFAULT_MAX_STRING,
-            slots: Slots::new(None),
-            map_room: 0,
             rng,
+            effects: None,
+            reclaim: true,
+            held: Vec::new(),
         }
     }
 }
@@ -337,10 +332,10 @@ impl Store {
         Store::default()
     }
 
-    /// A store that also lists its keys by slot (see the module docs), for
+    /// A store that keeps its keys by slot (see the module docs), for
     /// cluster mode. `slot_of` gives a key's slot, below [`SLOTS`].
     pub fn with_slots(slot_of: fn(&[u8]) -> u16) -> Store {
-        Store { slots: Slots::new(Some(slot_of)), ..Store::default() }
+        Store { keys: Keys::new(Some(slot_of)), ..Store::default() }
     }
 
     /// Sets the current time, unix ms. Expiry is judged against it.
@@ -350,6 +345,63 @@ impl Store {
 
     pub fn now(&self) -> i64 {
         self.now
+    }
+
+    /// Whether expired keys are deleted, by lookups and by
+    /// [`expire_cycle`](Self::expire_cycle) (the default), or only hidden
+    /// (a replica's store). See the module docs.
+    pub fn set_reclaim(&mut self, on: bool) {
+        self.reclaim = on;
+    }
+
+    /// The slots whose expired keys aren't deleted (see `held`), replacing
+    /// those given before.
+    pub fn set_held(&mut self, mut slots: Vec<u16>) {
+        slots.sort_unstable();
+        slots.dedup();
+        self.held = slots;
+    }
+
+    /// Whether `slot` is held (see `held`).
+    pub fn is_held(&self, slot: u16) -> bool {
+        !self.held.is_empty() && self.held.binary_search(&slot).is_ok()
+    }
+
+    /// Whether the keys of `table`, expired, may be deleted.
+    fn reclaims(&self, table: u32) -> bool {
+        self.reclaim && !self.table_held(table)
+    }
+
+    /// Whether `table` is a held slot's.
+    fn table_held(&self, table: u32) -> bool {
+        !self.held.is_empty() && self.has_slots() && self.is_held(table as u16)
+    }
+
+    /// Records the writes' effects from now on, or stops (and drops those
+    /// not taken). See the module docs.
+    pub fn record_effects(&mut self, on: bool) {
+        self.effects = on.then(Vec::new);
+    }
+
+    /// The effects recorded since the last call, in order.
+    pub fn take_effects(&mut self) -> Vec<Effect> {
+        match &mut self.effects {
+            Some(effects) if !effects.is_empty() => mem::take(effects),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether effects are recorded and some wait to be taken: cheaper
+    /// than [`take_effects`](Self::take_effects) for every command.
+    pub fn has_effects(&self) -> bool {
+        self.effects.as_ref().is_some_and(|e| !e.is_empty())
+    }
+
+    /// Records `effect` if recording.
+    fn effect(&mut self, effect: impl FnOnce() -> Effect) {
+        if let Some(effects) = &mut self.effects {
+            effects.push(effect());
+        }
     }
 
     /// Redis's `proto-max-bulk-len` as far as the store is concerned: the
@@ -362,7 +414,7 @@ impl Store {
     /// `GET`. The value is borrowed: copy it straight into the reply.
     pub fn get(&mut self, key: &[u8]) -> Result<Option<&[u8]>, Error> {
         match self.live(key) {
-            Some(e) => Ok(Some(e.value.as_str()?)),
+            Some(e) => Ok(Some(e.as_str()?)),
             None => Ok(None),
         }
     }
@@ -375,7 +427,7 @@ impl Store {
         for key in keys {
             self.live(key);
         }
-        keys.iter().map(|key| self.map.get(*key).and_then(|e| e.value.as_str().ok()).map(|s| &s[..])).collect()
+        keys.iter().map(|key| self.keys.get(key).and_then(|e| e.as_str().ok())).collect()
     }
 
     /// `SET` with its options; see [`SetReply`] for what it returns.
@@ -384,10 +436,12 @@ impl Store {
         // the condition.
         let at = self.expire_at_for_set(opts.expiry)?;
         let now = self.now;
+        // With an expiry the effect is the absolute time, or a delete.
+        let recorded = at.is_some() && self.effects.is_some();
         let entry = self.live(key);
         if opts.get {
             if let Some(e) = &entry {
-                e.value.as_str()?;
+                e.as_str()?;
             }
         }
         let blocked = match opts.cond {
@@ -396,32 +450,31 @@ impl Store {
             SetCond::Xx => entry.is_none(),
         };
         if blocked {
-            return Ok(match entry {
+            let reply = match entry {
                 _ if !opts.get => SetReply::NotSet,
-                Some(e) => SetReply::Old(Some(e.value.as_str()?.clone())),
+                Some(e) => SetReply::Old(Some(e.as_str()?.to_vec())),
                 None => SetReply::Old(None),
-            });
+            };
+            if recorded {
+                self.effect(|| Effect::Nothing);
+            }
+            return Ok(reply);
         }
+        let existed = entry.is_some();
         let old = match entry {
             None => {
                 // An expiry in the past (PXAT 1) still replies OK, but leaves
                 // no key behind.
                 if at.is_none_or(|at| at > now) {
-                    self.insert(key, value.to_vec(), at);
+                    self.insert(key, value, at);
                 }
                 None
             }
             Some(e) => {
-                let old = if opts.get {
-                    match mem::replace(&mut e.value, Value::Str(value.to_vec())) {
-                        Value::Str(old) => Some(old),
-                        _ => unreachable!("type checked above"),
-                    }
-                } else {
-                    e.value.assign(value);
-                    None
-                };
-                let has_ttl = e.slot != NO_SLOT;
+                // The type was checked above.
+                let old = if opts.get { Some(e.as_str()?.to_vec()) } else { None };
+                e.set_str(value);
+                let has_ttl = e.has_ttl();
                 match (opts.expiry, at) {
                     (SetExpiry::KeepTtl, _) => {}
                     (_, None) if has_ttl => self.set_ttl(key, None),
@@ -429,12 +482,19 @@ impl Store {
                     (_, Some(at)) if at <= now => {
                         self.remove(key);
                     }
-                    (_, Some(at)) if has_ttl => e.expire_at = at,
+                    (_, Some(at)) if has_ttl => e.set_expire_at(at),
                     (_, Some(at)) => self.set_ttl(key, Some(at)),
                 }
                 old
             }
         };
+        if let Some(at) = at.filter(|_| recorded) {
+            self.effect(|| match () {
+                _ if at > now => Effect::As(vec![b"SET".to_vec(), key.to_vec(), value.to_vec(), b"PXAT".to_vec(), at.to_string().into()]),
+                _ if existed => Effect::As(vec![b"DEL".to_vec(), key.to_vec()]),
+                _ => Effect::Nothing,
+            });
+        }
         Ok(if opts.get { SetReply::Old(old) } else { SetReply::Ok })
     }
 
@@ -482,7 +542,7 @@ impl Store {
     /// has: Redis's lookup with `LOOKUP_NOEXPIRE`, which the slot check of
     /// a migrating slot uses (the command may be redirected, not run).
     pub fn contains(&self, key: &[u8]) -> bool {
-        self.map.get(key).is_some_and(|e| self.now <= e.expire_at)
+        self.keys.get(key).is_some_and(|e| self.now <= e.expire_at())
     }
 
     /// A live key's value and the milliseconds it has left (`None` without
@@ -490,10 +550,10 @@ impl Store {
     /// copying it to another node. Like [`contains`](Self::contains), an
     /// expired key is `None` and isn't reclaimed.
     pub fn peek(&self, key: &[u8]) -> Option<(&[u8], Option<i64>)> {
-        let e = self.map.get(key).filter(|e| self.now <= e.expire_at)?;
-        let ttl = (e.slot != NO_SLOT).then(|| (e.expire_at - self.now).max(1));
+        let e = self.keys.get(key).filter(|e| self.now <= e.expire_at())?;
+        let ttl = e.has_ttl().then(|| (e.expire_at() - self.now).max(1));
         // Only strings exist outside the tests.
-        Some((e.value.as_str().ok()?, ttl))
+        Some((e.as_str().ok()?, ttl))
     }
 
     /// `GETDEL`: the value, now deleted. A value of another type stays.
@@ -501,29 +561,31 @@ impl Store {
         match self.live(key) {
             None => return Ok(None),
             Some(e) => {
-                e.value.as_str()?;
+                e.as_str()?;
             }
         }
-        match self.remove(key).map(|e| e.value) {
+        match self.remove(key).map(Kv::into_value) {
             Some(Value::Str(s)) => Ok(Some(s)),
             _ => unreachable!("checked above"),
         }
     }
 
     /// `APPEND`: the new length. Creates the key if missing; keeps the TTL.
+    /// The string moves out of its block to a `Vec` of its own, which grows
+    /// by doubling: appending stays linear.
     pub fn append(&mut self, key: &[u8], value: &[u8]) -> Result<usize, Error> {
         let max = self.max_string;
         match self.live(key) {
             Some(e) => {
-                let s = e.value.as_str_mut()?;
-                if s.len() + value.len() > max {
+                if e.as_str()?.len() + value.len() > max {
                     return Err(Error::StringTooLong);
                 }
+                let s = e.str_buf()?;
                 s.extend_from_slice(value);
                 Ok(s.len())
             }
             None => {
-                self.insert(key, value.to_vec(), None);
+                self.insert(key, value, None);
                 Ok(value.len())
             }
         }
@@ -532,7 +594,7 @@ impl Store {
     /// `STRLEN`: 0 for a missing key.
     pub fn strlen(&mut self, key: &[u8]) -> Result<usize, Error> {
         match self.live(key) {
-            Some(e) => Ok(e.value.as_str()?.len()),
+            Some(e) => Ok(e.as_str()?.len()),
             None => Ok(0),
         }
     }
@@ -540,21 +602,39 @@ impl Store {
     /// `INCRBY` (and `INCR` with 1): the new value. A missing key counts as
     /// 0; the TTL is kept.
     pub fn incr_by(&mut self, key: &[u8], by: i64) -> Result<i64, Error> {
+        let mut buf = [0; 20];
         match self.live(key) {
             Some(e) => {
-                let s = e.value.as_str_mut()?;
-                let old = parse_i64(s).ok_or(Error::NotInteger)?;
+                let old = parse_i64(e.as_str()?).ok_or(Error::NotInteger)?;
                 let new = old.checked_add(by).ok_or(Error::Overflow)?;
-                write_i64(s, new);
+                e.set_str(format_i64(&mut buf, new));
                 Ok(new)
             }
             None => {
-                let mut s = Vec::with_capacity(20);
-                write_i64(&mut s, by);
-                self.insert(key, s, None);
+                self.insert(key, format_i64(&mut buf, by), None);
                 Ok(by)
             }
         }
+    }
+
+    /// `INCRBYFLOAT`: the new value, as written. In Redis's order: the
+    /// key's type, its value, then the increment; the TTL is kept. (Redis
+    /// keeps the result as an `embstr` even when it reads as an integer;
+    /// `OBJECT ENCODING` here goes by the contents.)
+    pub fn incr_by_float(&mut self, key: &[u8], incr: &[u8]) -> Result<Vec<u8>, Error> {
+        let old = match self.live(key) {
+            Some(e) => float::parse(e.as_str()?).ok_or(Error::NotFloat)?,
+            None => Number::Finite(LongDouble::ZERO),
+        };
+        let incr = float::parse(incr).ok_or(Error::NotFloat)?;
+        let mut new = Vec::new();
+        old.add(incr).ok_or(Error::NotFinite)?.write(&mut new);
+        match self.live(key) {
+            Some(e) => e.set_str(&new),
+            None => self.insert(key, &new, None),
+        }
+        self.effect(|| Effect::As(vec![b"SET".to_vec(), key.to_vec(), new.clone(), b"KEEPTTL".to_vec()]));
+        Ok(new)
     }
 
     /// `DECRBY` (and `DECR` with 1).
@@ -580,19 +660,25 @@ impl Store {
         let at = when.checked_mul(unit).and_then(|ms| ms.checked_add(base)).ok_or(invalid)?;
 
         let now = self.now;
-        let Some(e) = self.live(key) else { return Ok(false) };
-        let current = (e.slot != NO_SLOT).then_some(e.expire_at);
+        let Some(e) = self.live(key) else {
+            self.effect(|| Effect::Nothing);
+            return Ok(false);
+        };
+        let current = e.has_ttl().then(|| e.expire_at());
         let refused = (flags.nx && current.is_some())
             || (flags.xx && current.is_none())
             || (flags.gt && current.is_none_or(|cur| at <= cur))
             || (flags.lt && current.is_some_and(|cur| at >= cur));
         if refused {
+            self.effect(|| Effect::Nothing);
             return Ok(false);
         }
         if at <= now {
             self.remove(key);
+            self.effect(|| Effect::As(vec![b"DEL".to_vec(), key.to_vec()]));
         } else {
             self.set_ttl(key, Some(at));
+            self.effect(|| Effect::As(vec![b"PEXPIREAT".to_vec(), key.to_vec(), at.to_string().into()]));
         }
         Ok(true)
     }
@@ -602,9 +688,19 @@ impl Store {
         let now = self.now;
         match self.live(key) {
             None => -2,
-            Some(e) if e.slot == NO_SLOT => -1,
+            Some(e) if !e.has_ttl() => -1,
             // `live` leaves only keys with now <= expire_at: never negative.
-            Some(e) => e.expire_at.saturating_sub(now),
+            Some(e) => e.expire_at().saturating_sub(now),
+        }
+    }
+
+    /// `PEXPIRETIME`: the absolute expiry, unix ms; -1 without expiry, -2
+    /// if the key doesn't exist.
+    pub fn pexpire_time(&mut self, key: &[u8]) -> i64 {
+        match self.live(key) {
+            None => -2,
+            Some(e) if !e.has_ttl() => -1,
+            Some(e) => e.expire_at(),
         }
     }
 
@@ -619,7 +715,7 @@ impl Store {
     /// `PERSIST`: true if the key had an expiry, now removed.
     pub fn persist(&mut self, key: &[u8]) -> bool {
         match self.live(key) {
-            Some(e) if e.slot != NO_SLOT => {
+            Some(e) if e.has_ttl() => {
                 self.set_ttl(key, None);
                 true
             }
@@ -630,53 +726,88 @@ impl Store {
     /// `TYPE`: `"string"`, `"hash"`, `"set"`, `"list"`, or `"none"` for a
     /// missing key.
     pub fn type_of(&mut self, key: &[u8]) -> &'static str {
-        self.live(key).map_or("none", |e| e.value.type_name())
+        self.live(key).map_or("none", |e| e.type_name())
     }
 
     /// `OBJECT ENCODING`: `None` for a missing key.
     pub fn encoding(&mut self, key: &[u8]) -> Option<&'static str> {
-        self.live(key).map(|e| e.value.encoding())
+        self.live(key).map(|e| e.encoding())
     }
 
-    /// `DBSIZE`. Like Redis, counts expired keys not reclaimed yet.
+    /// Every key, expired keys not reclaimed yet included, those of held
+    /// slots too (`INFO keyspace`).
     pub fn dbsize(&self) -> usize {
-        self.map.len()
+        self.keys.len
+    }
+
+    /// `DBSIZE`: like [`dbsize`](Self::dbsize), without the held slots'
+    /// keys (see [`set_held`](Self::set_held)).
+    pub fn dbsize_served(&self) -> usize {
+        let held: usize = if self.has_slots() { self.held.iter().map(|&s| self.keys.tables[usize::from(s)].len()).sum() } else { 0 };
+        self.keys.len - held
     }
 
     /// Every key, in no particular order; like [`dbsize`](Self::dbsize),
     /// expired keys not reclaimed yet included.
     pub fn keys(&self) -> impl Iterator<Item = &[u8]> {
-        self.map.keys().map(|k| &**k)
+        self.keys.iter().map(Kv::key)
     }
 
-    /// Whether the keys are listed by slot ([`Store::with_slots`]).
+    /// Whether the keys are kept by slot ([`Store::with_slots`]).
     pub fn has_slots(&self) -> bool {
-        self.slots.slot_of.is_some()
+        self.keys.slot_of.is_some()
+    }
+
+    /// The table of `slot`. Panics without slots, or if `slot` isn't below
+    /// [`SLOTS`].
+    fn slot(&self, slot: u16) -> &Indexed<Kv> {
+        assert!(self.has_slots(), "a store without the slot index");
+        &self.keys.tables[usize::from(slot)]
     }
 
     /// `CLUSTER COUNTKEYSINSLOT`: like [`dbsize`](Self::dbsize), expired
     /// keys not reclaimed yet included. Panics without the slot index, or if
     /// `slot` isn't below [`SLOTS`].
     pub fn count_in_slot(&self, slot: u16) -> usize {
-        assert!(self.has_slots(), "a store without the slot index");
-        self.slots.keys[usize::from(slot)].len()
+        self.slot(slot).len()
     }
 
     /// The keys of `slot`, in no particular order, expired ones not
     /// reclaimed yet included (`CLUSTER GETKEYSINSLOT`). Panics as
     /// [`count_in_slot`](Self::count_in_slot) does.
     pub fn keys_in_slot(&self, slot: u16) -> impl Iterator<Item = &[u8]> {
-        assert!(self.has_slots(), "a store without the slot index");
-        self.slots.keys[usize::from(slot)].iter().map(|k| &**k)
+        self.slot(slot).entries().iter().map(Kv::key)
+    }
+
+    /// Deletes up to `n` keys of `slot`, expired or not, recording no
+    /// effect, and returns them: a slot given up, emptied in pieces. Panics
+    /// as [`count_in_slot`](Self::count_in_slot) does.
+    pub fn drop_slot_part(&mut self, slot: u16, n: usize) -> Vec<Box<[u8]>> {
+        let len = self.slot(slot).len();
+        let mut keys = Vec::with_capacity(n.min(len));
+        // From the end: nothing moves.
+        for pos in (len.saturating_sub(n)..len).rev() {
+            keys.push(self.remove_at(Loc { table: u32::from(slot), pos: pos as u32 }).key().into());
+        }
+        keys
+    }
+
+    /// Deletes every key of `slot`, expired or not, recording no effect: a
+    /// slot copied from another node and given up. Returns how many.
+    /// Panics as [`count_in_slot`](Self::count_in_slot) does.
+    pub fn drop_slot(&mut self, slot: u16) -> usize {
+        let len = self.slot(slot).len();
+        for pos in (0..len).rev() {
+            self.remove_at(Loc { table: u32::from(slot), pos: pos as u32 });
+        }
+        len
     }
 
     /// `FLUSHDB` / `FLUSHALL`. Frees the memory too.
     pub fn flush(&mut self) {
-        self.map = HashMap::new();
-        self.map_room = 0;
+        self.keys = Keys::new(self.keys.slot_of);
         self.expiring = Vec::new();
         self.cursor = 0;
-        self.slots = Slots::new(self.slots.slot_of);
     }
 
     /// Active expiry: examines up to `budget` keys with an expiry, continuing
@@ -685,6 +816,9 @@ impl Store {
     /// `budget`, more are probably due and calling again soon pays off.
     pub fn expire_cycle(&mut self, budget: usize) -> usize {
         let mut removed = 0;
+        if !self.reclaim {
+            return 0;
+        }
         for _ in 0..budget {
             if self.expiring.is_empty() {
                 break;
@@ -692,11 +826,11 @@ impl Store {
             if self.cursor >= self.expiring.len() {
                 self.cursor = 0;
             }
-            let key = &self.expiring[self.cursor];
-            if self.now > self.map[&**key].expire_at {
-                // The last key moves into this slot: examine it next.
-                let key = Rc::clone(key);
-                self.remove(&key);
+            let loc = self.expiring[self.cursor];
+            if self.now > self.keys.at(loc).expire_at() && self.reclaims(loc.table) {
+                // The last key moves into this place: examine it next.
+                let kv = self.remove_at(loc);
+                self.effect(|| Effect::Expired(kv.key().to_vec()));
                 removed += 1;
             } else {
                 self.cursor += 1;
@@ -705,44 +839,30 @@ impl Store {
         removed
     }
 
-    /// Gives back the room of the map and the expiry index once they're
-    /// less than a tenth full (see the [module docs](self)). Call it from a
-    /// timer. Returns whether it shrank anything.
+    /// Gives back the room of the expiry index once it's less than a tenth
+    /// full (see the [module docs](self)). Call it from a timer. Returns
+    /// whether it shrank anything.
     pub fn shrink(&mut self) -> bool {
         let sparse = |len: usize, capacity: usize| capacity > SHRINK_MIN && len * 10 < capacity;
-        let mut shrank = false;
-        self.map_room = self.map_room.max(self.map.capacity());
-        if sparse(self.map.len(), self.map_room) {
-            self.map.shrink_to(self.map.len() * 2);
-            self.map_room = self.map.capacity();
-            shrank = true;
-        }
         if sparse(self.expiring.len(), self.expiring.capacity()) {
             self.expiring.shrink_to(self.expiring.len() * 2);
-            shrank = true;
+            return true;
         }
-        shrank
+        false
     }
 
-    /// The bytes the next new key would allocate at once if it makes the
-    /// map grow (a table twice the size, while the old one is still
-    /// there), and the expiry index with it; 0 if it fits. So that a node
-    /// can refuse the write instead of jumping past its limit: Redis
-    /// refuses to expand a dict past `maxmemory` for the same reason. An
-    /// estimate: std doesn't tell the table's size, and a map full of
-    /// tombstones is cleaned in place rather than grown.
+    /// The most the next new key may allocate at once if it makes a table
+    /// grow (its `Vec` or its index twice the size, while the old one is
+    /// still there), and the expiry index with it. So that a node can
+    /// refuse the write instead of jumping past its limit: Redis refuses to
+    /// expand a dict past `maxmemory` for the same reason. Which table the
+    /// key goes to isn't known, so the tables count as the largest one,
+    /// full (see `Keys::largest`): a few kB, where one map of every key
+    /// doubled by hundreds of MB.
     pub fn growth(&self) -> usize {
-        let mut bytes = 0;
-        let (len, capacity) = (self.map.len(), self.map.capacity());
-        let room = self.map_room.max(capacity);
-        if len >= capacity && (len + 1) * 2 > room {
-            // hashbrown: buckets a power of two, filled to 7/8; a control
-            // byte per bucket.
-            let buckets = ((len.max(room) + 1) * 8 / 7).next_power_of_two();
-            bytes += buckets * (mem::size_of::<(Rc<[u8]>, Entry)>() + 1);
-        }
+        let mut bytes = self.keys.tables[self.keys.largest].growth_bound();
         if !self.expiring.is_empty() && self.expiring.len() == self.expiring.capacity() {
-            bytes += self.expiring.capacity() * 2 * mem::size_of::<Rc<[u8]>>();
+            bytes += self.expiring.capacity() * 2 * mem::size_of::<Loc>();
         }
         bytes
     }
@@ -752,112 +872,84 @@ impl Store {
         self.expiring.len()
     }
 
-    /// The entry of `key` unless it has expired; an expired one is deleted.
+    /// The block of `key` unless it has expired; an expired one is deleted.
     /// Every command looks its key up through here.
-    fn live(&mut self, key: &[u8]) -> Option<&mut Entry> {
-        let now = self.now;
-        let entry: *mut Entry = self.map.get_mut(key)?;
-        // SAFETY: `entry` comes from a `&mut` into the map, which isn't
-        // touched again before the pointer becomes a `&mut` with the same
-        // lifetime, except on the path that removes the entry, which doesn't
-        // use the pointer after that. Safe Rust can't say this yet (returning
-        // the borrow on one path and mutating the map on the other is NLL
-        // "problem case #3"); a second lookup would cost a hash per GET.
-        unsafe {
-            if now > (*entry).expire_at {
-                self.remove(key);
-                return None;
+    fn live(&mut self, key: &[u8]) -> Option<&mut Kv> {
+        let loc = self.keys.find(key)?;
+        if self.now > self.keys.at(loc).expire_at() {
+            if self.reclaims(loc.table) {
+                self.remove_at(loc);
+                self.effect(|| Effect::Expired(key.to_vec()));
             }
-            Some(&mut *entry)
+            return None;
         }
+        Some(self.keys.at_mut(loc))
     }
 
-    /// Adds a key that doesn't exist (expired counts as existing: check
-    /// with `live` first).
-    fn insert(&mut self, key: &[u8], value: Vec<u8>, at: Option<i64>) {
-        self.insert_value(key, Value::Str(value), at);
+    /// Adds a string key that doesn't exist (expired counts as existing:
+    /// check with `live` first).
+    fn insert(&mut self, key: &[u8], value: &[u8], at: Option<i64>) {
+        self.insert_kv(key, at, |hash, ttl| Kv::new_str(hash, key, value, ttl));
     }
 
     /// [`insert`](Self::insert) of any value.
     fn insert_value(&mut self, key: &[u8], value: Value, at: Option<i64>) {
-        let key: Rc<[u8]> = Rc::from(key);
-        let (expire_at, slot) = match at {
-            Some(at) => (at, self.push_expiring(Rc::clone(&key))),
-            None => (NEVER, NO_SLOT),
-        };
-        let pos = if self.slots.active {
-            let i = self.slots.list_of(&key);
-            let list = &mut self.slots.keys[i];
-            list.push(Rc::clone(&key));
-            (list.len() - 1) as u32
-        } else {
-            0
-        };
-        let old = self.map.insert(key, Entry { value, expire_at, slot, pos });
-        debug_assert!(old.is_none(), "insert of an existing key");
+        self.insert_kv(key, at, |hash, ttl| Kv::new(hash, key, value, ttl));
     }
 
-    /// Deletes `key`, expired or not, and its places in the expiry and slot
-    /// indexes.
-    fn remove(&mut self, key: &[u8]) -> Option<Entry> {
-        let entry = self.map.remove(key)?;
-        if entry.slot != NO_SLOT {
-            self.unlink(entry.slot);
+    /// Adds the block `make` makes from the key's hash and its expiry.
+    fn insert_kv(&mut self, key: &[u8], at: Option<i64>, make: impl FnOnce(u32, Option<(i64, u32)>) -> Kv) {
+        let (table, hash) = self.keys.locate(key);
+        debug_assert!(self.keys.tables[table].find(hash, key).is_none(), "insert of an existing key");
+        let ttl = at.map(|at| (at, self.next_ttl_slot()));
+        let pos = self.keys.tables[table].push(make(hash, ttl));
+        if ttl.is_some() {
+            self.expiring.push(Loc { table: table as u32, pos: pos as u32 });
         }
-        if !self.slots.active {
-            return Some(entry);
+        self.keys.len += 1;
+        if self.keys.tables[table].len() > self.keys.tables[self.keys.largest].len() {
+            self.keys.largest = table;
         }
-        let i = self.slots.list_of(key);
-        let list = &mut self.slots.keys[i];
-        list.swap_remove(entry.pos as usize);
-        if let Some(moved) = list.get(entry.pos as usize) {
-            self.map.get_mut(&**moved).expect("slot index out of sync").pos = entry.pos;
-        }
-        // Room given back as the slot empties (it moved away): halved at a
-        // quarter full, freed when empty.
-        if list.is_empty() {
-            *list = Vec::new();
-        } else if list.len() * 4 <= list.capacity() && list.capacity() > 16 {
-            list.shrink_to(list.len() * 2);
-        }
-        Some(entry)
     }
 
-    /// Builds the key list of a standalone store if it has none yet (see
-    /// [`Slots`]): one pass over the map.
-    fn index_keys(&mut self) {
-        if self.slots.active {
-            return;
+    /// Deletes `key`, expired or not, and its place in the expiry index.
+    fn remove(&mut self, key: &[u8]) -> Option<Kv> {
+        let loc = self.keys.find(key)?;
+        Some(self.remove_at(loc))
+    }
+
+    /// [`remove`](Self::remove) of the key at `loc`. The last key of its
+    /// table moves into its place, the last of the expiry index into its
+    /// place there.
+    fn remove_at(&mut self, loc: Loc) -> Kv {
+        let table = &mut self.keys.tables[loc.table as usize];
+        let kv = table.remove_swap_at(loc.pos as usize);
+        if let Some(slot) = table.get(loc.pos as usize).and_then(Kv::ttl_slot) {
+            self.expiring[slot as usize].pos = loc.pos;
         }
-        let list = &mut self.slots.keys[0];
-        list.reserve_exact(self.map.len());
-        for (key, e) in self.map.iter_mut() {
-            e.pos = list.len() as u32;
-            list.push(Rc::clone(key));
+        if let Some(slot) = kv.ttl_slot() {
+            self.unlink(slot);
         }
-        self.slots.active = true;
+        self.keys.len -= 1;
+        kv
     }
 
     /// Sets (`Some`) or clears (`None`) the expiry of an existing key.
     fn set_ttl(&mut self, key: &[u8], at: Option<i64>) {
-        let e = self.map.get_mut(key).expect("set_ttl of a missing key");
-        match at {
-            Some(at) if e.slot != NO_SLOT => e.expire_at = at,
-            Some(at) => {
-                // The index shares the map's key; std has no lookup that
-                // hands out the key and a `&mut` to the value at once.
-                let shared = Rc::clone(self.map.get_key_value(key).unwrap().0);
-                let slot = self.push_expiring(shared);
-                let e = self.map.get_mut(key).unwrap();
-                e.expire_at = at;
-                e.slot = slot;
+        let loc = self.keys.find(key).expect("set_ttl of a missing key");
+        let slot = self.next_ttl_slot();
+        let kv = self.keys.at_mut(loc);
+        match (at, kv.ttl_slot()) {
+            (Some(at), Some(_)) => kv.set_expire_at(at),
+            (Some(at), None) => {
+                kv.set_ttl(Some((at, slot)));
+                self.expiring.push(loc);
             }
-            None if e.slot != NO_SLOT => {
-                let slot = mem::replace(&mut e.slot, NO_SLOT);
-                e.expire_at = NEVER;
+            (None, Some(slot)) => {
+                kv.set_ttl(None);
                 self.unlink(slot);
             }
-            None => {}
+            (None, None) => {}
         }
     }
 
@@ -870,17 +962,16 @@ impl Store {
         ((u128::from(r) * n as u128) >> 64) as usize
     }
 
-    fn push_expiring(&mut self, key: Rc<[u8]>) -> u32 {
-        let slot = u32::try_from(self.expiring.len()).ok().filter(|&s| s != NO_SLOT).expect("too many keys with a TTL");
-        self.expiring.push(key);
-        slot
+    /// The place in the expiry index of the next key to get a TTL.
+    fn next_ttl_slot(&self) -> u32 {
+        u32::try_from(self.expiring.len()).expect("too many keys with a TTL")
     }
 
     /// Removes `slot` from the expiry index; the last key moves into it.
     fn unlink(&mut self, slot: u32) {
         self.expiring.swap_remove(slot as usize);
-        if let Some(moved) = self.expiring.get(slot as usize) {
-            self.map.get_mut(&**moved).expect("expiry index out of sync").slot = slot;
+        if let Some(&moved) = self.expiring.get(slot as usize) {
+            self.keys.at_mut(moved).set_ttl_slot(slot);
         }
     }
 }

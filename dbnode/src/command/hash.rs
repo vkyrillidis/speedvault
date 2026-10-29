@@ -1,9 +1,9 @@
 //! The hash commands' parsing and replies (Redis 7.0's `t_hash.c`); the
 //! store does the work.
 
-use super::{arity_error, integer_arg, integer_reply, store_error, Flow};
-use resp::{Args, Encoder};
-use store::{Hash, Store};
+use super::{arity_error, integer_arg, integer_reply, store_error, syntax_error, Flow};
+use resp::{Args, Encoder, Protocol};
+use store::{parse_i64, Hash, Store};
 
 /// `HSET key field value [field value ...]`: the number of new fields;
 /// `HMSET`, the same with `+OK`.
@@ -68,6 +68,63 @@ pub(super) fn hincrby(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow
             Flow::Continue
         }
     }
+}
+
+pub(super) fn hincrbyfloat(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {
+    match store.hincr_by_float(&args[1], &args[2], &args[3]) {
+        Ok(value) => out.bulk(&value),
+        Err(e) => store_error(e, out),
+    }
+    Flow::Continue
+}
+
+/// `HRANDFIELD key [count [WITHVALUES]]`. The count is read before the key
+/// is looked up, as in Redis. With values, RESP3 gets a pair per field.
+pub(super) fn hrandfield(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {
+    if args.len() == 2 {
+        match store.hrandfield(&args[1]) {
+            Ok(Some(field)) => out.bulk(&field),
+            Ok(None) => out.null(),
+            Err(e) => store_error(e, out),
+        }
+        return Flow::Continue;
+    }
+    let count = match parse_i64(&args[2]) {
+        None => return integer_reply(Err(store::Error::NotInteger), out),
+        // Redis takes -LONG_MAX..LONG_MAX.
+        Some(i64::MIN) => {
+            out.error(b"ERR value is out of range, value must between -9223372036854775807 and 9223372036854775807");
+            return Flow::Continue;
+        }
+        Some(n) => n,
+    };
+    let with_values = args.len() == 4;
+    if args.len() > 4 || (with_values && !args[3].eq_ignore_ascii_case(b"withvalues")) {
+        syntax_error(out);
+        return Flow::Continue;
+    }
+    // So that twice the count still fits.
+    if with_values && !(-(i64::MAX / 2)..=i64::MAX / 2).contains(&count) {
+        out.error(b"ERR value is out of range");
+        return Flow::Continue;
+    }
+    match store.hrandfield_count(&args[1], count) {
+        Ok(pairs) => {
+            let nested = with_values && out.protocol() == Protocol::Resp3;
+            out.array(if with_values && !nested { 2 * pairs.len() } else { pairs.len() });
+            for (f, v) in pairs {
+                if nested {
+                    out.array(2);
+                }
+                out.bulk(&f);
+                if with_values {
+                    out.bulk(&v);
+                }
+            }
+        }
+        Err(e) => store_error(e, out),
+    }
+    Flow::Continue
 }
 
 pub(super) fn hlen(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {

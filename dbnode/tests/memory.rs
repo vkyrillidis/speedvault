@@ -248,7 +248,7 @@ fn a_node_fills_up_to_its_maxmemory() {
         assert!(i < 100_000, "never refused");
     }
     // Refused at the limit, or a little before when the next key would
-    // make the map double past it.
+    // make a table grow past it.
     let used = field(&info_memory(&mut c), "used_memory");
     assert!(used > 6 << 20 && used < (8 << 20) + 64 * 1024, "{used}");
     assert!(i > 5000, "refused after {i} keys of 1 KB");
@@ -287,11 +287,15 @@ fn a_share_of_the_container_limit() {
     }
 }
 
-/// With small keys the map is most of the memory, and it doubles in one
-/// allocation: writes are refused once that would go past `maxmemory`,
-/// even if the node is below it now.
+/// With small keys the keyspace's tables are much of the memory. Each
+/// grows on its own, by little (one of 16384), so writes go on up to
+/// `maxmemory`, and a write that would make a table grow past it is
+/// refused first: the peak passes it by the replies to a batch at most
+/// (1000 `-OOM` errors), which aren't counted ahead, as in Redis. (One map
+/// of every key doubled in one allocation: writes were refused megabytes
+/// before the limit.)
 #[test]
-fn the_map_does_not_double_past_maxmemory() {
+fn small_keys_fill_up_to_maxmemory() {
     let max: u64 = 64 << 20;
     let node = Node::start(&["--maxmemory", "64mb"]);
     let mut c = Client::connect(node.addr);
@@ -309,9 +313,9 @@ fn the_map_does_not_double_past_maxmemory() {
         i += 1000;
         assert!(i < 10_000_000, "never refused");
     };
-    assert!(used < max - (4 << 20), "refused at {used} of {max}: not ahead of the map's growth");
+    assert!(used > max - (1 << 20), "refused at {used} of {max}: something grew by a large piece");
     let peak = field(&info_memory(&mut c), "used_memory_peak");
-    assert!(peak <= max, "peak {peak} past {max}");
+    assert!(peak <= max + (128 << 10), "peak {peak} past {max}");
 }
 
 /// A value that grows (APPEND reallocates it) is counted as it grows; the

@@ -32,6 +32,13 @@ pub(crate) struct Client {
     /// node is importing (Redis's `CLIENT_ASKING`). Any other command
     /// clears it.
     pub(crate) asking: Cell<bool>,
+    /// After `READONLY`, until `READWRITE`: the client may read a
+    /// replica's primary's slots from it.
+    pub(crate) readonly: Cell<bool>,
+    /// The stream's offset after this client's last command that went
+    /// into it (Redis's `woff`): what `WAIT` waits for the replicas to
+    /// acknowledge.
+    pub(crate) woff: Cell<u64>,
 }
 
 impl Client {
@@ -92,6 +99,8 @@ impl Clients {
             last_cmd: Cell::new("NULL"),
             resp: Cell::new(2),
             asking: Cell::new(false),
+            readonly: Cell::new(false),
+            woff: Cell::new(0),
         });
         self.by_id.borrow_mut().insert(id, client.clone());
         Registration { clients: self, client }

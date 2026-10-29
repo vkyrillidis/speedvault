@@ -92,27 +92,186 @@ every slot, with `bench.sh`: the cost of the slot check. Results:
 ## Moving slots
 
 ```sh
-tools/bench/migrate_bench.sh                 # or one part: speed, impact, rebalance
+tools/bench/migrate_bench.sh                 # or one part: speed, impact, rebalance, drain
+tools/bench/migrate_bench.sh drain -- --drain 128/512 --drain-runs 5
 ```
 
 stuart and dbnodes from the release binaries, each pinned (stuart CPU 14,
-nodes 2, 4, 6, 12, redis-benchmark 8 and 10), filled straight from Python
-(keys with a hash tag per slot); `migrate_bench.py` measures:
+nodes 2, 4, 6, 12, redis-benchmark 8 and 10, a RedisCluster client 0),
+filled straight from Python (keys with a hash tag per slot). Slots move by
+snapshot (`results/2026-10-25-*` compare it with phase 5's moves key by
+key, since removed); `migrate_bench.py` measures:
 
 - **speed:** `STUART MOVE` of 8 or 1024 slots holding 1M keys of 16 B,
-  300k of 1 KiB or 30k of 16 KiB, for `--migrate-batch` 10, 100, 1000,
-  with no clients: the time to the last table, keys/s and MB/s.
+  300k of 1 KiB or 30k of 16 KiB with no clients, for `--migrate-batch`
+  100 and 1000 (the copy's batch): the time to the last table, keys/s and
+  MB/s, the target's memory.
 - **impact:** 4M keys of 16 B moving per `--migrate-batch` /
-  `--migrate-pause` pair (`--impact 100/0,100/50,...`) while
+  `--migrate-pause` pair (`--impact 100/50,...`: the copy's batch and its
+  pause while clients are served) while
   redis-benchmark (`-c 50`) SETs and GETs keys of a slot staying at the
   source and SETs at the target, in 0.3 s runs for 4 s or until the move
   ends: mean requests/s and the worst p99, against the same with no move.
 - **rebalance:** `STUART REBALANCE` of 4M keys from three nodes onto a
   fourth per `--moves-per-source` / `--max-moves` pair (`--rebalance
   32/128,...`), with redis-benchmark on a slot the first node keeps.
+- **drain:** `STUART LEAVE` of one of four nodes holding 200k keys of
+  100 B (as `migrate_check`'s sigterm) per `--moves-per-source` /
+  `--max-moves` pair (`--drain 32/128,128/512`): what moving 4096 slots
+  costs besides their keys.
+
+In every part a `RedisCluster` client SETs keys of random slots during the
+move (p99 and worst latency). The nodes log verbosely, and the
+cutover pauses (from `CLUSTER PAUSESLOTS` to the table that ends them)
+come from the sources' logs: p50, max and how many.
 
 Times are monotonic; redis-benchmark runs during which the wall clock
 stepped (below) are dropped. Results: `results/<date>-<commit>/migrate.md`.
+
+## A primary leaving on SIGTERM
+
+```sh
+tools/bench/handover_bench.sh                # or one part: handover, drain, rolling, scale-down
+tools/bench/handover_bench.sh handover -- --runs 10 --filler 200000
+```
+
+stuart `--auto --replicas 1` and six named nodes (three primaries with a
+replica each), `--filler` keys of 100 B (default 1M), and RedisCluster
+clients INCRing keys one at a time, on the leaving primary's slots and
+on any slot (`handover_bench.py`):
+
+- **handover:** a primary gets SIGTERM and hands its slots to its
+  replica: the write pause at the node (its verbose log's `Writes resumed
+  after X us`, from `CLUSTER PAUSEWRITES` to the handover table), the
+  clients' worst INCR, the time to the table giving the replica the slots
+  and to the exit; the node then started again, the next primary once
+  it's a synced replica: `--runs` handovers.
+- **drain:** the same node drained instead (its replica leaves first):
+  the time until it holds no slot, the cutover pauses, the clients' worst
+  INCR; a new cluster each run.
+- **rolling:** each node SIGTERMed in turn and started again under its
+  name: the slots moved (`stuart_slots_moved_total`), the handovers, the
+  full and partial syncs the primaries served, the client's worst INCR
+  and errors.
+- **scale-down:** 6 nodes to 4, as `migrate_check scale-down`: two
+  replicas of different primaries get SIGTERM, the second once the first
+  exited, and one of the three primaries is demoted (its slots drained,
+  then it's the replica of the primary lacking one): the slots moved,
+  the demotions, the time from the second SIGTERM to the demotion's
+  start, to the end of its drain, to every primary having a synced
+  replica, the cutover pauses, the client's p99 before and during the
+  drain (on any slot and on the demoted primary's), the full syncs; a
+  new cluster each run.
+
+Results: `results/<date>-<commit>/handover.md`.
+
+## A replica's sync
+
+```sh
+tools/bench/sync_bench.sh                    # or --keys 1000000 --cut-keys 100000
+tools/bench/sync_bench.sh --also redis-8.10.2=$HOME/redis-8/bin/redis-server \
+                          --also valkey-9.1.2=$HOME/valkey-9/bin/valkey-server
+```
+
+A primary loaded with 1M and 10M keys (`key:%012d`, 16 B values), then a
+replica attached: ours (stuart `--auto --replicas 1`, the second node
+joining as the replica), Redis 7.0.15's and each `--also` server's
+(`REPLICAOF`, diskless, with `repl-diskless-sync-delay 0`), each with no
+clients and with redis-benchmark SETting random keys of those (`-c 50`)
+meanwhile.
+`sync_bench.py` measures the time from the replica's start (ours: the
+process; Redis's: `REPLICAOF`) to its link up, and every 50 ms the Pss
+(`/proc/PID/smaps_rollup`) of the primary, with Redis's forked child,
+and of the replica: Pss counts a page shared after a fork once, so the
+primary's peak shows what copy-on-write copied. Then the replica's
+`DBSIZE` and offset are checked against the primary's. Pinned: primary
+CPU 2, replica 4, stuart 14, redis-benchmark 8 and 10.
+
+Then a cut (`--cut-keys`, default 1M): the replica reaches its primary
+through a proxy in `sync_bench.py` (ours: the primary `--announce`s the
+proxy's port, so stuart's connection goes through it too; theirs:
+`REPLICAOF` the proxy), which a second after the link is up closes every
+connection and turns new ones away for 1 s. Measured: the MB written
+meanwhile, the time from the proxy's reopening to the link up, and
+whether that was a partial resync or a full one (`INFO stats`
+`sync_partial_ok`, `sync_full`); with no clients and with the SETs. Only
+the cut goes through the proxy: the syncs above are direct. Results:
+`results/<date>-<commit>/sync.md`.
+
+## What a replica costs its primary
+
+```sh
+tools/bench/ack_bench.sh [--runs 5] [--base COMMIT] [--also NAME=SERVER ...]
+```
+
+redis-benchmark SET, GET, INCR and HSET (`-r 1000000`, 16 B values,
+`-c 50`; one run per pipeline depth: `-P 1` with `-n 1000000`, `-P 16`
+with `-n 4000000`) at a primary alone and with a replica: ours (stuart
+`--auto`, `--replicas 1` for the replica), Redis 7.0.15 and each `--also`
+server, standalone (`REPLICAOF`) and in cluster mode as ours runs (the
+primary owns every slot, `CLUSTER REPLICATE`); with `--base`, ours built
+from that commit too. Each figure is the median of `--runs`; a run during
+which the clock stepped is run again. The replica's offset is checked
+against the primary's after each set-up, and ours must have refused no
+write (the lease). Pinned: primary CPU 2, replica 4, stuart 14,
+redis-benchmark 8 and 10. The tables: requests/s, with a replica against
+alone, ours against theirs. Run it on a quiet host: a busy one (a browser,
+a game launcher) took up to a quarter off ours with `-P 16`, and less off
+theirs. Results: `results/<date>-<commit>/acks.md`.
+
+## Failover
+
+```sh
+tools/bench/failover_bench.sh [--timeouts 2,5] [--runs 3] [--also NAME=SERVER ...]
+```
+
+Three primaries with a replica each: ours (stuart `--auto --replicas 1
+--fail-after T`), Redis 7.0.15's and each `--also` server's (`redis-cli
+--cluster create --cluster-replicas 1`, the server's own `redis-cli` if
+it has one, `cluster-node-timeout T`, `cluster-replica-validity-factor 0`:
+WSL2's clock steps make a replica's data look too old otherwise), every
+replica synced first. A redis-py RedisCluster INCRs keys of one primary's
+slots, counting the INCRs acknowledged per key.
+
+- **killed:** the primary is SIGKILLed: the time to the replica's
+  promotion (`CLUSTER NODES` at stuart, or at the first node) and to the
+  client's first INCR through again.
+- **leaving** (timeout 5 s): ours gets SIGTERM, theirs `CLUSTER FAILOVER`
+  at the replica: the time to the promotion and the client's longest gap
+  between two acknowledged INCRs.
+
+Both: the writes lost (INCRs acknowledged that the keys' values don't
+hold), per run. Results: `results/<date>-<commit>/failover.md`.
+
+## Memory with a replica
+
+```sh
+tools/bench/memory_bench.sh [--also NAME=SERVER ...]
+```
+
+Two datasets, each into a new primary with a replica, pipelined straight
+to the primary: 1M strings (`key:%012d`, 16 B values) and collections
+(10,000 each of hashes of 100 fields, sets of 100 members, lists of 100
+elements, all 8-9 B; and 10 hashes and 10 sets of 100,000: 5M elements).
+Ours, Redis 7.0.15 and each `--also` server, standalone and in cluster
+mode. Once the replica has the primary's offset and keys: `used_memory`
+and RSS (`VmRSS`) of both, and `used_memory`'s growth over the empty node
+a key or an element. Results: `results/<date>-<commit>/memory.md`.
+
+## Stalls while the keyspace grows
+
+```sh
+tools/bench/stall_bench.sh [--keys N] [--also NAME=SERVER ...]
+```
+
+10M new keys (`key:%012d`, 16 B values) from one connection, 100 `SET`s a
+batch, into ours, Redis 7.0.15 and each `--also` server (a redis-server-like
+binary, or another build of `dbnode`), one at a time, the server on CPU 2
+and the client on CPU 4. Each batch's round trip is timed on the monotonic
+clock: a keyspace rehashed all at once when it doubles shows as one slow
+batch. The keys/s, the round trips' p50, p99.9 and max, how many took over
+10 ms, and the three slowest with the keys there were. Results:
+`results/<date>-<commit>/stalls.md`.
 
 ## Pinning
 
@@ -156,6 +315,12 @@ the host clock: `w32tm /resync /force` in an elevated prompt.
 
 ## Results
 
+- `results/2026-10-27-d114045/` (throughput with a replica, standalone
+  and cluster mode; sync and the 1 s cut), `results/2026-10-27-4103e02/`
+  (failover) and `results/2026-10-27-ea5d41b/` (memory): phase 8
+  milestone 10, against Redis 7.0.15, 8.10.2 and Valkey 9.1.2.
+  `results/2026-10-26-dde1f70/acks.md`: the first throughput run,
+  standalone theirs only.
 - `results/2026-10-17-bbf979c/` and `results/2026-10-17-7a98a6c/`: 3-node
   clusters (`cluster_bench.sh`), after and before the faster slot hash.
 - `results/2026-10-17-ef94116/`: the same session with Redis 8.10.2 and
