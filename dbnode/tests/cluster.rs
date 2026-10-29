@@ -113,12 +113,13 @@ fn keys_are_routed_by_slot() {
     c.call(&[b"EXISTS", b"{bar}x", b"{bar}y"], b":2\r\n");
     c.call(&[b"MGET", b"{foo}x", b"{foo}y"], MOVED_FOO);
 
-    // Every key is checked before MOVED, but an unassigned first key
-    // fails at once.
+    // Every key is checked before MOVED, and as in Redis 8 before an
+    // unassigned first key's CLUSTERDOWN.
     c.call(&[b"MGET", b"bar", b"foo"], CROSSSLOT);
     c.call(&[b"MGET", b"foo", b"bar"], CROSSSLOT);
     c.call(&[b"DEL", b"bar", b"{bar}x", b"x"], CROSSSLOT);
-    c.call(&[b"MGET", &unassigned, b"foo"], CLUSTERDOWN);
+    c.call(&[b"MGET", &unassigned, b"foo"], CROSSSLOT);
+    c.call(&[b"MGET", &unassigned, &unassigned], CLUSTERDOWN);
     c.call(&[b"MGET", b"bar", &unassigned], CROSSSLOT);
     // MSET's keys are every other argument; its own arity rule comes after.
     c.call(&[b"MSET", b"bar", b"1", b"foo"], CROSSSLOT);
@@ -676,6 +677,62 @@ fn a_replica() {
     );
     let replid = info.split("master_replid:").nth(1).unwrap().split("\r\n").next().unwrap();
     assert!(replid.len() == 40 && replid.bytes().all(|b| b.is_ascii_hexdigit()) && replid != me, "{replid}");
+}
+
+/// `SHARDS` in `CLUSTER SETTABLE`: the shards as Redis 7.2+ groups them
+/// by shard id, here B failed over to this node and still in its shard,
+/// first; `CLUSTER MYSHARDID` the node's (its own id before a table, and
+/// with the default shards).
+#[test]
+fn shards_and_myshardid() {
+    let (mut c, me) = node();
+    let port = c.0.peer_addr().unwrap().port();
+    let p = port.to_string();
+    let me = &me[..];
+    c.call(&[b"CLUSTER", b"MYSHARDID"], format!("$40\r\n{me}\r\n").as_bytes());
+    c.call(&[b"CLUSTER", b"MYSHARDID", b"x"], b"-ERR wrong number of arguments for 'cluster|myshardid' command\r\n");
+    let nodes = [(B, "10.0.0.2", "7000"), (me, "127.0.0.1", &p[..]), (C, "10.0.0.3", "7000")];
+    let all_mine = [("0", "16383", me)];
+    let with_shards = |epoch: &str, shards: &[(&str, &str)]| {
+        let mut args = settable_replicas(epoch, &nodes, &all_mine, &[], &[(C, me)]);
+        args.extend([b"FAILED".to_vec(), b"1".to_vec(), B.as_bytes().to_vec(), b"SHARDS".to_vec(), shards.len().to_string().into()]);
+        for (node, shard) in shards {
+            args.extend([node.as_bytes().to_vec(), shard.as_bytes().to_vec()]);
+        }
+        args
+    };
+    let invalid = |e: String| format!("-ERR Invalid table: {e}\r\n").into_bytes();
+    call_vec(&mut c, &with_shards("2", &[(B, B), (me, B)]), &invalid(format!("node {C} is given no shard")));
+    call_vec(&mut c, &with_shards("2", &[(B, B), (me, B), (C, C)]), &invalid(format!("replica {C} is not in its primary's shard")));
+    let mut odd = with_shards("2", &[(B, B), (me, B), (C, B)]);
+    odd.pop();
+    call_vec(&mut c, &odd, b"-ERR syntax error\r\n");
+    call_vec(&mut c, &with_shards("2", &[(B, B), (me, B), (C, B)]), OK);
+
+    c.call(&[b"CLUSTER", b"MYSHARDID"], format!("$40\r\n{B}\r\n").as_bytes());
+    c.cmd(&[b"CLUSTER", b"SHARDS"]);
+    let mut shards = vec![0; 4096];
+    let n = std::io::Read::read(&mut c.0, &mut shards).unwrap();
+    let shards = String::from_utf8_lossy(&shards[..n]).to_string();
+    let entry = |id: &str, ip: &str, port: &str, role: &str, health: &str| {
+        format!(
+            "*14\r\n$2\r\nid\r\n$40\r\n{id}\r\n$4\r\nport\r\n:{port}\r\n$2\r\nip\r\n${}\r\n{ip}\r\n$8\r\nendpoint\r\n${}\r\n{ip}\r\n\
+             $4\r\nrole\r\n${}\r\n{role}\r\n$18\r\nreplication-offset\r\n:0\r\n$6\r\nhealth\r\n${}\r\n{health}\r\n",
+            ip.len(),
+            ip.len(),
+            role.len(),
+            health.len()
+        )
+    };
+    let want = "*1\r\n*4\r\n$5\r\nslots\r\n*2\r\n:0\r\n:16383\r\n$5\r\nnodes\r\n*3\r\n".to_string()
+        + &entry(B, "10.0.0.2", "7000", "master", "fail")
+        + &entry(me, "127.0.0.1", &p, "master", "online")
+        + &entry(C, "10.0.0.3", "7000", "replica", "loading");
+    assert_eq!(shards, want);
+
+    // The default shards again: each primary its own.
+    call_vec(&mut c, &settable_replicas("3", &nodes, &all_mine, &[], &[(C, me)]), OK);
+    c.call(&[b"CLUSTER", b"MYSHARDID"], format!("$40\r\n{me}\r\n").as_bytes());
 }
 
 #[test]

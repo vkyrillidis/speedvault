@@ -63,20 +63,21 @@ See [running a cluster](docs/cluster.md) and [Kubernetes](docs/kubernetes.md)
 ## What it supports
 
 - **Strings and integers:** `GET SET` (with `EX PX EXAT PXAT NX XX KEEPTTL
-  GET`) `MGET MSET SETNX GETDEL APPEND STRLEN INCR DECR INCRBY DECRBY
-  INCRBYFLOAT` (in Redis's 80-bit `long double`, digit for digit).
+  GET IFEQ IFNE IFDEQ IFDNE`) `MGET MSET MSETEX SETNX GETDEL DELEX DIGEST
+  APPEND STRLEN INCR DECR INCRBY DECRBY INCRBYFLOAT INCREX` (floats in
+  Redis's 80-bit `long double`, digit for digit).
 - **Keys:** `DEL EXISTS TYPE EXPIRE PEXPIRE EXPIREAT PEXPIREAT TTL PTTL
   PERSIST SCAN KEYS DBSIZE FLUSHDB FLUSHALL`, `OBJECT ENCODING`.
 - **Hashes:** `HSET HMSET HSETNX HGET HMGET HDEL HEXISTS HLEN HSTRLEN HKEYS
   HVALS HGETALL HINCRBY HINCRBYFLOAT HRANDFIELD HSCAN`.
 - **Sets:** `SADD SREM SISMEMBER SMISMEMBER SCARD SMEMBERS SPOP SRANDMEMBER
   SMOVE SUNION SINTER SDIFF SUNIONSTORE SINTERSTORE SDIFFSTORE SINTERCARD
-  SSCAN`.
+  SUNIONCARD SDIFFCARD SSCAN`.
 - **Lists:** `LPUSH RPUSH LPUSHX RPUSHX LPOP RPOP LLEN LRANGE LINDEX LSET
-  LINSERT LREM LTRIM LPOS LMOVE RPOPLPUSH LMPOP`.
+  LINSERT LREM LTRIM LPOS LMOVE LMOVEM RPOPLPUSH LMPOP`.
 - **Connection and server:** `PING ECHO HELLO SELECT 0 QUIT CLIENT COMMAND
   INFO`, `CONFIG GET` and `SET`.
-- **Cluster:** `CLUSTER SLOTS SHARDS NODES INFO MYID KEYSLOT COUNTKEYSINSLOT
+- **Cluster:** `CLUSTER SLOTS SHARDS NODES INFO MYID MYSHARDID KEYSLOT COUNTKEYSINSLOT
   GETKEYSINSLOT`, `ASKING READONLY READWRITE`, with `-MOVED`, `-ASK` and
   `-TRYAGAIN` redirects as Redis Cluster sends them.
 - **Replication:** `WAIT`, `ROLE`, `INFO replication`, reads from replicas
@@ -89,7 +90,7 @@ commands, pub/sub, transactions, scripting, eviction policies other than
 `noeviction`, and databases other than 0. There is no persistence (RDB or
 AOF) by design: replicas keep the data, and a pod stopping hands over to
 its replica first. Replies are checked against Redis
-7.0.15 by a differential test suite (`tools/compat`), which also lists the
+8.10.2 by a differential test suite (`tools/compat`), which also lists the
 few deliberate differences.
 
 ## How it works
@@ -134,7 +135,8 @@ cargo clippy --all-targets -- -D warnings
 
 On Windows, build inside WSL2 (with `CARGO_TARGET_DIR` inside the Linux
 file system: much faster than a target directory on a Windows drive). The
-compatibility suites need a Redis 7.0.15 `redis-server` and redis-py; see
+compatibility suites need a Redis 8.10.2 `redis-server`
+(`tools/compat/build_redis.sh` builds one) and redis-py; see
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Status

@@ -10,6 +10,7 @@ standard library only.
 | `difftest.py` | Differential tester: runs the corpus against a reference and a target and compares replies byte for byte |
 | `allowlist.py` | Known, intended differences (case pattern → reason) |
 | `resp_proxy.py` | Logging TCP proxy: prints every request and reply going through it, including the ones `MONITOR` doesn't show (rejected commands) |
+| `build_redis.sh` | Builds the reference Redis, 8.10.2, from its release tag (the commit pinned) into `.redis`; CI uses it too |
 | `client_startup_capture.sh` | Runs redis-cli, redis-benchmark and redis-py through the proxy and logs what they send. The output for Redis 7.0.15 is in `captures/redis-7.0.15-client-startup.log` |
 | `cluster_compat.sh`, `cluster_compat.py` | The `cluster` crate against a real Redis Cluster: `CLUSTER KEYSLOT` on random keys, `CLUSTER SLOTS SHARDS NODES` byte for byte |
 | `stuart_cluster.sh` | stuart and three dbnodes from the release binaries, end to end: join, `STUART CREATE`, `redis-cli -c` seeded with stuart and with a node, `redis-cli --cluster check`, a stuart restart, a node restart and `STUART ASSIGN` |
@@ -21,7 +22,8 @@ standard library only.
 ## Setup
 
 ```sh
-# Redis as the reference (any free port)
+# Redis 8.10.2 as the reference (any free port), built from its tag
+tools/compat/build_redis.sh .redis && export PATH=$PWD/.redis/bin:$PATH
 redis-server --port 6393 --save '' --appendonly no --daemonize yes
 ```
 
@@ -214,7 +216,7 @@ The cluster is down`). A Redis master that has just joined also reports
 `cluster_state:fail` for a few seconds (its rejoin delay); the script waits
 for that to pass.
 
-The baseline is Redis 7.0.15, as for the rest of the compat tests. The
+The baseline is Redis 8.10.2, as for the rest of the compat tests. The
 `cluster_disabled*` cases of `corpus.py` check the standalone side (the
 cluster commands refused as Redis refuses them) in the main difftest.
 

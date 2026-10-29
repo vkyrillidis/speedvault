@@ -56,13 +56,22 @@ import os
 import re
 import sys
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from resp import Conn, cmd, parse
 from cluster_compat import mask_nodes
 
 HELLO_ID = re.compile(rb"\$2\r\nid\r\n:\d+\r\n")
 SHARDS_OFFSET = re.compile(rb"\$18\r\nreplication-offset\r\n:\d+\r\n")
+# HELLO's last field: Redis 8 lists its built-in modules (vectorset; the
+# official images add JSON, search, time series and bloom), we have none.
+HELLO_MODULES = re.compile(rb"\$7\r\nmodules\r\n.*\Z", re.S)
+
+
+def mask_hello(raw: bytes) -> bytes:
+    """HELLO's connection id and modules masked."""
+    raw = HELLO_ID.sub(b"$2\r\nid\r\n:ID\r\n", raw)
+    return HELLO_MODULES.sub(b"$7\r\nmodules\r\n<masked>", raw)
 
 
 def ports(text: str) -> List[int]:
@@ -168,11 +177,11 @@ def compare_requests(redis: List[int], ours: List[int]) -> int:
         return raw
 
     # SHARDS and NODES list the nodes in an order of their own: Redis in its
-    # hash table's (different on each node), ours in the table's. Their
-    # format was compared with the order matched in cluster_compat.py; here
-    # the elements are compared as sets.
+    # hash tables' (different on each node), ours in the table's. Each
+    # element was compared byte for byte in cluster_compat.py; here the
+    # elements are compared as sets.
     def norm(p: Tuple, raw: bytes) -> bytes:
-        raw = HELLO_ID.sub(b"$2\r\nid\r\n:ID\r\n", raw)
+        raw = mask_hello(raw)
         if p[:2] == ("CLUSTER", "NODES"):
             kind, text = mask_nodes(raw)
             return kind + "\n".join(sorted(text.split("\n"))).encode()
@@ -569,10 +578,10 @@ def replace_all(pairs: List[Tuple[bytes, bytes]], raw: bytes) -> bytes:
 
 
 def norm_layout(p: Tuple, raw: bytes) -> bytes:
-    """A reply with what differs between the clusters masked: HELLO's id,
-    NODES' live fields and order, SHARDS' offsets and order, CLUSTER INFO
-    past cluster_size."""
-    raw = HELLO_ID.sub(b"$2\r\nid\r\n:ID\r\n", raw)
+    """A reply with what differs between the clusters masked: HELLO's id
+    and modules, NODES' live fields and order, SHARDS' offsets and order,
+    CLUSTER INFO past cluster_size."""
+    raw = mask_hello(raw)
     if p[:2] == ("CLUSTER", "NODES"):
         kind, text = mask_nodes(raw)
         return kind + "\n".join(sorted(text.split("\n"))).encode()
@@ -679,7 +688,30 @@ def compare_replicas(redis: List[int], ours: List[int]) -> int:
                                   f"  redis: {rr[:400]!r}\n  ours:  {oo[:400]!r}")
                 print(f"replicas: RESP{proto}, Redis node {rport} / our node {oport}: {same}/{len(probes)} the same")
     print(f"replicas: {total - failures}/{total} the same")
-    return failures
+    return failures + compare_shard_ids("replicas", nodes)
+
+
+def compare_shard_ids(step: str, nodes: List[Tuple[int, int, Optional[int]]]) -> int:
+    """CLUSTER MYSHARDID at every live node pair (Redis port, our port):
+    Redis's ids are random, so the nodes are compared by how they group,
+    those with one id together. Returns the number of failures."""
+    groups: Tuple[Dict[bytes, Set[int]], Dict[bytes, Set[int]]] = ({}, {})
+    for rport, oport, _ in nodes:
+        if not (pings(rport) and pings(oport)):
+            continue
+        for g, port in zip(groups, (rport, oport)):
+            with Conn("127.0.0.1", port, timeout=5) as c:
+                shard = c.call("CLUSTER", "MYSHARDID").value
+            if not re.fullmatch(rb"[0-9a-f]{40}", shard):
+                print(f"{step}: CLUSTER MYSHARDID at {port}: {shard!r}")
+                return 1
+            g.setdefault(shard, set()).add(rport)
+    theirs, mine = (sorted(sorted(v) for v in g.values()) for g in groups)
+    if theirs != mine:
+        print(f"{step}: CLUSTER MYSHARDID groups differ: Redis {theirs}, ours (as Redis ports) {mine}")
+        return 1
+    print(f"{step}: CLUSTER MYSHARDID: the same groups, {theirs}")
+    return 0
 
 
 def compare_failed(redis: List[int], ours: List[int], dead: Tuple[int, int]) -> int:
@@ -823,7 +855,7 @@ def compare_failover(redis: List[int], ours: List[int]) -> int:
                                   f"  redis: {rr[:600]!r}\n  ours:  {oo[:600]!r}")
                 print(f"failover: RESP{proto}, Redis node {rport} / our node {oport}: {same}/{len(probes)} the same")
     print(f"failover: {total - failures}/{total} the same")
-    return failures
+    return failures + compare_shard_ids("failover", nodes)
 
 
 def pings(port: int) -> bool:

@@ -1,10 +1,10 @@
 //! Connection and server commands: `HELLO`, `CLIENT`, `COMMAND`, `INFO`,
 //! `CONFIG`. These are what clients send on connect (see
-//! `tools/compat/README.md`); replies and errors are Redis 7.0's.
+//! `tools/compat/README.md`); replies and errors are Redis 8.10.2's.
 //!
-//! The node presents itself as Redis 7.0.15 (`HELLO`'s `server` and
+//! The node presents itself as Redis 8.10.2 (`HELLO`'s `server` and
 //! `version`, `INFO`'s `redis_version`): clients pick features by them, and
-//! 7.0.15 is the behaviour the node copies. `INFO` adds a
+//! 8.10.2 is the behaviour the node copies. `INFO` adds a
 //! `speedvault_version` line so the real server can still be told apart.
 
 use crate::client::Client;

@@ -242,7 +242,7 @@ impl State {
         let mut pairs: Vec<(NodeId, NodeId)> = replicas(&old).into_iter().filter(|(_, p)| p != id).collect();
         pairs.push((*id, primary));
         // `first` stays: the moves under way are in this table too.
-        self.table = Some(table_from(old.epoch() + 1, self.nodes.clone(), &owners(&old), &migrations(&old), &pairs, &failed(&old)));
+        self.set_table(table_from(old.epoch() + 1, self.nodes.clone(), &owners(&old), &migrations(&old), &pairs, &failed(&old)));
         for r in &orphans {
             match self.pick_primary(r, &orphans) {
                 Some(p) => self.attach(*r, p),
@@ -288,7 +288,7 @@ impl State {
         }
         let epoch = old.epoch() + 1;
         // `first` stays: the moves under way are in this table too.
-        self.table = Some(table_from(epoch, self.nodes.clone(), &owners(old), &migrations(old), &replicas(old), &marked));
+        self.set_table(table_from(epoch, self.nodes.clone(), &owners(old), &migrations(old), &replicas(old), &marked));
         self.cleared.retain(|(r, _)| r != id);
         if !failed {
             self.cleared.push((*id, epoch));
@@ -315,7 +315,7 @@ impl State {
         pairs.extend(primary.map(|p| (*id, p)));
         let marked: Vec<NodeId> = failed(old).into_iter().filter(|m| m != id).collect();
         let epoch = old.epoch() + 1;
-        self.table = Some(table_from(epoch, self.nodes.clone(), &owners(old), &migrations(old), &pairs, &marked));
+        self.set_table(table_from(epoch, self.nodes.clone(), &owners(old), &migrations(old), &pairs, &marked));
         self.cleared.retain(|(r, _)| r != id);
         self.cleared.push((*id, epoch));
         true
@@ -386,7 +386,7 @@ impl State {
         if failed && !marked.contains(primary) {
             marked.push(*primary);
         }
-        self.table = Some(table_from(old.epoch() + 1, self.nodes.clone(), &owners, &migrations, &pairs, &marked));
+        self.set_table(table_from(old.epoch() + 1, self.nodes.clone(), &owners, &migrations, &pairs, &marked));
         self.queue.retain(|(_, to)| to != primary);
         self.queue.extend(requeue);
         self.first = vec![*replica];
@@ -514,10 +514,19 @@ impl State {
     /// Makes `id` (owning nothing) a replica of `primary`, in the table as
     /// it is.
     fn attach(&mut self, id: NodeId, primary: NodeId) {
-        let Some(t) = self.table.take() else { return };
+        let Some(t) = self.table.clone() else { return };
         let mut list = replicas(&t);
         list.push((id, primary));
-        self.table = Some(t.with_replicas(&list).expect("a replica that owns nothing, of a primary"));
+        self.set_table(t.with_replicas(&list).expect("a replica that owns nothing, of a primary"));
+    }
+
+    /// Makes `table` the table, the shards carried over from the one before
+    /// (see [`SlotTable::with_shards_after`]).
+    fn set_table(&mut self, table: SlotTable) {
+        self.table = Some(match &self.table {
+            Some(old) => table.with_shards_after(old),
+            None => table,
+        });
     }
 
     /// The table again, for the current nodes, with the next epoch: slots
@@ -553,7 +562,7 @@ impl State {
         let marked: Vec<NodeId> = failed(old).into_iter().filter(|id| known(id)).collect();
         self.cleared.retain(|(id, _)| known(id));
         self.successors.retain(|(p, s)| known(p) && known(s));
-        self.table = Some(table_from(old.epoch() + 1, self.nodes.clone(), &owners, &migrations, &kept, &marked));
+        self.set_table(table_from(old.epoch() + 1, self.nodes.clone(), &owners, &migrations, &kept, &marked));
         self.queue_check();
         // A replica whose primary went: to another primary, or a primary.
         // Not to one of the others, which have just become primaries too.
@@ -638,7 +647,7 @@ impl State {
         owners[usize::from(range.start)..=usize::from(range.end)].fill(Some(*id));
         let migrations = migrations(old);
         // `first` stays: the moves under way are in this table too.
-        self.table = Some(table_from(old.epoch() + 1, self.nodes.clone(), &owners, &migrations, &replicas(old), &failed(old)));
+        self.set_table(table_from(old.epoch() + 1, self.nodes.clone(), &owners, &migrations, &replicas(old), &failed(old)));
         Ok(range.len())
     }
 
@@ -672,7 +681,7 @@ impl State {
                 have[i] += 1;
             }
         }
-        self.table = Some(table_from(old.epoch() + 1, self.nodes.clone(), &owners, &migrations(old), &replicas(old), &failed(old)));
+        self.set_table(table_from(old.epoch() + 1, self.nodes.clone(), &owners, &migrations(old), &replicas(old), &failed(old)));
         free.len()
     }
 
@@ -924,7 +933,7 @@ impl State {
         }
         first.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         first.dedup();
-        self.table = Some(table_from(old.epoch() + 1, self.nodes.clone(), &owners, &migrations, &replicas(old), &failed(old)));
+        self.set_table(table_from(old.epoch() + 1, self.nodes.clone(), &owners, &migrations, &replicas(old), &failed(old)));
         self.first = first;
         self.queue_check();
     }
@@ -939,7 +948,7 @@ impl State {
         if cancelled.is_empty() {
             return;
         }
-        self.table = Some(table_from(old.epoch() + 1, self.nodes.clone(), &owners(old), &kept, &replicas(old), &failed(old)));
+        self.set_table(table_from(old.epoch() + 1, self.nodes.clone(), &owners(old), &kept, &replicas(old), &failed(old)));
         self.first = Vec::new();
         for (slot, _, to, _) in cancelled {
             if !self.queue.iter().any(|(s, _)| *s == slot) {
@@ -950,7 +959,8 @@ impl State {
     }
 
     /// The state file's text: a header, a line per node, then the table
-    /// (ranges, migrations, replicas, the nodes marked failed), the nodes
+    /// (ranges, migrations, replicas, the nodes marked failed, the shards
+    /// unless they are the default ones), the nodes
     /// it goes to first, and the queue.
     pub fn encode(&self) -> String {
         let mut text = format!("{HEADER}\n");
@@ -992,6 +1002,11 @@ impl State {
             for id in failed(t) {
                 text += &format!("failed {id}\n");
             }
+            if t.has_shards() {
+                for (i, shard) in t.shard_list() {
+                    text += &format!("shard {} {shard}\n", t.nodes()[i].id());
+                }
+            }
             for (id, epoch) in &self.cleared {
                 text += &format!("cleared {id} {epoch}\n");
             }
@@ -1018,6 +1033,7 @@ impl State {
         let (mut first, mut queue, mut names) = (Vec::new(), Vec::new(), Vec::new());
         let mut syncing = Vec::new();
         let (mut zones, mut replicas, mut failed, mut cleared, mut successors) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut shards = Vec::new();
         let id = |w: &str| NodeId::parse(w.as_bytes()).ok_or(format!("bad node id {w:?}"));
         let num = |w: &str| w.parse::<u64>().map_err(|e| format!("{w:?}: {e}"));
         for (i, line) in lines.enumerate() {
@@ -1046,6 +1062,7 @@ impl State {
                 }
                 ["replica", r, p] if epoch.is_some() => replicas.push((id(r).map_err(bad)?, id(p).map_err(bad)?)),
                 ["failed", n] if epoch.is_some() => failed.push(id(n).map_err(bad)?),
+                ["shard", n, shard] if epoch.is_some() => shards.push((id(n).map_err(bad)?, id(shard).map_err(bad)?)),
                 ["cleared", n, e] if epoch.is_some() => cleared.push((id(n).map_err(bad)?, num(e).map_err(bad)?)),
                 ["successor", p, s] if epoch.is_some() => successors.push((id(p).map_err(bad)?, id(s).map_err(bad)?)),
                 ["first", n] if epoch.is_some() => first.push(id(n).map_err(bad)?),
@@ -1078,6 +1095,7 @@ impl State {
                     .and_then(|t| t.with_replicas(&replicas))
                     .and_then(|t| t.with_syncs(&syncing))
                     .and_then(|t| t.with_failed(&failed))
+                    .and_then(|t| if shards.is_empty() { Ok(t) } else { t.with_shards(&shards) })
                     .map_err(|e| format!("the table: {e}"))?,
             ),
         };
@@ -1901,6 +1919,14 @@ mod tests {
         t.replicas().iter().map(|r| (n(r.replica), n(r.primary))).collect()
     }
 
+    /// The table's shards as `(first byte of the shard id, [node...])` by
+    /// node number.
+    fn shards(s: &State) -> Vec<(u8, Vec<u8>)> {
+        let t = s.table().unwrap();
+        let n = |i: usize| t.nodes()[i].id().as_bytes()[1] - b'0';
+        t.shards().into_iter().map(|(id, nodes)| (id.as_bytes()[1] - b'0', nodes.into_iter().map(n).collect())).collect()
+    }
+
     fn with_replicas(n: usize) -> State {
         let mut s = State::default();
         s.set_replicas(n);
@@ -2142,6 +2168,11 @@ mod tests {
         assert!(!s.active().contains(&id(1)), "a failed primary gets no slots");
         assert_eq!(s.first(), [id(3)], "the new primary takes it first");
         assert_eq!(s.primary_of(&id(3)), None);
+        // 1 stays in its shard, first, as Redis keeps its shard id.
+        assert_eq!(shards(&s), [(1, vec![1, 3, 5]), (2, vec![2, 4])]);
+        for n in [1, 3, 5] {
+            assert!(s.encode().contains(&format!("\nshard {} {}\n", id(n), id(1))), "{}", s.encode());
+        }
         // In the state file.
         let mut back = State::decode(&s.encode()).unwrap();
         back.set_replicas(2);
@@ -2153,6 +2184,7 @@ mod tests {
         assert!(s.back(&id(1)));
         assert_eq!(s.table().unwrap().epoch(), epoch + 1);
         assert_eq!(pairs(&s), [(4, 2), (5, 3), (1, 3)]);
+        assert_eq!(shards(&s), [(1, vec![1, 3, 5]), (2, vec![2, 4])], "in place");
         assert!(!s.is_failed(&id(1)));
         assert_eq!(s.promotable(&id(1)), Some(epoch + 1));
         assert!(!s.back(&id(1)), "once");
@@ -2174,6 +2206,7 @@ mod tests {
         u.leave(&id(2), &[]).unwrap();
         assert!(u.back(&id(1)));
         assert_eq!(u.primary_of(&id(1)), None);
+        assert_eq!(shards(&u).iter().map(|(_, n)| n.clone()).collect::<Vec<_>>(), [vec![2, 3], vec![1]], "a shard of its own");
         assert!(u.active().contains(&id(1)));
         // The successor in the state file.
         let mut v = with_replicas(1);

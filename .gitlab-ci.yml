@@ -1,5 +1,5 @@
 # CI for speedvault: tests and lints on Linux, the differential test
-# against a real Redis 7.0.15, and the Docker image. macOS isn't covered
+# against a real Redis 8.10.2, and the Docker image. macOS isn't covered
 # (GitLab's macOS runners are a paid tier): run `cargo test` on a Mac before
 # pushing changes to the reactor's kqueue code.
 
@@ -33,16 +33,30 @@ clippy:
     - rustup component add clippy
     - cargo clippy --workspace --all-targets --locked -- -D warnings
 
-# Our node against Redis 7.0.15, byte for byte (tools/compat/README.md).
+# Redis 8.10.2, the reference, built from its release tag by
+# tools/compat/build_redis.sh (the commit pinned; not the official image,
+# whose modules add commands) and cached.
+.redis:
+  extends: .rust
+  image: rust:1.92-bookworm
+  cache:
+    key: cargo-$CI_JOB_NAME
+    paths:
+      - .cargo/registry
+      - target
+      - .redis
+  before_script:
+    - bash tools/compat/build_redis.sh .redis
+    - export PATH=$CI_PROJECT_DIR/.redis/bin:$PATH
+    - redis-server --version | grep -q 'v=8\.10\.2 '
+
+# Our node against Redis 8.10.2, byte for byte (tools/compat/README.md).
 # Fails on any difference not in tools/compat/allowlist.py.
 compat:
-  extends: .rust
+  extends: .redis
   stage: test
-  services:
-    - name: redis:7.0.15
-      alias: redis
-      command: ["redis-server", "--save", "", "--appendonly", "no"]
   script:
+    - redis-server --port 6379 --save '' --appendonly no --daemonize yes
     - cargo build --release --locked -p dbnode
     - ./target/release/speedvault-server 127.0.0.1:7000 --loglevel warning &
     - |
@@ -55,7 +69,7 @@ compat:
           except OSError:
               time.sleep(0.2)
       PY
-    - python3 tools/compat/difftest.py --ref redis:6379 --target 127.0.0.1:7000 --json compat.json
+    - python3 tools/compat/difftest.py --ref 127.0.0.1:6379 --target 127.0.0.1:7000 --json compat.json
   artifacts:
     when: always
     paths:
@@ -67,15 +81,12 @@ compat:
 # redis-cli -c, redis-benchmark --cluster, a stuart restart under load),
 # and slots moving under load (migrate_check: no write lost or doubled
 # through redis-py and redis-cli -c during REBALANCE, DRAIN, and with
-# stuart or a node killed mid-move). Redis 7.0.15 from Debian bookworm,
-# the same version as the compat job.
+# stuart or a node killed mid-move). Redis 8.10.2, as in the compat job.
 cluster-compat:
-  extends: .rust
+  extends: .redis
   stage: test
-  image: rust:1.92-bookworm
   script:
-    - apt-get update -qq && apt-get install -y -qq redis-server redis-tools python3-pip iproute2 >/dev/null
-    - redis-server --version | grep -q 'v=7\.0\.15'
+    - apt-get update -qq && apt-get install -y -qq python3-pip iproute2 >/dev/null
     - pip3 install --quiet --break-system-packages redis==8.1.0 prometheus-client==0.21.1
     - export CARGO_TARGET_DIR=$CI_PROJECT_DIR/target
     - bash tools/compat/cluster_compat.sh

@@ -115,6 +115,7 @@ fn execute(args: &Args, stuart: &Rc<Stuart>, client: u64, out: &mut Encoder) -> 
         ("cluster", Some("info"), 2) => out.verbatim(b"txt", reply::info_text(&stuart.state.borrow().view()).as_bytes()),
         ("cluster", Some("keyslot"), 3) => out.integer(i64::from(key_hash_slot(&args[2]))),
         ("cluster", Some("myid"), 2) => out.error(b"ERR stuart is not a node and has no node id"),
+        ("cluster", Some("myshardid"), 2) => out.error(b"ERR stuart is not a node and has no shard id"),
         ("stuart", Some("join"), 5 | 7 | 9) => join(args, stuart, out),
         ("stuart", Some("create"), 2) => create(stuart, out),
         ("stuart", Some("assign"), 5) => assign(args, stuart, out),
@@ -159,7 +160,7 @@ fn execute(args: &Args, stuart: &Rc<Stuart>, client: u64, out: &mut Encoder) -> 
         }
         ("cluster" | "stuart" | "client", Some(sub), _) => {
             let known: &[&str] = match name.as_str() {
-                "cluster" => &["slots", "shards", "nodes", "info", "keyslot", "myid"],
+                "cluster" => &["slots", "shards", "nodes", "info", "keyslot", "myid", "myshardid"],
                 "stuart" => &["join", "create", "assign", "move", "rebalance", "drain", "leave", "forget", "migrations", "nodes", "table"],
                 _ => &["setname", "setinfo", "id"],
             };

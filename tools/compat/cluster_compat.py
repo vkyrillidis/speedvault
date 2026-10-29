@@ -7,7 +7,9 @@
 2. CLUSTER SLOTS / SHARDS / NODES, raw RESP2 and RESP3 bytes, for each
    layout below. The layout is set up in Redis (ADDSLOTS, MEET), and the same
    layout, with Redis's node ids, addresses and node order, is given to
-   `cluster_compat replies`. SLOTS and SHARDS must be byte for byte the same.
+   `cluster_compat replies`. SLOTS and SHARDS must be byte for byte the same,
+   SHARDS' shards in any order (Redis 8 lists them in its hash table's
+   order of their random shard ids).
    NODES too, after masking what a table doesn't have (see reply.rs): the
    bus port, ping and pong times, and the config epoch. Two layouts have
    replicas (CLUSTER REPLICATE): with nothing written, their replication
@@ -36,7 +38,7 @@ import sys
 import time
 from typing import Dict, List, Optional, Tuple
 
-from resp import Conn, cmd
+from resp import Conn, cmd, parse
 
 Ranges = List[Tuple[int, int]]
 
@@ -181,6 +183,15 @@ def mask_nodes(raw: bytes) -> Tuple[bytes, str]:
     return kind + (b"ok" if framing_ok else b"BAD FRAMING"), "\n".join(lines)
 
 
+def sorted_shards(raw: bytes, mask=lambda b: b) -> bytes:
+    """A CLUSTER SHARDS reply with its shards sorted, each byte for byte
+    after `mask`."""
+    reply, _ = parse(raw)
+    if reply.kind != "*":
+        return mask(raw)
+    return raw[:raw.index(b"\r\n")] + b"".join(sorted(mask(e.encode()) for e in reply.value))
+
+
 def compare_layout(name: str, binary: str, nodes: List[Node], layout: Dict[int, Ranges], ask: List[int],
                    replicas: Optional[Dict[int, int]] = None) -> int:
     by_id = {n.id: n for n in nodes}
@@ -203,6 +214,8 @@ def compare_layout(name: str, binary: str, nodes: List[Node], layout: Dict[int, 
                 mine = ours[(reply, f"resp{proto}")]
                 if reply == "nodes":
                     same = mask_nodes(theirs) == mask_nodes(mine)
+                elif reply == "shards":
+                    same = sorted_shards(theirs) == sorted_shards(mine)
                 else:
                     same = theirs == mine
                 status = "same" if same else "DIFFERENT"
@@ -217,6 +230,9 @@ def compare_layout(name: str, binary: str, nodes: List[Node], layout: Dict[int, 
 
 
 HELLO_ID = re.compile(rb"\$2\r\nid\r\n:\d+\r\n")
+# HELLO's last field: Redis 8 lists its built-in modules (vectorset), we
+# have none.
+HELLO_MODULES = re.compile(rb"\$7\r\nmodules\r\n.*\Z", re.S)
 # The INFO cluster lines only our node has (moving slots, redirects,
 # leaving: phases 5 and 6).
 OUR_INFO = re.compile(rb"(migrate_|cluster_redirects_|cluster_leaving)[a-z_]*:\d+\r\n")
@@ -324,6 +340,7 @@ def compare_node(name: str, dbnode: str, node_port: int, nodes: List[Node], layo
 
         def mask(raw: bytes) -> bytes:
             raw = HELLO_ID.sub(b"$2\r\nid\r\n:ID\r\n", raw.replace(theirs, b"<MYID>").replace(ours, b"<MYID>"))
+            raw = HELLO_MODULES.sub(b"$7\r\nmodules\r\n<masked>", raw)
             if raw[:1] in b"$=" and b" myself," in raw:
                 kind, text = mask_nodes(raw)
                 return kind + text.encode()
@@ -352,6 +369,8 @@ def compare_node(name: str, dbnode: str, node_port: int, nodes: List[Node], layo
                     if p == ("CLUSTER", "INFO"):
                         keep = lambda raw: b"\r\n".join(raw.split(b"\r\n")[1:9])  # state .. current_epoch
                         a_, b_ = keep(rr), keep(oo)
+                    elif p == ("CLUSTER", "SHARDS"):
+                        a_, b_ = sorted_shards(rr, mask), sorted_shards(oo, mask)
                     else:
                         a_, b_ = mask(rr), mask(oo)
                     if a_ == b_:

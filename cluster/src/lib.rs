@@ -11,8 +11,9 @@
 //!   migrating from their owner to another node ([`Migration`]), and the
 //!   nodes that are replicas of others ([`Replica`], phase 8).
 //! - [`reply`] encodes `CLUSTER SLOTS`, `SHARDS` and `NODES` from a table, in
-//!   RESP2 and RESP3, as Redis 7.0.15 does (checked byte for byte by
-//!   `tools/compat/cluster_compat.sh` against a real Redis Cluster).
+//!   RESP2 and RESP3, as Redis 8.10.2 does (checked byte for byte by
+//!   `tools/compat/cluster_compat.sh` against a real Redis Cluster), its
+//!   shards grouped by shard id as Redis 7.2+ groups them.
 //!
 //! ```
 //! use cluster::{key_hash_slot, Node, NodeId, SlotRange, SlotTable};

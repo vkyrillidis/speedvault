@@ -138,8 +138,12 @@ reply::slots(&table, &[], &mut out);           // CLUSTER SLOTS, RESP2 or RESP3;
   line, replicas (`with_replicas`, phase 8: of a node that is no
   replica, owning no slots, none migrating to them, in the order given),
   and nodes marked failed (`with_failed`, phase 8: stuart found them down).
-- `reply.rs`: `CLUSTER SLOTS`, `SHARDS` and `NODES` as Redis 7.0.15 sends
-  them, RESP2 and RESP3. The nodes' replication offsets are passed in: a
+- `reply.rs`: `CLUSTER SLOTS`, `SHARDS` and `NODES` as Redis 8.10.2 sends
+  them, RESP2 and RESP3. `SHARDS` groups the nodes by shard id, as Redis
+  7.2+ does: the table lists every node's shard (`with_shards`; by
+  default a primary and its replicas), and stuart carries them from one
+  table to the next (`with_shards_after`) so that a primary failed over
+  stays in its shard, first, as in Redis. The nodes' replication offsets are passed in: a
   replica at 0 is left out of `SLOTS` and `loading` in `SHARDS`, as in
   Redis. A node marked failed is shown as Redis shows one in `FAIL`:
   `fail` in its `NODES` flags and its link `disconnected`, `health fail`
@@ -305,7 +309,7 @@ redis-cli -p 7000 SET k v
   escaping. `metrics.rs`: the node's page and readiness.
 - `admin.rs`: `HELLO`, `CLIENT`, `COMMAND`, `INFO`, `CONFIG GET` and `SET`
   (`maxmemory` only). The node
-  presents itself as Redis 7.0.15 (`HELLO`'s `version`, `INFO`'s
+  presents itself as Redis 8.10.2 (`HELLO`'s `version`, `INFO`'s
   `redis_version`), since clients pick features by it; `INFO` also has
   `speedvault_version`. No users or passwords: `HELLO ... AUTH default <any>`
   succeeds like Redis's `nopass` default user. Fields the node doesn't track

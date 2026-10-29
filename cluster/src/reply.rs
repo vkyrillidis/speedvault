@@ -1,5 +1,5 @@
 //! The replies to `CLUSTER SLOTS`, `SHARDS`, `NODES` and `INFO`, built from
-//! a [`SlotTable`] as Redis 7.0.15 builds them from its view of the cluster
+//! a [`SlotTable`] as Redis 8.10.2 builds them from its view of the cluster
 //! (`cluster.c`: `clusterReplyMultiBulkSlots`, `clusterReplyShards`,
 //! `clusterGenNodesDescription`, `clusterGenClusterInfoString`).
 //!
@@ -23,9 +23,11 @@
 //! checks `nodeFailed` first).
 //!
 //! `SLOTS` lists ranges in slot order, each with its primary, then the
-//! primary's replicas; `SHARDS` lists the primaries in the table's order
-//! (Redis: its hash table's order), each with its replicas, and `NODES`
-//! every node in the table's order, nodes without slots included.
+//! primary's replicas; `SHARDS` lists the table's shards in its order
+//! (Redis: its hash table's order), each with its nodes in order (as
+//! Redis 8.10.2 groups them by shard id: see
+//! [`SlotTable::with_shards`]), and `NODES` every node in the table's
+//! order, nodes without slots included.
 //! Unassigned slots appear nowhere.
 
 use crate::table::{SlotRange, SlotTable};
@@ -70,15 +72,17 @@ pub fn slots(table: &SlotTable, offsets: Offsets, out: &mut Encoder) {
     }
 }
 
-/// `CLUSTER SHARDS`: per primary, `{slots: [start, end, ...], nodes: [{id,
-/// port, ip, endpoint, role, replication-offset, health}, ...]}`, the
-/// primary first, then its replicas.
+/// `CLUSTER SHARDS`: per shard, `{slots: [start, end, ...], nodes: [{id,
+/// port, ip, endpoint, role, replication-offset, health}, ...]}`. As
+/// Redis 8.10.2 (`clusterGetMasterFromShard`), the slots are those of the
+/// primary of the shard's first node not marked failed: none if all are.
 pub fn shards(table: &SlotTable, offsets: Offsets, out: &mut Encoder) {
     let by_node = table.ranges_by_node();
-    let primaries: Vec<usize> = (0..table.nodes().len()).filter(|&i| table.primary_of(i).is_none()).collect();
-    out.array(primaries.len());
-    for i in primaries {
-        let ranges = &by_node[i];
+    let shards = table.shards();
+    out.array(shards.len());
+    for (_, shard) in shards {
+        let primary = shard.iter().find(|&&n| !table.is_failed(n)).map(|&n| table.primary_of(n).unwrap_or(n));
+        let ranges = primary.map_or(&[][..], |p| &by_node[p][..]);
         out.map(2);
         out.bulk(b"slots");
         out.array(2 * ranges.len());
@@ -87,11 +91,10 @@ pub fn shards(table: &SlotTable, offsets: Offsets, out: &mut Encoder) {
             out.integer(i64::from(range.end));
         }
         out.bulk(b"nodes");
-        let shard: Vec<usize> = std::iter::once(i).chain(table.replicas_of(i)).collect();
         out.array(shard.len());
         for n in shard {
             let node = &table.nodes()[n];
-            let replica = n != i;
+            let replica = table.primary_of(n).is_some();
             out.map(7);
             out.bulk(b"id");
             out.bulk(node.id().as_bytes());
@@ -528,6 +531,55 @@ mod tests {
         assert_eq!(encode(|out| slots(&p, &offsets, out)), encode(|out| slots(&with_replicas(), &offsets, out)));
         // The marks don't change INFO.
         assert_eq!(info_text(&t), info_text(&with_replicas()));
+    }
+
+    /// Redis 8.10.2 (3+3) once primary P2 was SIGKILLed and its replica R2
+    /// took over: `SHARDS` lists P2 in its shard still, first, `master`
+    /// and `fail`, the slots R2's.
+    #[test]
+    fn shards_after_a_failover() {
+        let before = with_replicas();
+        let t = SlotTable::new(
+            2,
+            before.nodes().to_vec(),
+            &[
+                (SlotRange::new(0, 5460), Some(id(P1))),
+                (SlotRange::new(5461, 10922), Some(id(R2))),
+                (SlotRange::new(10923, 16383), Some(id(P3))),
+            ],
+        )
+        .unwrap()
+        .with_replicas(&[(id(R3), id(P3)), (id(R1), id(P1))])
+        .unwrap()
+        .with_failed(&[id(P2)])
+        .unwrap()
+        .with_shards_after(&before);
+        let (two, _) = encode(|out| shards(&t, &[], out));
+        let s = |p: &[u8]| std::str::from_utf8(p).unwrap().to_string();
+        let shard = format!(
+            "$5\r\nslots\r\n*2\r\n:5461\r\n:10922\r\n$5\r\nnodes\r\n*2\r\n*14\r\n$2\r\nid\r\n$40\r\n{}\r\n$4\r\nport\r\n:7952\r\n",
+            s(P2)
+        )
+        .escape_default()
+        .to_string();
+        assert!(two.starts_with("*3\\r\\n"), "{two}");
+        assert!(two.contains(&shard), "{two}");
+        let p2 = &two[two.find(&s(P2)).unwrap()..two.find(&s(R2)).unwrap()];
+        assert!(p2.contains("master") && p2.contains("fail"), "{p2}");
+        let r2 = &two[two.find(&s(R2)).unwrap()..][..300];
+        assert!(r2.contains("$6\\r\\nmaster") && r2.contains("online"), "{r2}");
+        // Every node of a shard failed: no slots.
+        let all = t.clone().with_failed(&[id(P2), id(R2)]).unwrap();
+        let (two, _) = encode(|out| shards(&all, &[], out));
+        assert!(two.contains(&format!("*0\r\n$5\r\nnodes\r\n*2\r\n*14\r\n$2\r\nid\r\n$40\r\n{}", s(P2)).escape_default().to_string()), "{two}");
+        // None either when the first of them owns slots.
+        let all = t.clone().with_failed(&[id(P2), id(P1), id(R1)]).unwrap();
+        let (two, _) = encode(|out| shards(&all, &[], out));
+        assert!(two.contains(&format!("*0\r\n$5\r\nnodes\r\n*2\r\n*14\r\n$2\r\nid\r\n$40\r\n{}", s(P1)).escape_default().to_string()), "{two}");
+        // SLOTS and NODES are as without shards.
+        let plain = t.clone().with_replicas(&[(id(R3), id(P3)), (id(R1), id(P1))]).unwrap().with_failed(&[id(P2)]).unwrap();
+        assert_eq!(encode(|out| slots(&t, &[], out)), encode(|out| slots(&plain, &[], out)));
+        assert_eq!(nodes_text(&t, None), nodes_text(&plain, None));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Cluster mode (`--cluster`): the node's slot table, the slot check before
 //! every command with keys, and the `CLUSTER` commands.
 //!
-//! Replies and errors are Redis 7.0.15's in a cluster with
+//! Replies and errors are Redis 8.10.2's in a cluster with
 //! `cluster-require-full-coverage no`: a slot no node owns gets
 //! `-CLUSTERDOWN Hash slot not served` while the other slots carry on.
 //! Without `--cluster`, `CLUSTER`, `READONLY`, `READWRITE` and `ASKING`
@@ -267,9 +267,10 @@ impl Cluster {
 
     /// Whether this node serves the request's keys, at `keys` (the command
     /// table's first, last, step). If not, writes why and returns false, in
-    /// Redis's order (`getNodeByQuery`): the first key's slot is unassigned
-    /// (`CLUSTERDOWN`), another key is in another slot (`CROSSSLOT`; the
-    /// same key again is fine), or another node owns the slot (`MOVED`).
+    /// Redis 8's order (`preprocessCommand`, `getNodeByQuery`): a key is in
+    /// another slot than the first's (`CROSSSLOT`; the same key again is
+    /// fine), the first key's slot is unassigned (`CLUSTERDOWN`), or another
+    /// node owns the slot (`MOVED`).
     ///
     /// While a slot migrates key by key (see the module docs), its keys
     /// count. The source (the owner) serves a request whose keys it all
@@ -298,7 +299,12 @@ impl Cluster {
         let first_key = &args[first as usize];
         let slot = key_hash_slot(first_key);
         let Some(owner) = state.table.owner_index(slot) else {
-            out.error(b"CLUSTERDOWN Hash slot not served");
+            let crosses = (first..=last).step_by(step as usize).any(|i| key_hash_slot(&args[i as usize]) != slot);
+            if crosses {
+                out.error(b"CROSSSLOT Keys in request don't hash to the same slot");
+            } else {
+                out.error(b"CLUSTERDOWN Hash slot not served");
+            }
             return Route::Refused;
         };
         if owner == state.me && ((write && self.write_paused(Some(slot))) || self.landing.borrow().contains(&slot)) {
@@ -438,6 +444,17 @@ pub(crate) const CLUSTER: &[Command] = &[
         }
         Flow::Continue
     }),
+    // Its shard's id in the table (see `SlotTable::with_shards`); before
+    // the node is in one, its own id, as a Redis node starts a shard of
+    // its own.
+    conn("cluster|myshardid", 2, |_, node, _, out| {
+        if let Some(c) = enabled(node, out) {
+            let state = c.state.borrow();
+            let shard = state.table.position(&c.myself).and_then(|i| state.table.shard_of(i));
+            out.bulk(shard.unwrap_or(c.myself).as_bytes());
+        }
+        Flow::Continue
+    }),
     conn("cluster|slots", 2, |_, node, _, out| {
         if let Some(c) = enabled(node, out) {
             reply::slots(&c.state.borrow().table, &offsets(node), out);
@@ -566,14 +583,16 @@ fn get_keys_in_slot(args: &Args, node: &Node, _: &Client, out: &mut Encoder) -> 
 
 /// `CLUSTER SETTABLE epoch NODES n [id host port]... RANGES m [start end
 /// id|-]... [MIGRATING k [slot from to]...] [SYNCING k [slot from to]...]
-/// [REPLICAS r [id primary]...] [FAILED f [id]...]`: the whole table, from
+/// [REPLICAS r [id primary]...] [FAILED f [id]...] [SHARDS s [id shard]...]`:
+/// the whole table, from
 /// stuart. `MIGRATING` moves a slot key by key (Redis's `SETSLOT` states,
 /// see the module docs), `SYNCING` by snapshot (see
 /// [`Migration`](::cluster::Migration)). The ranges must name
 /// every slot once (`-`: unassigned), and the nodes must include this one.
 /// A migration names the slot's owner and the node it moves to; a
 /// replica, its primary (see [`SlotTable::with_replicas`]); the nodes
-/// marked failed, stuart found down ([`SlotTable::with_failed`]).
+/// marked failed, stuart found down ([`SlotTable::with_failed`]); the
+/// shards, if not the default ones ([`SlotTable::with_shards`]).
 fn set_table(args: &Args, node: &Node, client: &Client, out: &mut Encoder) -> Flow {
     let Some(c) = enabled(node, out) else { return Flow::Continue };
     match parse_table(args) {
@@ -808,7 +827,9 @@ fn parse_table(args: &Args) -> Result<SlotTable, TableArgError> {
     let q = if optional(p, b"replicas") { section(p, b"replicas", 2)? } else { 0 };
     let f = if optional(p, b"replicas") { p + 2 + 2 * q } else { p };
     let z = if optional(f, b"failed") { section(f, b"failed", 1)? } else { 0 };
-    let end = if optional(f, b"failed") { f + 2 + z } else { f };
+    let h = if optional(f, b"failed") { f + 2 + z } else { f };
+    let s = if optional(h, b"shards") { section(h, b"shards", 2)? } else { 0 };
+    let end = if optional(h, b"shards") { h + 2 + 2 * s } else { h };
     if args.len() != end {
         return Err(TableArgError::Syntax);
     }
@@ -847,10 +868,12 @@ fn parse_table(args: &Args) -> Result<SlotTable, TableArgError> {
         replicas.push((id(&args[i])?, id(&args[i + 1])?));
     }
     let failed = (0..z).map(|j| id(&args[f + 2 + j])).collect::<Result<Vec<_>, _>>()?;
+    let shards = (0..s).map(|j| Ok((id(&args[h + 2 + 2 * j])?, id(&args[h + 3 + 2 * j])?))).collect::<Result<Vec<_>, _>>()?;
     SlotTable::new(epoch, nodes, &ranges)
         .and_then(|t| t.with_replicas(&replicas))
         .and_then(|t| t.with_migrations(&migrations))
         .and_then(|t| t.with_syncs(&syncs))
         .and_then(|t| t.with_failed(&failed))
+        .and_then(|t| if shards.is_empty() { Ok(t) } else { t.with_shards(&shards) })
         .map_err(|e| TableArgError::Invalid(format!("ERR Invalid table: {e}")))
 }

@@ -247,7 +247,8 @@ fn push_offsets(stuart: &Stuart, link: &mut Link, id: &NodeId) -> io::Result<()>
 
 /// `CLUSTER SETTABLE epoch NODES n id host port ... RANGES m start end id|-
 /// ... [MIGRATING k slot from to ...] [SYNCING k slot from to ...] [REPLICAS r
-/// id primary ...] [FAILED f id ...]`.
+/// id primary ...] [FAILED f id ...] [SHARDS s id shard ...]`; `SHARDS` only
+/// if they aren't the default ones.
 pub(crate) fn settable_args(table: &SlotTable) -> Vec<Vec<u8>> {
     let mut args: Vec<Vec<u8>> = vec![b"CLUSTER".to_vec(), b"SETTABLE".to_vec(), table.epoch().to_string().into()];
     args.push(b"NODES".to_vec());
@@ -286,6 +287,14 @@ pub(crate) fn settable_args(table: &SlotTable) -> Vec<Vec<u8>> {
         args.push(b"FAILED".to_vec());
         args.push(table.failed().len().to_string().into());
         args.extend(table.failed().iter().map(|&i| table.nodes()[i].id().as_bytes().to_vec()));
+    }
+    if table.has_shards() {
+        let shards = table.shard_list();
+        args.push(b"SHARDS".to_vec());
+        args.push(shards.len().to_string().into());
+        for (i, shard) in shards {
+            args.extend([table.nodes()[i].id().as_bytes().to_vec(), shard.as_bytes().to_vec()]);
+        }
     }
     args
 }
@@ -409,5 +418,12 @@ mod tests {
         // The failed nodes after them, in node order.
         let failed = paired.with_failed(&[NodeId::parse(d.as_bytes()).unwrap(), NodeId::parse(c.as_bytes()).unwrap()]).unwrap();
         assert_eq!(text(&failed)[39..], ["FAILED", "2", &c, &d]);
+        // The shards last, only if not the default ones: here c's moved
+        // to b's shard.
+        assert_eq!(text(&failed).len(), 43);
+        let id = |s: &str| NodeId::parse(s.as_bytes()).unwrap();
+        let shards = [(id(&a), id(&a)), (id(&b), id(&b)), (id(&d), id(&b)), (id(&c), id(&a))];
+        let sharded = failed.with_shards(&shards).unwrap();
+        assert_eq!(text(&sharded)[43..], ["SHARDS", "4", &a, &a, &b, &b, &d, &b, &c, &a]);
     }
 }

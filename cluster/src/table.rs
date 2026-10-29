@@ -140,6 +140,12 @@ pub enum TableError {
     ReplicaMigrates(u16),
     /// A node marked failed twice.
     DuplicateFailed(NodeId),
+    /// A node given a shard twice.
+    DuplicateShard(NodeId),
+    /// A node given no shard.
+    NoShard(NodeId),
+    /// A replica in another shard than its primary's.
+    ReplicaOutsideShard(NodeId),
 }
 
 impl fmt::Display for TableError {
@@ -163,11 +169,32 @@ impl fmt::Display for TableError {
             TableError::ReplicaOwnsSlots(id) => write!(f, "replica {id} owns slots"),
             TableError::ReplicaMigrates(slot) => write!(f, "slot {slot} migrates to a replica"),
             TableError::DuplicateFailed(id) => write!(f, "node {id} is marked failed twice"),
+            TableError::DuplicateShard(id) => write!(f, "node {id} is given a shard twice"),
+            TableError::NoShard(id) => write!(f, "node {id} is given no shard"),
+            TableError::ReplicaOutsideShard(id) => write!(f, "replica {id} is not in its primary's shard"),
         }
     }
 }
 
 impl std::error::Error for TableError {}
+
+/// A shard id for a new shard of node `id`: its own, unless `taken`;
+/// then one made from it.
+fn fresh_shard(id: &NodeId, taken: impl Fn(&NodeId) -> bool) -> NodeId {
+    let mut shard = *id;
+    let mut k = 0u64;
+    while taken(&shard) {
+        k += 1;
+        // FNV-1a of the id and `k`, as its first 16 characters.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in id.as_bytes().iter().chain(&k.to_le_bytes()) {
+            h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+        }
+        shard = *id;
+        shard.0[..16].copy_from_slice(format!("{h:016x}").as_bytes());
+    }
+    shard
+}
 
 /// `owner` entry of a slot no node owns.
 const UNASSIGNED: u16 = u16::MAX;
@@ -217,6 +244,10 @@ pub struct SlotTable {
     /// The nodes marked failed (phase 8: stuart found them down), by
     /// index, in order.
     failed: Vec<usize>,
+    /// Every node's shard, as `(index, shard id)` in order (see
+    /// [`SlotTable::with_shards`]); `None`: the default, each primary a
+    /// shard with its own id, its replicas after it.
+    shards: Option<Vec<(usize, NodeId)>>,
 }
 
 impl SlotTable {
@@ -263,7 +294,7 @@ impl SlotTable {
         if let Some(slot) = owner.iter().position(|&o| o == MISSING) {
             return Err(TableError::Gap(slot as u16));
         }
-        Ok(SlotTable { epoch, nodes, owner, migrations: Vec::new(), replicas: Vec::new(), failed: Vec::new() })
+        Ok(SlotTable { epoch, nodes, owner, migrations: Vec::new(), replicas: Vec::new(), failed: Vec::new(), shards: None })
     }
 
     /// The same table with these slots migrating, as `(slot, from, to)`:
@@ -312,7 +343,7 @@ impl SlotTable {
     /// The same table with these nodes replicas, as `(replica, primary)`:
     /// each replica once, of a known node that is no replica, owning no
     /// slots and with none migrating to it. Replaces any replicas the
-    /// table had.
+    /// table had, and its shards with the default ones.
     pub fn with_replicas(mut self, replicas: &[(NodeId, NodeId)]) -> Result<SlotTable, TableError> {
         let mut list: Vec<Replica> = Vec::with_capacity(replicas.len());
         for &(replica, primary) in replicas {
@@ -336,6 +367,7 @@ impl SlotTable {
             return Err(TableError::ReplicaOfReplica(*self.nodes[x.replica].id()));
         }
         self.replicas = list;
+        self.shards = None;
         Ok(self)
     }
 
@@ -372,8 +404,139 @@ impl SlotTable {
         if self.nodes.iter().any(|n| n.host == node.host && n.port == node.port) {
             return Err(TableError::DuplicateAddress(node.host, node.port));
         }
+        let id = node.id;
         self.nodes.push(node);
+        if let Some(mut list) = self.shards.take() {
+            let shard = fresh_shard(&id, |s| list.iter().any(|(_, x)| x == s));
+            list.push((self.nodes.len() - 1, shard));
+            self.shards = Some(list);
+        }
         Ok(self)
+    }
+
+    /// The same table with its nodes in these shards, as `(node, shard
+    /// id)`, after [`with_replicas`](Self::with_replicas): every node
+    /// once, a replica in its primary's shard. As Redis 7.2+ groups nodes
+    /// by shard id (`CLUSTER SHARDS`, `MYSHARDID`): a replica takes its
+    /// primary's, and a primary failed over keeps its own, so it stays in
+    /// the shard of the replica that took over. `SHARDS` lists the shards
+    /// in the order of their first node here, a shard's nodes in this
+    /// order. Without it, each primary is a shard with its own id, its
+    /// replicas after it.
+    pub fn with_shards(mut self, shards: &[(NodeId, NodeId)]) -> Result<SlotTable, TableError> {
+        let mut list: Vec<(usize, NodeId)> = Vec::with_capacity(shards.len());
+        for &(id, shard) in shards {
+            let i = self.position(&id).ok_or(TableError::UnknownNode(id))?;
+            if list.iter().any(|&(j, _)| j == i) {
+                return Err(TableError::DuplicateShard(id));
+            }
+            list.push((i, shard));
+        }
+        if let Some((_, node)) = self.nodes.iter().enumerate().find(|&(i, _)| !list.iter().any(|&(j, _)| j == i)) {
+            return Err(TableError::NoShard(node.id));
+        }
+        let shard_of = |i: usize| list.iter().find(|&&(j, _)| j == i).map(|&(_, s)| s);
+        if let Some(r) = self.replicas.iter().find(|r| shard_of(r.replica) != shard_of(r.primary)) {
+            return Err(TableError::ReplicaOutsideShard(self.nodes[r.replica].id));
+        }
+        self.set_shards(list);
+        Ok(self)
+    }
+
+    /// The same table with its nodes' shards carried over from `previous`
+    /// as Redis's nodes keep their shard ids: a node keeps its shard and
+    /// its place in it, a primary failed over included, unless
+    /// - it's a replica of a primary in another shard: it moves to the end
+    ///   of its primary's (a replica's shard is its primary's);
+    /// - it's a primary not marked failed and another such primary of its
+    ///   shard owns slots (or neither does, but the other came first): one
+    ///   back or handing over without being made a replica. A Redis shard
+    ///   serves its slots from one primary; this one gets a shard of its
+    ///   own, its replicas with it;
+    /// - it's new: a primary gets a shard of its own, a replica its
+    ///   primary's, at the end.
+    ///
+    /// A new shard's id is the node's own, unless a shard has that one.
+    pub fn with_shards_after(mut self, previous: &SlotTable) -> SlotTable {
+        let before: Vec<(NodeId, NodeId)> = previous.shard_list().into_iter().map(|(i, s)| (previous.nodes[i].id, s)).collect();
+        let place = |i: usize| before.iter().position(|(n, _)| *n == self.nodes[i].id);
+        let was = |i: usize| place(i).map(|p| before[p].1);
+        let owns = |i: usize| self.owner.iter().any(|&o| usize::from(o) == i);
+        let primaries: Vec<usize> = (0..self.nodes.len()).filter(|&i| self.primary_of(i).is_none()).collect();
+        let mut shard: Vec<Option<NodeId>> = vec![None; self.nodes.len()];
+        // The primaries keeping theirs: of a shard's live ones, the one
+        // owning slots, else the first.
+        let rank = |i: usize| (!owns(i), place(i));
+        for &i in &primaries {
+            let Some(s) = was(i) else { continue };
+            let rival = |j: usize| j != i && !self.is_failed(j) && was(j) == Some(s) && rank(j) < rank(i);
+            if self.is_failed(i) || !primaries.iter().any(|&j| rival(j)) {
+                shard[i] = Some(s);
+            }
+        }
+        let mut new = Vec::new();
+        for &i in &primaries {
+            if shard[i].is_none() {
+                shard[i] = Some(fresh_shard(&self.nodes[i].id, |s| shard.contains(&Some(*s))));
+                new.push(i);
+            }
+        }
+        for r in &self.replicas {
+            shard[r.replica] = shard[r.primary];
+            if was(r.replica) != shard[r.replica] {
+                new.push(r.replica);
+            }
+        }
+        let mut list: Vec<(usize, NodeId)> =
+            before.iter().filter_map(|(id, s)| self.position(id).filter(|&i| shard[i] == Some(*s)).map(|i| (i, *s))).collect();
+        list.extend(new.into_iter().map(|i| (i, shard[i].unwrap())));
+        self.set_shards(list);
+        self
+    }
+
+    /// Keeps `None` for the default shards, so that equal tables compare
+    /// equal.
+    fn set_shards(&mut self, list: Vec<(usize, NodeId)>) {
+        self.shards = (list != self.default_shards()).then_some(list);
+    }
+
+    /// Every node's shard, as `(index, shard id)`, in the order
+    /// [`with_shards`](Self::with_shards) describes.
+    pub fn shard_list(&self) -> Vec<(usize, NodeId)> {
+        self.shards.clone().unwrap_or_else(|| self.default_shards())
+    }
+
+    /// Whether the shards are other than the default ones (see
+    /// [`with_shards`](Self::with_shards)).
+    pub fn has_shards(&self) -> bool {
+        self.shards.is_some()
+    }
+
+    /// The shards in order, each with its nodes in order.
+    pub fn shards(&self) -> Vec<(NodeId, Vec<usize>)> {
+        let mut shards: Vec<(NodeId, Vec<usize>)> = Vec::new();
+        for (i, s) in self.shard_list() {
+            match shards.iter_mut().find(|(x, _)| *x == s) {
+                Some((_, nodes)) => nodes.push(i),
+                None => shards.push((s, vec![i])),
+            }
+        }
+        shards
+    }
+
+    /// Node `i`'s shard id.
+    pub fn shard_of(&self, i: usize) -> Option<NodeId> {
+        self.shard_list().into_iter().find(|&(j, _)| j == i).map(|(_, s)| s)
+    }
+
+    fn default_shards(&self) -> Vec<(usize, NodeId)> {
+        let mut list = Vec::with_capacity(self.nodes.len());
+        for p in (0..self.nodes.len()).filter(|&i| self.primary_of(i).is_none()) {
+            let id = self.nodes[p].id;
+            list.push((p, id));
+            list.extend(self.replicas_of(p).map(|r| (r, id)));
+        }
+        list
     }
 
     /// The indexes of the nodes marked failed, in order.
@@ -481,6 +644,7 @@ impl fmt::Debug for SlotTable {
             .field("migrations", &self.migrations)
             .field("replicas", &self.replicas)
             .field("failed", &self.failed)
+            .field("shards", &self.shards)
             .finish()
     }
 }
@@ -763,5 +927,115 @@ mod tests {
         assert_eq!(t.clone().with_node(node(2)).unwrap_err(), TableError::DuplicateNode(id(2)));
         let taken = Node::new(id(4), "127.0.0.1", 7001).unwrap();
         assert_eq!(t.clone().with_node(taken).unwrap_err(), TableError::DuplicateAddress("127.0.0.1".into(), 7001));
+    }
+
+    /// Nodes 1 and 2 primaries (0-8191, 8192-16383); 3 and 5 replicas of
+    /// 1, 4 of 2.
+    fn paired() -> SlotTable {
+        SlotTable::new(1, (1..=5).map(node).collect(), &[(r(0, 8191), Some(id(1))), (r(8192, 16383), Some(id(2)))])
+            .unwrap()
+            .with_replicas(&[(id(3), id(1)), (id(4), id(2)), (id(5), id(1))])
+            .unwrap()
+    }
+
+    /// The shards as `(shard id, [node...])`, by node number.
+    fn shards_of(t: &SlotTable) -> Vec<(NodeId, Vec<u8>)> {
+        t.shards().into_iter().map(|(s, nodes)| (s, nodes.into_iter().map(|i| t.nodes()[i].id().as_bytes()[1] - b'0').collect())).collect()
+    }
+
+    /// `paired` after 1 failed over to 3: 3 owns 0-8191, 5 follows it.
+    fn failed_over(failed: bool) -> SlotTable {
+        let t = SlotTable::new(2, (1..=5).map(node).collect(), &[(r(0, 8191), Some(id(3))), (r(8192, 16383), Some(id(2)))])
+            .unwrap()
+            .with_replicas(&[(id(4), id(2)), (id(5), id(3))])
+            .unwrap();
+        if failed { t.with_failed(&[id(1)]).unwrap() } else { t }
+    }
+
+    #[test]
+    fn default_shards() {
+        let t = paired();
+        assert!(!t.has_shards());
+        assert_eq!(shards_of(&t), [(id(1), vec![1, 3, 5]), (id(2), vec![2, 4])]);
+        assert_eq!(t.shard_of(2), Some(id(1)), "node 3, a replica of 1");
+        // Carried over unchanged, it stays the default.
+        assert_eq!(paired().with_shards_after(&t), t);
+    }
+
+    #[test]
+    fn shards_through_a_failover() {
+        // The failed primary keeps its shard and its place, as in Redis:
+        // first, before the replica that took over.
+        let t = failed_over(true).with_shards_after(&paired());
+        assert!(t.has_shards());
+        assert_eq!(shards_of(&t), [(id(1), vec![1, 3, 5]), (id(2), vec![2, 4])]);
+        // Back as a replica of 3: in place.
+        let back = SlotTable::new(3, (1..=5).map(node).collect(), &[(r(0, 8191), Some(id(3))), (r(8192, 16383), Some(id(2)))])
+            .unwrap()
+            .with_replicas(&[(id(4), id(2)), (id(5), id(3)), (id(1), id(3))])
+            .unwrap()
+            .with_shards_after(&t);
+        assert_eq!(shards_of(&back), [(id(1), vec![1, 3, 5]), (id(2), vec![2, 4])]);
+        // Back as a primary without slots (or handing over): a shard of its
+        // own, with an id other than its own (its old shard has that).
+        let alone = failed_over(false).with_shards_after(&t);
+        let s = shards_of(&alone);
+        assert_eq!(s[..2], [(id(1), vec![3, 5]), (id(2), vec![2, 4])]);
+        assert_eq!(s[2].1, [1]);
+        assert_ne!(s[2].0, id(1));
+        assert_eq!(s[2].0.as_bytes()[16..], id(1).as_bytes()[16..]);
+        // Straight from the start too.
+        assert_eq!(failed_over(false).with_shards_after(&paired()), alone);
+        // A failed primary is no rival: 3 keeps the shard though it owns
+        // nothing now (its slots moved to 2).
+        let emptied = SlotTable::new(3, (1..=5).map(node).collect(), &[(r(0, 16383), Some(id(2)))])
+            .unwrap()
+            .with_replicas(&[(id(4), id(2)), (id(5), id(3))])
+            .unwrap()
+            .with_failed(&[id(1)])
+            .unwrap()
+            .with_shards_after(&t);
+        assert_eq!(shards_of(&emptied), [(id(1), vec![1, 3, 5]), (id(2), vec![2, 4])]);
+    }
+
+    #[test]
+    fn shards_of_moved_and_new_nodes() {
+        let t = failed_over(true).with_shards_after(&paired());
+        // 4 a replica of 3 now: to the end of 3's shard.
+        let moved = failed_over(true).with_replicas(&[(id(4), id(3)), (id(5), id(3))]).unwrap().with_shards_after(&t);
+        assert_eq!(shards_of(&moved), [(id(1), vec![1, 3, 5, 4]), (id(2), vec![2])]);
+        // Node 6 joins (a primary), node 2 is removed: 4 and 5 follow 3.
+        let nodes: Vec<Node> = [1, 3, 4, 5, 6].into_iter().map(node).collect();
+        let next = SlotTable::new(3, nodes, &[(r(0, 16383), Some(id(3)))])
+            .unwrap()
+            .with_replicas(&[(id(4), id(3)), (id(5), id(3))])
+            .unwrap()
+            .with_failed(&[id(1)])
+            .unwrap()
+            .with_shards_after(&moved);
+        assert_eq!(shards_of(&next), [(id(1), vec![1, 3, 5, 4]), (id(6), vec![6])]);
+        // A node added for a node leaving gets a shard of its own.
+        let lingering = next.clone().with_node(node(7)).unwrap();
+        assert_eq!(shards_of(&lingering).last(), Some(&(id(7), vec![7])));
+        // `with_replicas` goes back to the default shards.
+        assert!(!next.with_replicas(&[]).unwrap().has_shards());
+    }
+
+    #[test]
+    fn shards_given() {
+        let t = failed_over(true);
+        let list = [(id(1), id(1)), (id(3), id(1)), (id(5), id(1)), (id(2), id(2)), (id(4), id(2))];
+        let given = t.clone().with_shards(&list).unwrap();
+        assert_eq!(given, t.clone().with_shards_after(&paired()));
+        let ids = |l: Vec<(usize, NodeId)>| -> Vec<(NodeId, NodeId)> { l.into_iter().map(|(i, s)| (*t.nodes()[i].id(), s)).collect() };
+        assert_eq!(ids(given.shard_list()), list);
+        // The default ones are no shards given.
+        let default = [(id(1), id(1)), (id(2), id(2)), (id(4), id(2)), (id(3), id(3)), (id(5), id(3))];
+        assert!(!t.clone().with_shards(&default).unwrap().has_shards());
+        assert_eq!(t.clone().with_shards(&list[..4]).unwrap_err(), TableError::NoShard(id(4)));
+        assert_eq!(t.clone().with_shards(&[list[0], list[0]]).unwrap_err(), TableError::DuplicateShard(id(1)));
+        assert_eq!(t.clone().with_shards(&[(id(9), id(1))]).unwrap_err(), TableError::UnknownNode(id(9)));
+        let apart = [(id(1), id(1)), (id(3), id(1)), (id(5), id(5)), (id(2), id(2)), (id(4), id(2))];
+        assert_eq!(t.with_shards(&apart).unwrap_err(), TableError::ReplicaOutsideShard(id(5)));
     }
 }

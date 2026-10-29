@@ -19,11 +19,13 @@ Windows drive is much slower.
 
 ## Compatibility with Redis
 
-Replies must match Redis 7.0.15 byte for byte. The suites in `tools/compat`
-check that against a real `redis-server` (Debian bookworm and Ubuntu 24.04
-package 7.0.15) and need redis-py (`pip install redis==8.1.0`):
+Replies must match Redis 8.10.2 byte for byte. The suites in `tools/compat`
+check that against a real `redis-server`, built from the 8.10.2 tag by
+`tools/compat/build_redis.sh` (as CI does), and need redis-py
+(`pip install redis==8.1.0`):
 
 ```sh
+tools/compat/build_redis.sh .redis && export PATH=$PWD/.redis/bin:$PATH
 redis-server --port 6393 --save '' --appendonly no --daemonize yes
 target/release/speedvault-server 7393 &
 python3 tools/compat/difftest.py --ref 127.0.0.1:6393 --target 127.0.0.1:7393
