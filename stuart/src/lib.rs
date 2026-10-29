@@ -324,7 +324,7 @@ impl Stuart {
         };
         for id in empty {
             let since = *self.emptied.borrow_mut().entry(id).or_insert(epoch);
-            if !(self.has_taken(&id, since) || !self.is_up(&id)) {
+            if !self.has_taken(&id, since) && self.is_up(&id) {
                 continue;
             }
             match self.change(|s| s.remove_left(&id)) {
@@ -364,7 +364,7 @@ impl Stuart {
                 epoch
             }
         };
-        if !(self.has_taken(&id, since) || !self.is_up(&id)) {
+        if !self.has_taken(&id, since) && self.is_up(&id) {
             return;
         }
         match self.change(|s| s.demote(&id)) {
