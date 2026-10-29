@@ -441,8 +441,8 @@ The steward: `stuart [PORT | HOST:PORT] --state FILE [--auto] [--create-when N]
 moves slots between them, and is never in the data path.
 
 ```sh
-stuart --state /var/lib/stuart/state &
-dbnode 127.0.0.1:7001 --cluster --stuart 127.0.0.1:7600 &   # and 7002, 7003
+speedvault-stuart --state /var/lib/stuart/state &
+speedvault-server 127.0.0.1:7001 --cluster --stuart 127.0.0.1:7600 &   # and 7002, 7003
 redis-cli -p 7600 STUART NODES      # wait until they're up
 redis-cli -p 7600 STUART CREATE     # 0-5460, 5461-10922, 10923-16383, in join order
 redis-cli -c -p 7600 SET foo bar    # MOVED to the owner of slot 12182, then OK

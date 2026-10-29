@@ -266,7 +266,7 @@ tools/bench/stall_bench.sh [--keys N] [--also NAME=SERVER ...]
 
 10M new keys (`key:%012d`, 16 B values) from one connection, 100 `SET`s a
 batch, into ours, Redis 7.0.15 and each `--also` server (a redis-server-like
-binary, or another build of `dbnode`), one at a time, the server on CPU 2
+binary, or another build of `speedvault-server`), one at a time, the server on CPU 2
 and the client on CPU 4. Each batch's round trip is timed on the monotonic
 clock: a keyspace rehashed all at once when it doubles shows as one slow
 batch. The keys/s, the round trips' p50, p99.9 and max, how many took over

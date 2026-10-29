@@ -35,7 +35,7 @@ x-node: &node
 services:
   stuart:
     <<: *image
-    entrypoint: ["stuart"]
+    entrypoint: ["speedvault-stuart"]
     # On SIGTERM stuart serves on up to 15 s for nodes stopping too.
     stop_grace_period: 20s
     command: ["7600", "--state", "/var/lib/stuart/state", "--create-when", "3", "--auto"]

@@ -18,7 +18,7 @@ const DEFAULT_ADDR: &str = "127.0.0.1:7000";
 /// Enough for a client that answers at once to send its next request before
 /// the server sleeps: 1.37x Redis's GET/s at -P 1 instead of 0.87x (WSL2).
 const DEFAULT_BUSY_POLL: Duration = Duration::from_micros(20);
-const USAGE: &str = "usage: dbnode [PORT | HOST:PORT] [--timeout SECONDS] [--busy-poll USEC] [--loglevel LEVEL]
+const USAGE: &str = "usage: speedvault-server [PORT | HOST:PORT] [--timeout SECONDS] [--busy-poll USEC] [--loglevel LEVEL]
               [--maxmemory BYTES | N%] [--metrics PORT | HOST:PORT]
               [--cluster [--announce HOST:PORT] [--stuart HOST:PORT [--name NAME] [--zone ZONE] [--drain-timeout SECONDS] [--leave-linger SECONDS]]
                          [--migrate-batch KEYS] [--migrate-pause USEC] [--migrate-chunk ELEMENTS]]
@@ -90,11 +90,11 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Some(Command::Version) => {
-            println!("dbnode {}", env!("CARGO_PKG_VERSION"));
+            println!("speedvault-server {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
         Some(Command::Invalid(why)) => {
-            eprintln!("dbnode: {why}\n{USAGE}");
+            eprintln!("speedvault-server: {why}\n{USAGE}");
             return ExitCode::from(2);
         }
         None => {
@@ -106,7 +106,7 @@ fn main() -> ExitCode {
     let maxmemory = match maxmemory.resolve() {
         Ok(bytes) => bytes,
         Err(why) => {
-            eprintln!("dbnode: {why}");
+            eprintln!("speedvault-server: {why}");
             return ExitCode::from(2);
         }
     };
@@ -131,7 +131,7 @@ fn main() -> ExitCode {
     let max = if maxmemory == 0 { "none".to_string() } else { format!("{} ({maxmemory} bytes)", Human(maxmemory)) };
     let http = metrics.as_ref().and_then(|m| m.local_addr().ok()).map_or(String::new(), |a| format!(", metrics on http://{a}/metrics"));
     notice!(
-        "dbnode {} (pid {}) ready on {addr}; idle timeout {idle}, busy-poll {} us, maxmemory {max}{http}",
+        "speedvault-server {} (pid {}) ready on {addr}; idle timeout {idle}, busy-poll {} us, maxmemory {max}{http}",
         env!("CARGO_PKG_VERSION"),
         std::process::id(),
         busy_poll.as_micros()

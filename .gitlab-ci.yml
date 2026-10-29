@@ -44,7 +44,7 @@ compat:
       command: ["redis-server", "--save", "", "--appendonly", "no"]
   script:
     - cargo build --release --locked -p dbnode
-    - ./target/release/dbnode 127.0.0.1:7000 --loglevel warning &
+    - ./target/release/speedvault-server 127.0.0.1:7000 --loglevel warning &
     - |
       python3 - <<'PY'
       import socket, time

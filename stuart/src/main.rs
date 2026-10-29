@@ -11,7 +11,7 @@ use std::time::Duration;
 use stuart::{Config, Moves};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:7600";
-const USAGE: &str = "usage: stuart [PORT | HOST:PORT] --state FILE [--auto] [--create-when N] [--replicas N] [--fail-after SECONDS]
+const USAGE: &str = "usage: speedvault-stuart [PORT | HOST:PORT] --state FILE [--auto] [--create-when N] [--replicas N] [--fail-after SECONDS]
               [--moves-per-source N] [--max-moves N] [--loglevel LEVEL] [--metrics PORT | HOST:PORT]
   PORT | HOST:PORT    where to listen (default 127.0.0.1:7600; a bare port listens on all interfaces)
   --state FILE        the nodes and the slot table, written before stuart acts on them and read at start
@@ -48,7 +48,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Some(Command::Version) => {
-            println!("stuart {}", env!("CARGO_PKG_VERSION"));
+            println!("speedvault-stuart {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
         None => {
@@ -77,7 +77,7 @@ fn main() -> ExitCode {
         }
     };
     let http = metrics.as_ref().and_then(|m| m.local_addr().ok()).map_or(String::new(), |a| format!("; metrics on http://{a}/metrics"));
-    notice!("stuart {} (pid {}) ready on {addr}{http}", env!("CARGO_PKG_VERSION"), std::process::id());
+    notice!("speedvault-stuart {} (pid {}) ready on {addr}{http}", env!("CARGO_PKG_VERSION"), std::process::id());
     let error = stuart::serve(listener, metrics, Config { state, create_when, moves, auto, replicas, fail_after });
     warning!("stuart stopped: {}", error.err().map_or("no error".to_string(), |e| e.to_string()));
     ExitCode::FAILURE

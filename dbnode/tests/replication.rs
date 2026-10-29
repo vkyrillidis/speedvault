@@ -889,7 +889,7 @@ fn a_primary_stalled_past_its_lease_takes_no_write() {
         }
     }
     let primary = Kill(
-        std::process::Command::new(env!("CARGO_BIN_EXE_dbnode"))
+        std::process::Command::new(env!("CARGO_BIN_EXE_speedvault-server"))
             .args([&p_addr.to_string(), "--cluster", "--loglevel", "warning"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -942,7 +942,7 @@ fn a_stalled_primary_answered_late_takes_no_write() {
         }
     }
     let primary = Kill(
-        std::process::Command::new(env!("CARGO_BIN_EXE_dbnode"))
+        std::process::Command::new(env!("CARGO_BIN_EXE_speedvault-server"))
             .args([&p_addr.to_string(), "--cluster", "--loglevel", "warning"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

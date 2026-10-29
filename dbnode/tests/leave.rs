@@ -79,7 +79,7 @@ impl Node {
     fn start(stuart: &Stuart, extra: &[&str]) -> Node {
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_dbnode"))
+        let child = Command::new(env!("CARGO_BIN_EXE_speedvault-server"))
             .args([&addr.to_string(), "--cluster", "--stuart", &stuart.addr.to_string(), "--loglevel", "warning"])
             .args(extra)
             .stdout(Stdio::null())
@@ -219,7 +219,7 @@ fn refused_or_too_long() {
 fn without_stuart_sigterm_exits() {
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let addr = format!("127.0.0.1:{port}");
-    let child = Command::new(env!("CARGO_BIN_EXE_dbnode"))
+    let child = Command::new(env!("CARGO_BIN_EXE_speedvault-server"))
         .args([&addr, "--cluster"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())

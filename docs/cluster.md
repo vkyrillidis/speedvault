@@ -30,8 +30,8 @@ too, on the image just built).
 **By hand**, on one machine:
 
 ```sh
-stuart --state ./stuart.state --create-when 3 &
-for p in 7001 7002 7003; do dbnode 127.0.0.1:$p --cluster --stuart 127.0.0.1:7600 & done
+speedvault-stuart --state ./stuart.state --create-when 3 &
+for p in 7001 7002 7003; do speedvault-server 127.0.0.1:$p --cluster --stuart 127.0.0.1:7600 & done
 redis-cli -p 7600 STUART NODES      # three nodes, up, acked=1
 redis-cli -c -p 7600 SET foo bar    # stuart redirects to the owner of foo's slot
 ```

@@ -35,7 +35,7 @@ One node, as a Redis server on port 7000:
 
 ```sh
 cargo build --release
-target/release/dbnode 7000              # or: docker build -t speedvault . && docker run -p 7000:7000 speedvault
+target/release/speedvault-server 7000              # or: docker build -t speedvault . && docker run -p 7000:7000 speedvault
 redis-cli -p 7000 SET greeting hello
 redis-cli -p 7000 GET greeting
 ```
@@ -110,8 +110,8 @@ the writes made meanwhile, so nothing forks and nothing stops serving. See
 | `resp` | Incremental RESP2/RESP3 parser and reply encoder |
 | `store` | The keyspace: a table of one-block keys per slot; strings, hashes, sets, lists, expiry |
 | `cluster` | Hash slots, the slot table, Redis Cluster's replies |
-| `dbnode` | The server binary |
-| `stuart` | The cluster's steward |
+| `dbnode` | The node: `speedvault-server` |
+| `stuart` | The cluster's steward: `speedvault-stuart` |
 
 ## Documentation
 

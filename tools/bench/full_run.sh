@@ -16,7 +16,7 @@
 #
 # Servers (all on 127.0.0.1; the script stops if a port is taken):
 #   Redis      6393  redis-server --save '' --appendonly no, pinned to CPU 2
-#   speedvault 7000  target/release/dbnode --loglevel warning, CPU 2
+#   speedvault 7000  target/release/speedvault-server --loglevel warning, CPU 2
 #   --also     6394, 6395, ...  SERVER --save '' --appendonly no, CPU 2
 # They run one at a time under load, so they can share CPU 2. Redis (on
 # PATH, 7.0.15) stays the reference: the compat check and the ratios.
@@ -85,7 +85,7 @@ echo ">> building" >&2
 
 echo ">> starting servers" >&2
 redis-server --port 6393 --save '' --appendonly no >"$LOGS/redis.log" 2>&1 & PIDS+=($!)
-"$CARGO_TARGET_DIR/release/dbnode" 127.0.0.1:7000 --loglevel warning >"$LOGS/dbnode.log" 2>&1 & PIDS+=($!)
+"$CARGO_TARGET_DIR/release/speedvault-server" 127.0.0.1:7000 --loglevel warning >"$LOGS/dbnode.log" 2>&1 & PIDS+=($!)
 for i in "${!ALSO_NAMES[@]}"; do
   "${ALSO_BINS[$i]}" --port "${ALSO_PORTS[$i]}" --save '' --appendonly no >"$LOGS/${ALSO_NAMES[$i]}.log" 2>&1 & PIDS+=($!)
 done

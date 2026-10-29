@@ -39,7 +39,7 @@ cleanup() {
 }
 trap cleanup EXIT
 start_stuart() {
-  "$BIN/stuart" "127.0.0.1:$S" --state "$DIR/state" --loglevel warning 2>>"$DIR/stuart.log" & STUART_PID=$!
+  "$BIN/speedvault-stuart" "127.0.0.1:$S" --state "$DIR/state" --loglevel warning 2>>"$DIR/stuart.log" & STUART_PID=$!
   for _ in $(seq 50); do redis-cli -p "$S" ping >/dev/null 2>&1 && return; sleep 0.1; done
   echo "stuart didn't start; see $DIR/stuart.log" >&2; exit 1
 }
@@ -58,7 +58,7 @@ nodes_up() { [ "$(redis-cli -p "$S" stuart nodes | grep -c " up .*acked=$1 ")" =
 
 start_stuart
 for p in "${NODES[@]}"; do
-  "$BIN/dbnode" "127.0.0.1:$p" --cluster --stuart "127.0.0.1:$S" --loglevel warning 2>>"$DIR/node-$p.log" & PIDS+=($!)
+  "$BIN/speedvault-server" "127.0.0.1:$p" --cluster --stuart "127.0.0.1:$S" --loglevel warning 2>>"$DIR/node-$p.log" & PIDS+=($!)
 done
 wait_for "the 3 nodes joined and are up" nodes_up 0
 check "STUART CREATE" OK "$(redis-cli -p "$S" stuart create)"
@@ -101,7 +101,7 @@ old_id=$(redis-cli -p "$p" cluster myid)
 range=$(redis-cli -p "$S" stuart table | awk -v id="$old_id" '$1 == id {print $NF}')   # e.g. 10923-16383
 first=${range%-*}; last=${range#*-}
 kill -KILL "${PIDS[$owner]}"; wait "${PIDS[$owner]}" 2>/dev/null || true
-"$BIN/dbnode" "127.0.0.1:$p" --cluster --stuart "127.0.0.1:$S" --loglevel warning 2>>"$DIR/node-$p.log" & PIDS[$owner]=$!
+"$BIN/speedvault-server" "127.0.0.1:$p" --cluster --stuart "127.0.0.1:$S" --loglevel warning 2>>"$DIR/node-$p.log" & PIDS[$owner]=$!
 new_id_joined() { new_id=$(redis-cli -p "$p" cluster myid 2>/dev/null) && [ -n "$new_id" ] && [ "$new_id" != "$old_id" ] &&
   redis-cli -p "$S" stuart nodes | grep -q "^$new_id "; }
 wait_for "the restarted node joined with a new id" new_id_joined

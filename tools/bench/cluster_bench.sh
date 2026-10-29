@@ -86,10 +86,10 @@ redis_cluster redis-7.0.15 redis-server redis-cli 7900
 # Ours: stuart on 7910, nodes on 7911..7913, joined in port order.
 S=7910; OURS=(7911 7912 7913)
 for p in "$S" "${OURS[@]}"; do port_free "$p" || fail "port $p is taken"; done
-taskset -c 14 "$BIN/stuart" "127.0.0.1:$S" --state "$DIR/stuart.state" --loglevel warning 2>>"$DIR/stuart.log" & PIDS+=($!)
+taskset -c 14 "$BIN/speedvault-stuart" "127.0.0.1:$S" --state "$DIR/stuart.state" --loglevel warning 2>>"$DIR/stuart.log" & PIDS+=($!)
 wait_for "stuart starts" pings redis-cli "$S"
 for i in 0 1 2; do
-  taskset -c "${NODE_CPUS[$i]}" "$BIN/dbnode" "127.0.0.1:${OURS[$i]}" --cluster --stuart "127.0.0.1:$S" \
+  taskset -c "${NODE_CPUS[$i]}" "$BIN/speedvault-server" "127.0.0.1:${OURS[$i]}" --cluster --stuart "127.0.0.1:$S" \
     --loglevel warning 2>>"$DIR/node-${OURS[$i]}.log" & PIDS+=($!)
   wait_for "node ${OURS[$i]} joins" bash -c "[ \$(redis-cli -p $S stuart nodes | grep -c ' up ') = $((i + 1)) ]"
 done
@@ -114,8 +114,8 @@ if [ "$SLOT_CHECK" = 1 ]; then
   echo ">> the cost of cluster mode: standalone vs cluster mode, one node" >&2
   cleanup; CLIS=(); PORTS_ALL=(); PIDS=(); DIR="$(mktemp -d /tmp/cluster_bench.XXXXXX)"
   for p in 7941 7942; do port_free "$p" || fail "port $p is taken"; done
-  "$BIN/dbnode" 127.0.0.1:7941 --loglevel warning 2>>"$DIR/standalone.log" & PIDS+=($!)
-  "$BIN/dbnode" 127.0.0.1:7942 --cluster --loglevel warning 2>>"$DIR/cluster.log" & PIDS+=($!)
+  "$BIN/speedvault-server" 127.0.0.1:7941 --loglevel warning 2>>"$DIR/standalone.log" & PIDS+=($!)
+  "$BIN/speedvault-server" 127.0.0.1:7942 --cluster --loglevel warning 2>>"$DIR/cluster.log" & PIDS+=($!)
   wait_for "the nodes start" bash -c "redis-cli -p 7941 ping >/dev/null && redis-cli -p 7942 ping >/dev/null"
   id=$(redis-cli -p 7942 cluster myid)
   [ "$(redis-cli -p 7942 cluster settable 1 NODES 1 "$id" 127.0.0.1 7942 RANGES 1 0 16383 "$id")" = OK ] || fail "SETTABLE"

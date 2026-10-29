@@ -241,7 +241,7 @@ class Cluster:
     def start_stuart(self):
         log = open(os.path.join(self.dir, "stuart.log"), "ab")
         self.stuart_proc = subprocess.Popen(
-            [*self.pin(self.base), f"{self.bin}/stuart", f"{HOST}:{self.base}", "--state", os.path.join(self.dir, "state"),
+            [*self.pin(self.base), f"{self.bin}/speedvault-stuart", f"{HOST}:{self.base}", "--state", os.path.join(self.dir, "state"),
              "--loglevel", "warning", *self.stuart_args],
             stderr=log, stdout=subprocess.DEVNULL)
         wait_for("stuart to listen", lambda: self.stuart().ping())
@@ -256,7 +256,7 @@ class Cluster:
     def start_node(self, port: int, extra: Optional[List[str]] = None):
         log = open(os.path.join(self.dir, f"node-{port}.log"), "ab")
         self.nodes[port] = subprocess.Popen(
-            [*self.pin(port), f"{self.bin}/dbnode", f"{HOST}:{port}", "--cluster", "--stuart", f"{HOST}:{self.base}",
+            [*self.pin(port), f"{self.bin}/speedvault-server", f"{HOST}:{port}", "--cluster", "--stuart", f"{HOST}:{self.base}",
              "--loglevel", "warning", *self.migrate_args, *(extra or [])],
             stderr=log, stdout=subprocess.DEVNULL)
         node_id = wait_for(f"node {port} to listen", lambda: text(self.node(port).execute_command("CLUSTER", "MYID")))

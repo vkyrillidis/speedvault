@@ -65,4 +65,4 @@ done
   --cluster-replicas 0 --cluster-yes >/dev/null
 
 python3 "$HERE/cluster_compat.py" --bin "$BIN" --ports "$PORTS" --keys "$KEYS" \
-  --dbnode "$CARGO_TARGET_DIR/release/dbnode" --node-port "$NODE_PORT"
+  --dbnode "$CARGO_TARGET_DIR/release/speedvault-server" --node-port "$NODE_PORT"

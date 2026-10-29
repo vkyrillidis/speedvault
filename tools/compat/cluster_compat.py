@@ -411,7 +411,7 @@ def main(argv: List[str]) -> int:
     ap.add_argument("--bin", required=True, help="the cluster_compat example binary")
     ap.add_argument("--ports", required=True, help="4 ports: the 3-node cluster, then a spare node")
     ap.add_argument("--keys", type=int, default=20000)
-    ap.add_argument("--dbnode", help="also run our node in cluster mode in a Redis node's place (target/release/dbnode)")
+    ap.add_argument("--dbnode", help="also run our node in cluster mode in a Redis node's place (target/release/speedvault-server)")
     ap.add_argument("--node-port", type=int, default=7811, help="where our node listens [7811]")
     ap.add_argument("--seed", type=int, default=1)
     args = ap.parse_args(argv)

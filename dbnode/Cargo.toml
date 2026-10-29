@@ -7,6 +7,10 @@ license.workspace = true
 description = "The SpeedVault node: a Redis-compatible server"
 publish = false
 
+[[bin]]
+name = "speedvault-server"
+path = "src/main.rs"
+
 [dependencies]
 cluster = { path = "../cluster" }
 libc = "0.2"

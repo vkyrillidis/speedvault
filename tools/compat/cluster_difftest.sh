@@ -73,7 +73,7 @@ wait_for() {  # wait_for WHAT COMMAND...
   fail "$what"
 }
 start_stuart() {
-  "$BIN/stuart" "127.0.0.1:$S" --state "$DIR/state" --loglevel warning 2>>"$DIR/stuart.log" & STUART_PID=$!
+  "$BIN/speedvault-stuart" "127.0.0.1:$S" --state "$DIR/state" --loglevel warning 2>>"$DIR/stuart.log" & STUART_PID=$!
   wait_for "stuart starts" pings "$S"
 }
 joined() { [ "$("$REDIS_CLI" -p "$S" stuart nodes | grep -c ' up ')" = "$1" ]; }
@@ -95,7 +95,7 @@ wait_for "the Redis Cluster is ok" redis_ok
 # Ours: one node at a time, so the join order is the port order.
 start_stuart
 for i in 0 1 2; do
-  "$BIN/dbnode" "127.0.0.1:${O[$i]}" --cluster --stuart "127.0.0.1:$S" --loglevel warning 2>>"$DIR/node-${O[$i]}.log" & PIDS+=($!)
+  "$BIN/speedvault-server" "127.0.0.1:${O[$i]}" --cluster --stuart "127.0.0.1:$S" --loglevel warning 2>>"$DIR/node-${O[$i]}.log" & PIDS+=($!)
   wait_for "node ${O[$i]} joins" joined $((i + 1))
 done
 [ "$("$REDIS_CLI" -p "$S" stuart create)" = OK ] || fail "STUART CREATE"
@@ -154,11 +154,11 @@ for p in "${R6[@]}"; do
   wait_for "redis $p ok" bash -c "\"$REDIS_CLI\" -p $p cluster info | grep -q '^cluster_state:ok'"
   wait_for "redis $p knows the replicas" three_slaves "$p"
 done
-"$BIN/stuart" "127.0.0.1:$S6" --state "$DIR/state6" --replicas 1 --loglevel warning 2>>"$DIR/stuart6.log" & STUART6_PID=$!
+"$BIN/speedvault-stuart" "127.0.0.1:$S6" --state "$DIR/state6" --replicas 1 --loglevel warning 2>>"$DIR/stuart6.log" & STUART6_PID=$!
 wait_for "stuart (replicas) starts" pings "$S6"
 joined6() { [ "$("$REDIS_CLI" -p "$S6" stuart nodes | grep -c ' up ')" = "$1" ]; }
 for i in 0 1 2 3 4 5; do
-  "$BIN/dbnode" "127.0.0.1:${O6[$i]}" --cluster --stuart "127.0.0.1:$S6" --loglevel warning 2>>"$DIR/node-${O6[$i]}.log" & PIDS+=($!)
+  "$BIN/speedvault-server" "127.0.0.1:${O6[$i]}" --cluster --stuart "127.0.0.1:$S6" --loglevel warning 2>>"$DIR/node-${O6[$i]}.log" & PIDS+=($!)
   wait_for "node ${O6[$i]} joins" joined6 $((i + 1))
 done
 [ "$("$REDIS_CLI" -p "$S6" stuart create)" = OK ] || fail "STUART CREATE (replicas)"

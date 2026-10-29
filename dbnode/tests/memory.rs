@@ -156,7 +156,7 @@ impl Node {
     fn start(extra: &[&str]) -> Node {
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_dbnode"))
+        let child = Command::new(env!("CARGO_BIN_EXE_speedvault-server"))
             .args([&addr.to_string(), "--loglevel", "warning"])
             .args(extra)
             .stdout(Stdio::null())
@@ -264,7 +264,7 @@ fn a_node_fills_up_to_its_maxmemory() {
 /// without one.
 #[test]
 fn a_share_of_the_container_limit() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dbnode"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_speedvault-server"))
         .args(["127.0.0.1:0", "--maxmemory", "50%"])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

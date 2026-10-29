@@ -43,7 +43,7 @@ impl Stuart {
         // Its log goes next to the state file, and is printed if a test
         // fails while stuart runs.
         let log = std::fs::OpenOptions::new().create(true).append(true).open(state.with_extension("log")).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_stuart"))
+        let child = Command::new(env!("CARGO_BIN_EXE_speedvault-stuart"))
             .args([&format!("127.0.0.1:{port}"), "--state", state.to_str().unwrap(), "--loglevel", "notice"])
             .args(extra)
             .stdout(Stdio::null())
@@ -433,11 +433,11 @@ fn a_bad_state_file_stops_stuart() {
     let dir = temp_dir("bad");
     let state = dir.join("state");
     std::fs::write(&state, "not a state file\n").unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_stuart")).args(["127.0.0.1:0", "--state", state.to_str().unwrap()]).output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_speedvault-stuart")).args(["127.0.0.1:0", "--state", state.to_str().unwrap()]).output().unwrap();
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("the first line isn't"), "{err}");
-    let out = Command::new(env!("CARGO_BIN_EXE_stuart")).output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_speedvault-stuart")).output().unwrap();
     assert_eq!(out.status.code(), Some(2), "--state is required");
     let _ = std::fs::remove_dir_all(dir);
 }

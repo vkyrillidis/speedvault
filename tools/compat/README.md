@@ -197,7 +197,7 @@ example, which answers over stdin/stdout. Then `cluster_compat.py` checks:
   pong times and the config epoch (`cluster/src/reply.rs` says why).
 - Our node in cluster mode in a Redis node's place, for each layout
   (asking a node with slots, and in the uneven layout also the one
-  without): `dbnode --cluster --announce` that node's address, given that
+  without): `speedvault-server --cluster --announce` that node's address, given that
   node's view with `CLUSTER SETTABLE` (our id in place of its id, its
   `cluster_current_epoch` as the epoch). Then the same requests go to both,
   in RESP2 and RESP3: keys in its slots, another node's and unassigned

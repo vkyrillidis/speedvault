@@ -7,6 +7,10 @@ license.workspace = true
 description = "The SpeedVault cluster's steward: slots, moves, autoscaling"
 publish = false
 
+[[bin]]
+name = "speedvault-stuart"
+path = "src/main.rs"
+
 [dependencies]
 cluster = { path = "../cluster" }
 dbnode = { path = "../dbnode" }

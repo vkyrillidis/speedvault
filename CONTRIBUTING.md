@@ -25,7 +25,7 @@ package 7.0.15) and need redis-py (`pip install redis==8.1.0`):
 
 ```sh
 redis-server --port 6393 --save '' --appendonly no --daemonize yes
-target/release/dbnode 7393 &
+target/release/speedvault-server 7393 &
 python3 tools/compat/difftest.py --ref 127.0.0.1:6393 --target 127.0.0.1:7393
 tools/compat/cluster_compat.sh
 tools/compat/cluster_difftest.sh

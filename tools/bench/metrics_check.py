@@ -60,7 +60,7 @@ class Node:
     def __init__(self, args, port: int, busy_poll: int, metrics: bool):
         self.port = port
         self.metrics = port + 1000 if metrics else None
-        cmd = [f"{args.bin}/dbnode", f"{HOST}:{port}", "--busy-poll", str(busy_poll), "--loglevel", "warning"]
+        cmd = [f"{args.bin}/speedvault-server", f"{HOST}:{port}", "--busy-poll", str(busy_poll), "--loglevel", "warning"]
         if metrics:
             cmd += ["--metrics", f"{HOST}:{self.metrics}"]
         if args.taskset:

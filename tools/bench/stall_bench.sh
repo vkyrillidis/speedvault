@@ -8,7 +8,7 @@
 #   tools/bench/stall_bench.sh [--keys N] [--also NAME=SERVER ...]
 #   e.g. --also redis-8.10.2=$HOME/redis-8/bin/redis-server
 #        --also valkey-9.1.2=$HOME/valkey-9/bin/valkey-server
-#        --also old=$HOME/target/old/release/dbnode (another build of ours)
+#        --also old=$HOME/target/old/release/speedvault-server (another build of ours)
 #
 # Needs redis-server 7.0.15 (REDIS_SERVER to choose another).
 # CARGO_TARGET_DIR defaults to ~/target/speedvault.
@@ -31,5 +31,5 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/target/speedvault}"
 OUT="$HERE/results/$(date +%F)-$(git -C "$ROOT" rev-parse --short HEAD)"
 mkdir -p "$OUT"
 taskset -c 4 python3 "$HERE/stall_bench.py" "${ARGS[@]}" --out "$OUT/stalls.md" \
-  ours="$CARGO_TARGET_DIR/release/dbnode" "redis-$("$REDIS" --version | sed 's/.*v=\([0-9.]*\).*/\1/')=$REDIS" "${SERVERS[@]}"
+  ours="$CARGO_TARGET_DIR/release/speedvault-server" "redis-$("$REDIS" --version | sed 's/.*v=\([0-9.]*\).*/\1/')=$REDIS" "${SERVERS[@]}"
 echo "results: $OUT/stalls.md"

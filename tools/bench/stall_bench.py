@@ -11,7 +11,7 @@ clock: WSL2's wall clock steps). A server whose keyspace grows in one go
 that takes, and the batch that waited shows it; one that grows bit by bit
 (an incremental rehash, or many small tables) doesn't.
 
-BINARY is a dbnode (started standalone) or a redis-server-like binary
+BINARY is a speedvault-server (started standalone) or a redis-server-like binary
 (`--save '' --appendonly no`). Prints a Markdown table: keys/s, the
 batch round trips' p50, p99.9 and max, how many took over 10 ms, and the
 three slowest with the number of keys when they came; and writes it to
@@ -34,7 +34,7 @@ VALUE = b"0123456789abcdef"
 
 
 def start(binary: str, port: int, logdir: str) -> subprocess.Popen:
-    if "dbnode" in os.path.basename(binary):
+    if os.path.basename(binary).startswith("speedvault-server"):
         args = [binary, f"{HOST}:{port}", "--loglevel", "warning"]
     else:
         args = [binary, "--port", str(port), "--save", "", "--appendonly", "no"]
