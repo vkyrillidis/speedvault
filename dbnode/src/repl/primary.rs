@@ -18,7 +18,7 @@ use std::time::Instant;
 /// least): the replica's output is filled again once it's sent. Unit tests
 /// take a few keys at a time, so that writes come between batches.
 const BATCH_KEYS: usize = if cfg!(test) { 5 } else { 1000 };
-const BATCH_BYTES: usize = 1 << 20;
+pub(super) const BATCH_BYTES: usize = 1 << 20;
 
 /// `REPLSYNC id replid offset`: `None` (the reply written) unless it may
 /// go on, as a feed: the node is a primary in cluster mode and the table

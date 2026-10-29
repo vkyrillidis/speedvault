@@ -608,12 +608,41 @@ impl Replication {
         }
     }
 
-    /// A key, or a part of one, copied from another node (a slot moving here
-    /// by snapshot, see [`slots`]): into the stream as it came
-    /// (`REPLKEY ...`), for the replicas.
-    pub(crate) fn relay_key(&self, args: &Args) {
-        if self.active() {
-            self.append(args.iter(), Touches::Keys(&[&args[1]]));
+    /// A key copied from another node (a slot moving here by snapshot, see
+    /// [`slots`]), once all of it is here: into the stream as a copy sends
+    /// it (`REPLKEY ...`, a collection larger than `chunk` in parts, one
+    /// after the other), or `DEL` if it's gone already (expired: this node
+    /// keeps it until the source's `DEL`, serving neither meanwhile), for
+    /// the replicas. Not part by part as it came: a replica whose copy passed
+    /// the key's slot, or that came online, between two of them would get
+    /// a part without its first. All at once, each replica gets it whole or
+    /// not at all, as a write of the key.
+    pub(crate) fn relay_key(&self, store: &Store, key: &[u8], chunk: usize) {
+        if !self.active() {
+            return;
+        }
+        let touches = Touches::Keys(&[key]);
+        let Some(at) = store.expire_at(key) else {
+            self.append([&b"DEL"[..], key], touches);
+            return;
+        };
+        let at = at.map_or("-".to_string(), |a| a.to_string());
+        let frame = |kind: store::Kind, first: bool, last: bool, payload: &[u8]| {
+            let flag = |b: bool| if b { &b"1"[..] } else { &b"0"[..] };
+            self.append([&b"REPLKEY"[..], key, at.as_bytes(), kind.name(), flag(first), flag(last), payload], touches);
+        };
+        if store.elements(key).is_some_and(|n| n > chunk) {
+            let mut from = 0;
+            while let Some(part) = store.dump_part(key, from, chunk, primary::BATCH_BYTES) {
+                let last = from + part.count >= part.total;
+                frame(part.kind, from == 0, last, &part.payload);
+                if last {
+                    break;
+                }
+                from += part.count;
+            }
+        } else if let Some((value, _)) = store.dump(key) {
+            frame(value.kind(), true, true, value.payload());
         }
     }
 

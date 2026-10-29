@@ -433,7 +433,10 @@ slots' keys in batches of `--migrate-batch` keys and at most 1 MiB, a
 larger collection in parts of `--migrate-chunk` elements, the source
 pausing `--migrate-pause` after each batch if commands with keys were
 served meanwhile; then the writes to them) and serves none of it
-(`-MOVED` to the owner). stuart then pauses the slots' writes at the
+(`-MOVED` to the owner). Its replicas get each key copied once all of it
+is there, as a write of it (a collection in parts, its parts one after
+the other), so that one attaching or catching up meanwhile never gets
+half of one. stuart then pauses the slots' writes at the
 owner (`CLUSTER PAUSESLOTS`, ours: they wait, reads go on) and gives the
 target the slots once it has every write; there they wait until the
 owner's last frame. `CLUSTER SLOTSYNCS` (ours) lists a node's copies. The

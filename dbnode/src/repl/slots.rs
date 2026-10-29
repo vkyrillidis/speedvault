@@ -3,8 +3,10 @@
 //! this one, a link per source pulls them (`SLOTSYNC`), their keys and
 //! then the writes to them, and applies them here, though this node serves
 //! none of them yet (the table gives them to the source: `-MOVED` there),
-//! and into its own stream, for its replicas. Their expired keys aren't
-//! reclaimed meanwhile (the source's `DEL`s come), as at a replica.
+//! and into its own stream, for its replicas (a key once all of it is
+//! here: [`Replication::relay_key`](super::Replication::relay_key)).
+//! Their expired keys aren't reclaimed meanwhile (the source's `DEL`s
+//! come), as at a replica.
 //!
 //! When the table gives this node the slots (the cutover), they are
 //! *landing* until the source's `SLOTSDONE` (see the [module docs](super)):
@@ -577,10 +579,11 @@ pub(super) fn apply(node: &Node, sync: &Sync, args: &Args, staging: &mut Staging
         if !sync.slots.contains(&cluster::key_hash_slot(&args[1])) {
             return Err(bad("a key of another slot"));
         }
+        // Into this node's stream once whole (see `relay_key`).
         if replkey(node, args, staging)? {
             sync.keys.set(sync.keys.get() + 1);
+            node.repl.relay_key(&node.store.borrow(), &args[1], node.config.migrate.chunk.max(1));
         }
-        node.repl.relay_key(args);
         return Ok(());
     }
     if args[0].eq_ignore_ascii_case(b"SLOTSSYNCED") {

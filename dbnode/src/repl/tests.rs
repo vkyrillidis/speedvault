@@ -843,3 +843,113 @@ fn a_slot_sync_under_writes_copies_its_slots_only() {
         println!("seed {seed}: {} of {} keys synced, {writes} writes during the copy", mine.len(), a.store.borrow().dbsize());
     }
 }
+
+/// A collection landing in parts at a slot sync's target while a replica
+/// of the target attaches: after its first parts, the replica's copy then
+/// done at once (online), or with the copy under way, below the key's
+/// slot, when more parts come and past it before the rest. Either way the
+/// replica gets the key whole once it's all here, never a part without
+/// its first.
+#[test]
+fn a_replica_attaching_while_a_collection_lands_gets_it_whole() {
+    use crate::repl::{primary, replica, slots};
+    let config = || Config { migrate: crate::Migrate { chunk: 8, ..crate::Migrate::default() }, ..Config::default() };
+    for copying in [false, true] {
+        let a = node_with(BACKLOG_SIZE, store::Store::with_slots(cluster::key_hash_slot), config());
+        let b = node_with(BACKLOG_SIZE, store::Store::with_slots(cluster::key_hash_slot), config());
+        let r = node_with(BACKLOG_SIZE, store::Store::with_slots(cluster::key_hash_slot), Config::default());
+        r.store.borrow_mut().set_reclaim(false);
+        hset_many(&a, "{s}h", 100);
+        let slot = cluster::key_hash_slot(b"{s}h");
+        assert!(slot > 0);
+        // The target's own keys, for its replica's copy.
+        for i in 0..40 {
+            run(&b, &client(), &request(&[b"SET", format!("k{i}").as_bytes(), b"v"]));
+        }
+        b.store.borrow_mut().set_held(vec![slot]);
+        let feed = a.repl.attach_slots(&mut a.store.borrow_mut(), NodeId::from_bytes(&[9; 20]), vec![slot]);
+        let first = take(&feed);
+        let mut pending = first[first.windows(2).position(|w| w == b"\r\n").unwrap() + 2..].to_vec();
+        let sync = slots::Sync::for_test(NodeId::from_bytes(&[7; 20]), vec![slot]);
+        let mut staging = replica::Staging::new();
+        let mut out = Encoder::new(Protocol::Resp2);
+        // A batch of the source's copy (a few parts of h), applied at the target.
+        let mut batch = |pending: &mut Vec<u8>, staging: &mut replica::Staging| {
+            primary::fill(&a, &feed);
+            pending.extend(take(&feed));
+            let mut parser = Parser::new(Limits::default());
+            let mut at = 0;
+            while let Ok(Parsed::Complete { consumed }) = parser.parse(&pending[at..]) {
+                slots::apply(&b, &sync, &parser.args(&pending[at..at + consumed]), staging, &mut out).unwrap();
+                at += consumed;
+            }
+            pending.drain(..at);
+        };
+        batch(&mut pending, &mut staging);
+        assert!(!staging.is_empty(), "h half here");
+        let (to_r, mut r_pending) = attach(&b);
+        if copying {
+            batch(&mut pending, &mut staging);
+            assert!(!staging.is_empty(), "h still half here");
+        }
+        while to_r.copying() {
+            primary::fill(&b, &to_r);
+        }
+        while feed.copying() {
+            batch(&mut pending, &mut staging);
+        }
+        assert!(staging.is_empty(), "h all here");
+        r_pending.extend(take(&to_r));
+        let mut r_staging = replica::Staging::new();
+        let mut parser = Parser::new(Limits::default());
+        let mut at = 0;
+        while let Ok(Parsed::Complete { consumed }) = parser.parse(&r_pending[at..]) {
+            replica::apply(&r, &parser.args(&r_pending[at..at + consumed]), consumed, &mut r_staging, &mut out).unwrap();
+            at += consumed;
+        }
+        assert_eq!(at, r_pending.len());
+        assert!(r_staging.is_empty(), "copying {copying}: parts held at the replica");
+        assert_eq!(view(&b, b"{s}h"), view(&a, b"{s}h"), "copying {copying}: h at the target");
+        assert_eq!(views(&r, false), views(&b, false), "copying {copying}: the replica has the target's keys");
+    }
+}
+
+/// A key a slot sync copies again (a new copy of its slots) that has
+/// expired by the time it lands: the target's replica loses the copy it
+/// got before as well.
+#[test]
+fn a_key_landing_expired_goes_at_the_replica_too() {
+    use crate::repl::{primary, replica, slots};
+    let b = node_with(BACKLOG_SIZE, store::Store::with_slots(cluster::key_hash_slot), Config::default());
+    let r = node_with(BACKLOG_SIZE, store::Store::with_slots(cluster::key_hash_slot), Config::default());
+    r.store.borrow_mut().set_reclaim(false);
+    let slot = cluster::key_hash_slot(b"{s}k");
+    b.store.borrow_mut().set_held(vec![slot]);
+    b.store.borrow_mut().set_now(T0);
+    let (to_r, mut pending) = attach(&b);
+    while to_r.copying() {
+        primary::fill(&b, &to_r);
+    }
+    let sync = slots::Sync::for_test(NodeId::from_bytes(&[7; 20]), vec![slot]);
+    let mut staging = replica::Staging::new();
+    let mut out = Encoder::new(Protocol::Resp2);
+    for at in ["-".to_string(), (T0 - 1).to_string()] {
+        let frame = request(&[b"REPLKEY", b"{s}k", at.as_bytes(), b"string", b"1", b"1", b"v"]);
+        let mut parser = Parser::new(Limits::default());
+        let Ok(Parsed::Complete { .. }) = parser.parse(&frame) else { panic!("not RESP") };
+        slots::apply(&b, &sync, &parser.args(&frame), &mut staging, &mut out).unwrap();
+    }
+    pending.extend(take(&to_r));
+    let mut r_staging = replica::Staging::new();
+    let mut parser = Parser::new(Limits::default());
+    let mut at = 0;
+    while let Ok(Parsed::Complete { consumed }) = parser.parse(&pending[at..]) {
+        replica::apply(&r, &parser.args(&pending[at..at + consumed]), consumed, &mut r_staging, &mut out).unwrap();
+        at += consumed;
+    }
+    assert_eq!(at, pending.len());
+    r.store.borrow_mut().set_now(T0);
+    // Live: the target keeps it, expired, until the source's DEL.
+    assert_eq!(b.store.borrow().elements(b"{s}k"), None, "expired at the target");
+    assert_eq!(r.store.borrow().elements(b"{s}k"), None, "the replica's older copy, kept");
+}

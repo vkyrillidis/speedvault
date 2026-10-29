@@ -14,7 +14,7 @@ use crate::{notice, verbose, warning, Node};
 use cluster::NodeId;
 use reactor::{sleep, TcpStream};
 use resp::{Encoder, Limits, Parsed, Parser, Protocol};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::rc::Rc;
@@ -75,9 +75,33 @@ pub(crate) struct Link {
     fenced: Cell<Option<Instant>>,
     /// The last `REPLPING` from the primary: acknowledged with the offset.
     ping: Cell<u64>,
+    /// The collections arriving in parts, outside a connection: they are
+    /// what was applied up to the offset, so a link carrying on
+    /// (`+CONTINUE`) between two parts of one goes on with them.
+    staging: RefCell<Staging>,
+}
+
+/// A link's staged parts, given back to the [`Link`] when it ends.
+struct Kept<'a>(&'a Link, Staging);
+
+impl Drop for Kept<'_> {
+    fn drop(&mut self) {
+        *self.0.staging.borrow_mut() = std::mem::take(&mut self.1);
+    }
 }
 
 impl Link {
+    /// The parts staged for a new connection: those of the one before if it
+    /// carries on (`+CONTINUE`), none for a sync from scratch. Given back to
+    /// the link when the connection ends.
+    fn staging(&self, carrying_on: bool) -> Kept<'_> {
+        let mut staging = std::mem::take(&mut *self.staging.borrow_mut());
+        if !carrying_on {
+            staging.clear();
+        }
+        Kept(self, staging)
+    }
+
     /// `CLUSTER FENCE`: no acknowledgement for `d` (zero: from now on
     /// again). The stream is still applied meanwhile.
     pub(crate) fn fence(&self, d: Duration) {
@@ -245,7 +269,8 @@ fn follow(node: &Node, primary: &cluster::Node) -> io::Result<()> {
     let (mut acked, mut acked_offset) = (Instant::now(), (link.offset(), link.ping.get()));
 
     let mut parser = Parser::new(Limits::default());
-    let mut staging = Staging::new();
+    let mut kept = link.staging(link.state() == State::Online);
+    let staging = &mut kept.1;
     let mut out = Encoder::new(Protocol::Resp2);
     loop {
         // Before anything read is applied: once the table made this node a
@@ -268,7 +293,7 @@ fn follow(node: &Node, primary: &cluster::Node) -> io::Result<()> {
                         break;
                     }
                     if !args.is_empty() {
-                        apply(node, &args, consumed, &mut staging, &mut out)?;
+                        apply(node, &args, consumed, staging, &mut out)?;
                     }
                     start += consumed;
                 }
@@ -456,3 +481,19 @@ fn execute(node: &Node, args: &resp::Args, staging: &mut Staging, out: &mut Enco
     Ok(())
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The parts staged when a connection ends: kept for the next if it
+    /// carries on, dropped for a sync from scratch.
+    #[test]
+    fn staged_parts_outlive_a_connection_that_carries_on() {
+        let link = Link::default();
+        link.staging(true).1.insert(b"h".to_vec(), (Staged::new(Kind::Hash), None));
+        assert!(link.staging(true).1.contains_key(&b"h"[..]), "carrying on: kept");
+        assert!(link.staging(false).1.is_empty(), "from scratch: dropped");
+        assert!(link.staging(true).1.is_empty(), "and gone");
+    }
+}
