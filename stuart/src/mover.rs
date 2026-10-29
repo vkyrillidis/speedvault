@@ -138,13 +138,13 @@ pub(crate) fn mover(stuart: Rc<Stuart>) {
 }
 
 /// The connection kept for `node`, made if there's none.
-fn link<'a>(links: &'a mut HashMap<NodeId, Link>, node: &cluster::Node) -> io::Result<&'a mut Link> {
+fn link<'a>(stuart: &Stuart, links: &'a mut HashMap<NodeId, Link>, node: &cluster::Node) -> io::Result<&'a mut Link> {
     let addr = (node.host().to_string(), node.port());
     if links.get(node.id()).is_some_and(|l| l.to != addr) {
         links.remove(node.id());
     }
     if !links.contains_key(node.id()) {
-        links.insert(*node.id(), keeper::connect(node)?);
+        links.insert(*node.id(), keeper::connect(stuart, node)?);
     }
     Ok(links.get_mut(node.id()).unwrap())
 }
@@ -190,8 +190,8 @@ fn sync_lines(text: &str) -> Option<Vec<SyncLine>> {
 }
 
 /// `CLUSTER SLOTSYNCS` at `node`.
-fn slot_syncs(links: &mut HashMap<NodeId, Link>, node: &cluster::Node) -> io::Result<Vec<SyncLine>> {
-    match keeper::call(link(links, node)?, &[b"CLUSTER", b"SLOTSYNCS"])? {
+fn slot_syncs(stuart: &Stuart, links: &mut HashMap<NodeId, Link>, node: &cluster::Node) -> io::Result<Vec<SyncLine>> {
+    match keeper::call(link(stuart, links, node)?, &[b"CLUSTER", b"SLOTSYNCS"])? {
         Reply::Bulk(text) => sync_lines(&String::from_utf8_lossy(&text))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "CLUSTER SLOTSYNCS: a bad line")),
         other => Err(io::Error::new(io::ErrorKind::InvalidData, format!("CLUSTER SLOTSYNCS: {other:?}"))),
@@ -224,7 +224,7 @@ fn snapshots(stuart: &Stuart, table: &SlotTable, links: &mut HashMap<NodeId, Lin
         if !stuart.has_taken(target.id(), table.epoch()) {
             continue;
         }
-        let lines = match slot_syncs(links, target) {
+        let lines = match slot_syncs(stuart, links, target) {
             Ok(lines) => lines,
             Err(e) => {
                 links.remove(target.id());
@@ -248,7 +248,7 @@ fn snapshots(stuart: &Stuart, table: &SlotTable, links: &mut HashMap<NodeId, Lin
                 Some(_) => break,
             };
             let source = table.nodes()[from].clone();
-            match cut(links, &source, target, &line.slots, budget) {
+            match cut(stuart, links, &source, target, &line.slots, budget) {
                 Ok(Some(paused)) => cuts.push(Cut { slots: line.slots, target: *target.id(), paused }),
                 Ok(None) => {
                     tries.insert(line.slots, (missed, Instant::now() + RETRY_BEHIND));
@@ -289,18 +289,18 @@ fn cancel(stuart: &Stuart, slots: &[u16], why: &str) -> Option<Ended> {
 /// pause began))`: it did, push the table now; `Ok(None)`: the target is
 /// too far behind to pause (asked again later); `Err`: it didn't catch up
 /// (the pause ended), or a call failed.
-fn cut(links: &mut HashMap<NodeId, Link>, source: &cluster::Node, target: &cluster::Node, slots: &[u16], budget: Duration) -> io::Result<Option<Instant>> {
+fn cut(stuart: &Stuart, links: &mut HashMap<NodeId, Link>, source: &cluster::Node, target: &cluster::Node, slots: &[u16], budget: Duration) -> io::Result<Option<Instant>> {
     let mut args: Vec<Vec<u8>> = vec![b"CLUSTER".to_vec(), b"PAUSESLOTS".to_vec(), PAUSE.as_millis().to_string().into_bytes(), target.id().as_bytes().to_vec()];
     args.extend(slots.iter().map(|s| s.to_string().into_bytes()));
     let args: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
     let started = Instant::now();
-    let offset = match keeper::call(link(links, source)?, &args)? {
+    let offset = match keeper::call(link(stuart, links, source)?, &args)? {
         Reply::Integer(o) if o >= 0 => o as u64,
         Reply::Error(e) if e.starts_with("BEHIND ") => return Ok(None),
         other => return Err(io::Error::other(format!("CLUSTER PAUSESLOTS: {other:?}"))),
     };
     loop {
-        let reached = slot_syncs(links, target)?.iter().any(|l| l.source == *source.id() && l.slots == slots && l.offset >= offset);
+        let reached = slot_syncs(stuart, links, target)?.iter().any(|l| l.source == *source.id() && l.slots == slots && l.offset >= offset);
         if reached {
             return Ok(Some(started));
         }
@@ -312,7 +312,7 @@ fn cut(links: &mut HashMap<NodeId, Link>, source: &cluster::Node, target: &clust
     let mut end: Vec<&[u8]> = vec![b"CLUSTER", b"PAUSESLOTS", b"0", target.id().as_bytes()];
     let slot_args: Vec<Vec<u8>> = slots.iter().map(|s| s.to_string().into_bytes()).collect();
     end.extend(slot_args.iter().map(Vec::as_slice));
-    let _ = keeper::call(link(links, source)?, &end);
+    let _ = keeper::call(link(stuart, links, source)?, &end);
     Err(io::Error::other(format!("the target didn't reach offset {offset} within {} ms", budget.as_millis())))
 }
 

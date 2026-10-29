@@ -4,8 +4,10 @@
 //! (a Kubernetes Service may not resolve yet when the pod starts), so
 //! neither a slow DNS nor an absent stuart holds up the reactor: the node
 //! serves `CLUSTERDOWN` meanwhile. Once joined, stuart drives: it pings the
-//! node and pushes the slot table with `CLUSTER SETTABLE`.
+//! node and pushes the slot table with `CLUSTER SETTABLE`. With a password,
+//! every request to stuart logs in first (see `auth`).
 
+use crate::auth::{self, Secret};
 use crate::{notice, warning, Announce};
 use cluster::NodeId;
 use resp::{Encoder, Protocol};
@@ -25,14 +27,16 @@ const TIMEOUT: Duration = Duration::from_secs(2);
 /// connections (stuart's tables say where it is).
 pub(crate) struct Stuart {
     pub(crate) addr: String,
+    /// The cluster's password, which stuart's port requires.
+    password: Option<Secret>,
     /// The address it last answered at, or its tables came from (with its
     /// port).
     seen: Mutex<Option<SocketAddr>>,
 }
 
 impl Stuart {
-    pub(crate) fn new(addr: String) -> Stuart {
-        Stuart { addr, seen: Mutex::new(None) }
+    pub(crate) fn new(addr: String, password: Option<Secret>) -> Stuart {
+        Stuart { addr, password, seen: Mutex::new(None) }
     }
 
     /// A table came from stuart at `ip` (`CLUSTER SETTABLE`, which only
@@ -68,7 +72,7 @@ impl Stuart {
         for addr in addrs {
             match TcpStream::connect_timeout(&addr, TIMEOUT) {
                 Ok(conn) => {
-                    let reply = request(conn, args)?;
+                    let reply = request(conn, self.password.as_ref(), args)?;
                     *self.seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(addr);
                     return Ok(reply);
                 }
@@ -132,16 +136,31 @@ fn join_once(stuart: &Stuart, id: &NodeId, announce: &Announce, name: Option<&st
     }
 }
 
-fn request(mut conn: TcpStream, args: &[&[u8]]) -> io::Result<String> {
+/// `args` and the reply's line, after `AUTH` with `password` if given (in
+/// the same write).
+fn request(mut conn: TcpStream, password: Option<&Secret>, args: &[&[u8]]) -> io::Result<String> {
     conn.set_read_timeout(Some(TIMEOUT))?;
     conn.set_write_timeout(Some(TIMEOUT))?;
     let mut req = Encoder::new(Protocol::Resp2);
+    if let Some(password) = password {
+        auth::login(&mut req, &password.0);
+    }
     req.array(args.len());
     for arg in args {
         req.bulk(arg);
     }
     conn.write_all(req.as_bytes())?;
+    if password.is_some() {
+        let reply = read_line(&mut conn)?;
+        if reply != "+OK" {
+            return Err(io::Error::other(format!("stuart refused the password: {reply}")));
+        }
+    }
+    read_line(&mut conn)
+}
 
+/// One reply line, without its line end.
+fn read_line(conn: &mut TcpStream) -> io::Result<String> {
     let mut line = Vec::new();
     let mut byte = [0];
     while !line.ends_with(b"\r\n") {

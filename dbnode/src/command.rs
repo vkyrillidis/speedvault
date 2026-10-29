@@ -150,6 +150,7 @@ pub(crate) const COMMANDS: &[Command] = &[
     write(data("flushdb", -1, NO_KEYS, flush)),
     data("quit", -1, NO_KEYS, quit),
     conn("hello", -1, admin::hello),
+    conn("auth", -2, admin::auth),
     container("client", -2, admin::unreachable, admin::CLIENT),
     container("command", -1, admin::command, admin::COMMAND),
     container("config", -2, admin::unreachable, admin::CONFIG),
@@ -241,6 +242,12 @@ pub(crate) fn execute(args: &Args, node: &Node, client: &Client, out: &mut Encod
     let arity = i64::from(cmd.arity);
     if (arity > 0 && argc != arity) || argc < -arity {
         arity_error(cmd.name, out);
+        return Flow::Continue;
+    }
+    // Then the password, as in Redis: before the client has logged in,
+    // only AUTH, HELLO and QUIT (see `auth`).
+    if !client.authenticated.get() && !crate::auth::allowed_before_auth(cmd.name) {
+        out.error(crate::auth::NOAUTH);
         return Flow::Continue;
     }
     // In cluster mode, only keys in this node's slots (after the arity

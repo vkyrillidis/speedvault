@@ -7,7 +7,8 @@
 //! 8.10.2 is the behaviour the node copies. `INFO` adds a
 //! `speedvault_version` line so the real server can still be told apart.
 
-use crate::client::Client;
+use crate::auth::{self, Login};
+use crate::client::{self, Client};
 use crate::command::{c_str, conn, find, syntax_error, Command, Flow, COMMANDS};
 use crate::memory::{self, Human, Limit};
 use crate::{warning, Node};
@@ -102,16 +103,31 @@ pub(crate) fn unreachable(_: &Args, _: &Node, _: &Client, _: &mut Encoder) -> Fl
 fn set_name(client: &Client, name: &[u8], out: &mut Encoder) -> bool {
     let ok = client.set_name(name);
     if !ok {
-        out.error(b"ERR Client names cannot contain spaces, newlines or special characters.");
+        name_error(out);
     }
     ok
 }
 
-/// `HELLO [protover [AUTH username password] [SETNAME clientname]]`.
-///
-/// Every option is checked before anything changes. There are no users or
-/// passwords: like a Redis whose `default` user has `nopass`, `AUTH default`
-/// with any password succeeds and other users don't exist.
+fn name_error(out: &mut Encoder) {
+    out.error(b"ERR Client names cannot contain spaces, newlines or special characters.");
+}
+
+/// `AUTH [username] password` (see [`auth`]).
+pub(crate) fn auth(args: &Args, node: &Node, client: &Client, out: &mut Encoder) -> Flow {
+    let args: Vec<&[u8]> = args.iter().collect();
+    match auth::auth(&args, node.password.borrow().as_deref(), node.cluster.is_some(), out) {
+        Login::Ok => client.authenticated.set(true),
+        Login::Wrong => node.auth_failures.set(node.auth_failures.get() + 1),
+        Login::Error => {}
+    }
+    Flow::Continue
+}
+
+/// `HELLO [protover [AUTH username password] [SETNAME clientname]]`, in
+/// Redis 8.10.2's order: the version, each option (a bad name fails
+/// there, before the password is tried), the login, then `-NOAUTH` if the
+/// client still isn't authenticated; nothing changes before that. The one
+/// user is `default` (see [`auth`]).
 pub(crate) fn hello(args: &Args, node: &Node, client: &Client, out: &mut Encoder) -> Flow {
     let mut proto = None;
     if args.len() >= 2 {
@@ -127,14 +143,18 @@ pub(crate) fn hello(args: &Args, node: &Node, client: &Client, out: &mut Encoder
             }
         }
     }
-    let (mut user, mut name) = (None, None);
+    let (mut login, mut name) = (None, None);
     let mut i = 2;
     while i < args.len() {
         let (opt, more) = (&args[i], args.len() - 1 - i);
         if opt.eq_ignore_ascii_case(b"auth") && more >= 2 {
-            user = Some(&args[i + 1]);
+            login = Some((&args[i + 1], &args[i + 2]));
             i += 3;
         } else if opt.eq_ignore_ascii_case(b"setname") && more >= 1 {
+            if !client::valid_name(&args[i + 1]) {
+                name_error(out);
+                return Flow::Continue;
+            }
             name = Some(&args[i + 1]);
             i += 2;
         } else {
@@ -142,14 +162,20 @@ pub(crate) fn hello(args: &Args, node: &Node, client: &Client, out: &mut Encoder
             return Flow::Continue;
         }
     }
-    if user.is_some_and(|u| u != b"default") {
-        out.error(b"WRONGPASS invalid username-password pair or user is disabled.");
+    if let Some((user, pass)) = login {
+        if !auth::check(node.password.borrow().as_deref(), user, pass) {
+            node.auth_failures.set(node.auth_failures.get() + 1);
+            out.error(auth::WRONGPASS);
+            return Flow::Continue;
+        }
+        client.authenticated.set(true);
+    }
+    if !client.authenticated.get() {
+        out.error(auth::HELLO_NOAUTH);
         return Flow::Continue;
     }
     if let Some(name) = name {
-        if !set_name(client, name, out) {
-            return Flow::Continue;
-        }
+        client.set_name(name);
     }
     if let Some(proto) = proto {
         client.resp.set(proto);
@@ -327,20 +353,22 @@ fn command_info_of(cmd: &Command, out: &mut Encoder) {
 }
 
 /// The parameters `CONFIG GET` knows. `CONFIG SET` changes only
-/// `maxmemory` (and accepts `maxmemory-policy noeviction`).
-fn config_params(node: &Node) -> [(&'static str, String); 8] {
+/// `maxmemory` and `requirepass` (and accepts `maxmemory-policy
+/// noeviction`). The password reads as it is, as in Redis.
+fn config_params(node: &Node) -> [(&'static str, Vec<u8>); 9] {
     // Whole seconds, as Redis has it; rounded up so that a timeout under a
     // second doesn't read as 0, "never".
     let timeout = node.config.idle_timeout.map_or(0, |t| t.as_millis().div_ceil(1000));
     [
-        ("appendonly", "no".to_string()),
-        ("databases", "1".to_string()),
-        ("maxmemory", node.maxmemory.get().to_string()),
-        ("maxmemory-policy", "noeviction".to_string()),
-        ("port", node.port.to_string()),
-        ("proto-max-bulk-len", resp::Limits::default().max_bulk_len.to_string()),
-        ("save", String::new()),
-        ("timeout", timeout.to_string()),
+        ("appendonly", b"no".to_vec()),
+        ("databases", b"1".to_vec()),
+        ("maxmemory", node.maxmemory.get().to_string().into_bytes()),
+        ("maxmemory-policy", b"noeviction".to_vec()),
+        ("port", node.port.to_string().into_bytes()),
+        ("proto-max-bulk-len", resp::Limits::default().max_bulk_len.to_string().into_bytes()),
+        ("requirepass", node.password.borrow().clone().unwrap_or_default()),
+        ("save", Vec::new()),
+        ("timeout", timeout.to_string().into_bytes()),
     ]
 }
 
@@ -349,7 +377,7 @@ fn config_params(node: &Node) -> [(&'static str, String); 8] {
 /// sent it, as in Redis. Each parameter is listed once.
 fn config_get(args: &Args, node: &Node, _: &Client, out: &mut Encoder) -> Flow {
     let params = config_params(node);
-    let mut found: Vec<(&[u8], &str)> = Vec::new();
+    let mut found: Vec<(&[u8], &[u8])> = Vec::new();
     for pattern in args.iter().skip(2) {
         let is_glob = pattern.iter().any(|&b| b == b'*' || b == b'?');
         for (name, value) in &params {
@@ -362,7 +390,7 @@ fn config_get(args: &Args, node: &Node, _: &Client, out: &mut Encoder) -> Flow {
     out.map(found.len());
     for (name, value) in found {
         out.bulk(name);
-        out.bulk(value.as_bytes());
+        out.bulk(value);
     }
     Flow::Continue
 }
@@ -370,7 +398,9 @@ fn config_get(args: &Args, node: &Node, _: &Client, out: &mut Encoder) -> Flow {
 /// `CONFIG SET parameter value [parameter value ...]`: every pair is
 /// checked before any applies, as in Redis. `maxmemory` takes a size
 /// (`100mb`, as Redis does) or, ours, a share of the container's memory
-/// limit (`75%`); `maxmemory-policy` only `noeviction`, the one policy.
+/// limit (`75%`); `maxmemory-policy` only `noeviction`, the one policy;
+/// `requirepass` a password, "" for none, as in Redis, but only standalone:
+/// a cluster's nodes and stuart share theirs, set when they start.
 fn config_set(args: &Args, node: &Node, _: &Client, out: &mut Encoder) -> Flow {
     // An odd count past the arity check is a syntax error in Redis 7.0.
     if !args.len().is_multiple_of(2) {
@@ -380,11 +410,11 @@ fn config_set(args: &Args, node: &Node, _: &Client, out: &mut Encoder) -> Flow {
     let failed = |out: &mut Encoder, name: &[u8], why: &str| {
         out.error_parts(&[b"ERR CONFIG SET failed (possibly related to argument '", name, b"') - ", why.as_bytes()]);
     };
-    let mut maxmemory = None;
+    let (mut maxmemory, mut requirepass) = (None, None);
     let mut seen: Vec<&[u8]> = Vec::new();
     for i in (2..args.len()).step_by(2) {
         let (name, value) = (&args[i], &args[i + 1]);
-        let known = [&b"maxmemory"[..], b"maxmemory-policy"].into_iter().find(|k| name.eq_ignore_ascii_case(k));
+        let known = [&b"maxmemory"[..], b"maxmemory-policy", b"requirepass"].into_iter().find(|k| name.eq_ignore_ascii_case(k));
         let Some(known) = known else {
             out.error_parts(&[b"ERR Unknown option or number of arguments for CONFIG SET - '", c_str(name, usize::MAX), b"'"]);
             return Flow::Continue;
@@ -407,6 +437,12 @@ fn config_set(args: &Args, node: &Node, _: &Client, out: &mut Encoder) -> Flow {
                 }
                 Some(Ok(bytes)) => maxmemory = Some(bytes),
             }
+        } else if known == b"requirepass" {
+            if node.cluster.is_some() {
+                failed(out, known, "in cluster mode the password is the cluster's, set at start (--requirepass, --requirepass-file)");
+                return Flow::Continue;
+            }
+            requirepass = Some(value);
         } else if !value.eq_ignore_ascii_case(b"noeviction") {
             failed(out, known, "only noeviction is supported");
             return Flow::Continue;
@@ -418,6 +454,10 @@ fn config_set(args: &Args, node: &Node, _: &Client, out: &mut Encoder) -> Flow {
         if bytes != 0 && bytes < used {
             warning!("WARNING: the new maxmemory value set via CONFIG SET ({bytes}) is smaller than the current memory usage ({used}). This will result in writes being refused (noeviction).");
         }
+    }
+    // The clients authenticated stay so.
+    if let Some(password) = requirepass {
+        *node.password.borrow_mut() = (!password.is_empty()).then(|| password.to_vec());
     }
     out.ok();
     Flow::Continue
@@ -516,6 +556,7 @@ fn info_section(section: &str, node: &Node, text: &mut String) {
             field(text, "sync_full", syncs[0].get());
             field(text, "sync_partial_ok", syncs[1].get());
             field(text, "sync_partial_err", syncs[2].get());
+            field(text, "acl_access_denied_auth", node.auth_failures.get());
         }
         "replication" => {
             // Redis 7.0's fields. A primary has no backlog until the

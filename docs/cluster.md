@@ -36,6 +36,22 @@ redis-cli -p 7600 STUART NODES      # three nodes, up, acked=1
 redis-cli -c -p 7600 SET foo bar    # stuart redirects to the owner of foo's slot
 ```
 
+**With a password**, every node and stuart take the same one; the nodes
+log in to stuart and to each other with it, stuart to the nodes, and
+clients to both:
+
+```sh
+echo 's3cret' > ./password                     # one line end at the end is dropped
+speedvault-stuart --state ./stuart.state --create-when 3 --requirepass-file ./password &
+for p in 7001 7002 7003; do speedvault-server 127.0.0.1:$p --cluster --stuart 127.0.0.1:7600 --requirepass-file ./password & done
+REDISCLI_AUTH=s3cret redis-cli -c -p 7600 SET foo bar
+```
+
+A node with another password can't join (its log says why). In cluster
+mode `CONFIG SET requirepass` is refused: to change the password,
+restart every node and stuart with the new one (until they all have it,
+the old and the new can't reach each other).
+
 Without `--create-when`, run `redis-cli -p 7600 STUART CREATE` once the
 nodes have joined. On several machines, each node gets `--announce` with
 the address clients reach it at, and `--stuart` with stuart's address

@@ -240,7 +240,7 @@ KEYS] [--migrate-pause USEC]]` listens on
   `_max_bytes`, `_used_ratio` (the HPA's other input), `_peak_bytes`,
   `_rss_bytes`, `speedvault_commands_processed_total`,
   `speedvault_commands_refused_oom_total`, `speedvault_clients`,
-  `speedvault_connections_received_total`, `speedvault_keys`,
+  `speedvault_connections_received_total`, `speedvault_auth_failures_total`, `speedvault_keys`,
   `speedvault_keys_expiring`, `speedvault_uptime_seconds`,
   `speedvault_info{version,mode,node_id}`, and in cluster mode
   `speedvault_cluster_slots`, `speedvault_cluster_slots_migrating{direction="out|in"}`,
@@ -307,14 +307,27 @@ redis-cli -p 7000 SET k v
   the connection, and the client could lose the reply). No HTTP library:
   a scrape is one request. Also the text format's writer, with label
   escaping. `metrics.rs`: the node's page and readiness.
-- `admin.rs`: `HELLO`, `CLIENT`, `COMMAND`, `INFO`, `CONFIG GET` and `SET`
-  (`maxmemory` only). The node
+- `admin.rs`: `HELLO`, `AUTH`, `CLIENT`, `COMMAND`, `INFO`, `CONFIG GET`
+  and `SET` (`maxmemory` and `requirepass`). The node
   presents itself as Redis 8.10.2 (`HELLO`'s `version`, `INFO`'s
   `redis_version`), since clients pick features by it; `INFO` also has
-  `speedvault_version`. No users or passwords: `HELLO ... AUTH default <any>`
-  succeeds like Redis's `nopass` default user. Fields the node doesn't track
+  `speedvault_version`. Fields the node doesn't track
   are fixed: zero memory counters in `CLIENT LIST`, no flags, ACL categories
   or docs in `COMMAND`.
+- `auth.rs`: the password (`--requirepass-file`, `--requirepass`), Redis's
+  `requirepass`, the one password of its `default` user: before a client
+  has logged in, `execute` refuses every command but `AUTH`, `HELLO` and
+  `QUIT` with `-NOAUTH` (after the unknown-command and arity checks, as
+  Redis), the connection refuses `REPLSYNC` and `SLOTSYNC` likewise, and
+  the parser takes requests of 10 arguments of 16 KiB at most (Redis's
+  limits for clients that haven't logged in). A client connected while
+  there was no password counts as logged in; changing the password keeps
+  clients logged in. The comparison takes the same time wherever the
+  passwords differ. In a cluster the nodes and stuart share it: each link
+  sends `AUTH default <password>` first, in the same write as its first
+  request (to stuart, a replica's to its primary, a slot copy's to its
+  source, stuart's to the nodes). stuart answers `AUTH` and `HELLO` with
+  these functions too.
 - `cluster_mode.rs`: cluster mode: the slot table, the slot check, and
   `CLUSTER`, `READONLY`, `READWRITE`, `ASKING`. `admin.rs` has `ROLE` and
   `INFO replication` (phase 8), which say what the table makes the node.

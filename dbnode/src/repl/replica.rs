@@ -183,6 +183,11 @@ fn follow(node: &Node, primary: &cluster::Node) -> io::Result<()> {
         None => ("?".to_string(), "-1".to_string()),
     };
     let mut req = Encoder::new(Protocol::Resp2);
+    // Logged in first, in the same write: the cluster's one password.
+    let login = node.password.borrow().clone();
+    if let Some(password) = &login {
+        crate::auth::login(&mut req, password);
+    }
     req.array(4);
     for arg in [&b"REPLSYNC"[..], cluster.myself().as_bytes(), replid.as_bytes(), offset.as_bytes()] {
         req.bulk(arg);
@@ -194,11 +199,20 @@ fn follow(node: &Node, primary: &cluster::Node) -> io::Result<()> {
     let mut buf = vec![0; READ_SIZE];
     let mut end = 0;
     let mut start;
-    // The reply line first.
+    // The reply line first (after AUTH's).
+    let mut auth_reply = login.is_some();
     let line = loop {
         if let Some(i) = buf[..end].windows(2).position(|w| w == b"\r\n") {
             let line = String::from_utf8_lossy(&buf[..i]).into_owned();
             start = i + 2;
+            if std::mem::take(&mut auth_reply) {
+                if line != "+OK" {
+                    return Err(io::Error::other(format!("AUTH: {line}")));
+                }
+                buf.copy_within(start..end, 0);
+                end -= start;
+                continue;
+            }
             break line;
         }
         if end == buf.len() {

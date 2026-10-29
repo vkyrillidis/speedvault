@@ -195,6 +195,8 @@ from redis.cluster import RedisCluster  # noqa: E402
 from redis.crc import key_slot  # noqa: E402
 
 HOST = "127.0.0.1"
+# --password: stuart and the nodes require it; every client logs in.
+PASSWORD: Optional[str] = None
 SLOTS = 16384
 # How many times redis-py may run one INCR that it reports as failed.
 RETRIES = 16
@@ -216,6 +218,11 @@ def wait_for(what: str, cond, timeout: float = 20.0, every: float = 0.05):
         if time.time() > deadline:
             raise Fail(f"timed out waiting for {what}")
         time.sleep(every)
+
+
+def requirepass() -> List[str]:
+    """The flag that gives stuart or a node the password, if any."""
+    return ["--requirepass", PASSWORD] if PASSWORD else []
 
 
 def text(reply) -> str:
@@ -242,7 +249,7 @@ class Cluster:
         log = open(os.path.join(self.dir, "stuart.log"), "ab")
         self.stuart_proc = subprocess.Popen(
             [*self.pin(self.base), f"{self.bin}/speedvault-stuart", f"{HOST}:{self.base}", "--state", os.path.join(self.dir, "state"),
-             "--loglevel", "warning", *self.stuart_args],
+             "--loglevel", "warning", *self.stuart_args, *requirepass()],
             stderr=log, stdout=subprocess.DEVNULL)
         wait_for("stuart to listen", lambda: self.stuart().ping())
 
@@ -257,7 +264,7 @@ class Cluster:
         log = open(os.path.join(self.dir, f"node-{port}.log"), "ab")
         self.nodes[port] = subprocess.Popen(
             [*self.pin(port), f"{self.bin}/speedvault-server", f"{HOST}:{port}", "--cluster", "--stuart", f"{HOST}:{self.base}",
-             "--loglevel", "warning", *self.migrate_args, *(extra or [])],
+             "--loglevel", "warning", *self.migrate_args, *(extra or []), *requirepass()],
             stderr=log, stdout=subprocess.DEVNULL)
         node_id = wait_for(f"node {port} to listen", lambda: text(self.node(port).execute_command("CLUSTER", "MYID")))
         wait_for(f"node {port} to join", lambda: any(l.startswith(node_id + " ") and " up " in l for l in self.stuart_nodes()))
@@ -295,10 +302,10 @@ class Cluster:
 
     # Connections.
     def stuart(self):
-        return redis.Redis(host=HOST, port=self.base, socket_timeout=5)
+        return redis.Redis(password=PASSWORD, host=HOST, port=self.base, socket_timeout=5)
 
     def node(self, port: int):
-        return redis.Redis(host=HOST, port=port, socket_timeout=10)
+        return redis.Redis(password=PASSWORD, host=HOST, port=port, socket_timeout=10)
 
     def node_ports(self) -> List[int]:
         return sorted(self.nodes)
@@ -456,7 +463,7 @@ class RedisPyWriter(Writer):
     name = "redis-py"
 
     def run(self):
-        rc = wait_for("redis-py to connect", lambda: RedisCluster(host=HOST, port=self.seed_port))
+        rc = wait_for("redis-py to connect", lambda: RedisCluster(password=PASSWORD, host=HOST, port=self.seed_port))
         j = self.offset
         while not self.stopping.is_set():
             j = (j + 1) % len(self.indices)
@@ -484,7 +491,7 @@ class WaitWriter(Writer):
         self.safe = [0] * len(names)
 
     def run(self):
-        rc = wait_for("redis-py to connect", lambda: RedisCluster(host=HOST, port=self.seed_port))
+        rc = wait_for("redis-py to connect", lambda: RedisCluster(password=PASSWORD, host=HOST, port=self.seed_port))
         j = self.offset
         while not self.stopping.is_set():
             j = (j + 1) % len(self.indices)
@@ -526,7 +533,7 @@ class DelWriter(Writer):
         self.del_failures = 0
 
     def run(self):
-        rc = wait_for("redis-py to connect", lambda: RedisCluster(host=HOST, port=self.seed_port))
+        rc = wait_for("redis-py to connect", lambda: RedisCluster(password=PASSWORD, host=HOST, port=self.seed_port))
         n = 0
         while not self.stopping.is_set():
             n += 1
@@ -658,7 +665,8 @@ class RedisCliWriter(Writer):
     name = "redis-cli"
 
     def spawn(self):
-        return subprocess.Popen(["redis-cli", "-c", "-h", HOST, "-p", str(self.seed_port)],
+        env = dict(os.environ, **({"REDISCLI_AUTH": PASSWORD} if PASSWORD else {}))
+        return subprocess.Popen(["redis-cli", "-c", "-h", HOST, "-p", str(self.seed_port)], env=env,
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
 
     def run(self):
@@ -786,7 +794,7 @@ class CollectionWriter(Writer):
         self.sent: Dict[Tuple[int, str], Dict[int, bool]] = {}
 
     def run(self):
-        rc = wait_for("redis-py to connect", lambda: RedisCluster(host=HOST, port=self.seed_port))
+        rc = wait_for("redis-py to connect", lambda: RedisCluster(password=PASSWORD, host=HOST, port=self.seed_port))
         seq = 0
         while not self.stopping.is_set():
             seq += 1
@@ -1128,6 +1136,9 @@ def run_failover(name: str, args) -> List[str]:
             print(f"  primary {victim} SIGKILLed; its replica {heir}")
         else:
             probe = socket.create_connection((HOST, victim), timeout=30)
+            if PASSWORD:
+                probe.sendall(b"*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n" % (len(PASSWORD), PASSWORD.encode()))
+                assert probe.recv(5) == b"+OK\r\n"
             cluster.signal_node(victim, signal.SIGSTOP)
             print(f"  primary {victim} SIGSTOPped; its replica {heir}")
             time.sleep(0.5)
@@ -1226,7 +1237,7 @@ def run_move_failover(name: str, args) -> List[str]:
             # The source of a link landing (the target took the table that
             # gives it the slots, the source's last writes on the way): it
             # dies then.
-            watch = redis.Redis(host=HOST, port=target)
+            watch = redis.Redis(password=PASSWORD, host=HOST, port=target)
 
             def landing():
                 for line in text(watch.execute_command("CLUSTER", "SLOTSYNCS")).splitlines():
@@ -2092,10 +2103,14 @@ def main(argv: List[str]) -> int:
                     help="passed to each dbnode (e.g. --migrate-arg=--migrate-batch --migrate-arg=10)")
     ap.add_argument("--lettuce-port", type=int, dest="lettuce_port", help="the node Lettuce takes as its seed (default: the first)")
     ap.add_argument("--keep", action="store_true", help="keep the logs of a failed scenario")
+    ap.add_argument("--password", help="stuart and the nodes require this password (--requirepass); every client logs in")
     args = ap.parse_args(argv)
     args.lettuce_modes = args.lettuce_modes.split(",") if args.lettuce else []
-    global COLLECTION
+    global COLLECTION, PASSWORD
     COLLECTION = args.collection
+    PASSWORD = args.password
+    if PASSWORD and args.lettuce:
+        ap.error("--password doesn't log Lettuce in")
     scenarios = SCENARIOS if "all" in args.scenarios else args.scenarios
     failed = 0
     for name in scenarios:

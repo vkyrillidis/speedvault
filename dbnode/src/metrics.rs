@@ -37,6 +37,8 @@ impl Site for Node {
         let oom = "Commands refused with -OOM: past maxmemory.";
         metric(out, "speedvault_commands_refused_oom_total", Kind::Counter, oom, self.commands_refused_oom.get());
         metric(out, "speedvault_connections_received_total", Kind::Counter, "Client connections accepted.", self.connections_received.get());
+        let denied = "AUTH (or HELLO's AUTH option) refused for a wrong password (INFO's acl_access_denied_auth).";
+        metric(out, "speedvault_auth_failures_total", Kind::Counter, denied, self.auth_failures.get());
         metric(out, "speedvault_clients", Kind::Gauge, "Clients connected.", self.clients.len());
         {
             let store = self.store.borrow();

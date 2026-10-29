@@ -32,5 +32,11 @@ The first public release.
   state on disk.
 - Live slot migration by snapshot plus the writes made meanwhile: no key
   frozen, no write lost, one `-MOVED` per slot.
+- A password (`--requirepass-file`, `--requirepass`), Redis 8.10.2's
+  `requirepass`: `AUTH`, `HELLO ... AUTH`, `-NOAUTH`, `CONFIG GET/SET
+  requirepass`, `acl_access_denied_auth` (and
+  `speedvault_auth_failures_total`). One for a cluster: the nodes and
+  stuart log in to each other with it, and stuart's port requires it;
+  `components/auth` reads it from a Kubernetes Secret.
 - Kubernetes: Prometheus metrics, Kustomize manifests with a replica per
   primary, autoscaling with the HorizontalPodAutoscaler by pairs of pods.

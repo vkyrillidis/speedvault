@@ -376,6 +376,11 @@ fn link(node: &Node, sync: &Sync) -> io::Result<()> {
     let _ = conn.set_nodelay(true);
     conn.set_read_timeout(Some(TIMEOUT))?;
     let mut req = Encoder::new(Protocol::Resp2);
+    // Logged in first, in the same write: the cluster's one password.
+    let login = node.password.borrow().clone();
+    if let Some(password) = &login {
+        crate::auth::login(&mut req, password);
+    }
     req.array(2 + sync.slots.len());
     req.bulk(b"SLOTSYNC");
     req.bulk(cluster.myself().as_bytes());
@@ -388,10 +393,20 @@ fn link(node: &Node, sync: &Sync) -> io::Result<()> {
     let mut buf = vec![0; READ_SIZE];
     let mut end = 0;
     let mut start;
+    let mut auth_reply = login.is_some();
     let line = loop {
         if let Some(i) = buf[..end].windows(2).position(|w| w == b"\r\n") {
             start = i + 2;
-            break String::from_utf8_lossy(&buf[..i]).into_owned();
+            let line = String::from_utf8_lossy(&buf[..i]).into_owned();
+            if std::mem::take(&mut auth_reply) {
+                if line != "+OK" {
+                    return Err(io::Error::other(format!("AUTH: {line}")));
+                }
+                buf.copy_within(start..end, 0);
+                end -= start;
+                continue;
+            }
+            break line;
         }
         if end == buf.len() || sync.stop.get() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "no reply line"));

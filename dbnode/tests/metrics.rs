@@ -86,6 +86,7 @@ fn a_standalone_node_s_metrics() {
     let info = format!("speedvault_info{{version=\"{}\",mode=\"standalone\",node_id=\"\"}}", env!("CARGO_PKG_VERSION"));
     let mut expected = vec![
         &info[..],
+        "speedvault_auth_failures_total",
         "speedvault_busy_seconds_total",
         "speedvault_clients",
         "speedvault_commands_processed_total",
@@ -105,7 +106,7 @@ fn a_standalone_node_s_metrics() {
     expected.sort();
     assert_eq!(names, expected);
     assert_eq!(value(&m, &info), 1.0);
-    for zero in ["speedvault_clients", "speedvault_commands_processed_total", "speedvault_keys", "speedvault_memory_max_bytes", "speedvault_memory_used_ratio"] {
+    for zero in ["speedvault_auth_failures_total", "speedvault_clients", "speedvault_commands_processed_total", "speedvault_keys", "speedvault_memory_max_bytes", "speedvault_memory_used_ratio"] {
         assert_eq!(value(&m, zero), 0.0, "{zero}");
     }
     assert!(value(&m, "speedvault_memory_used_bytes") > 0.0);

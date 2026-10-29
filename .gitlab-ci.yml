@@ -70,10 +70,16 @@ compat:
               time.sleep(0.2)
       PY
     - python3 tools/compat/difftest.py --ref 127.0.0.1:6379 --target 127.0.0.1:7000 --json compat.json
+    # AUTH: both again, with a password, for the cases tagged auth.
+    - redis-server --port 6380 --save '' --appendonly no --requirepass pw --daemonize yes
+    - ./target/release/speedvault-server 127.0.0.1:7001 --loglevel warning --requirepass pw &
+    - sleep 1
+    - python3 tools/compat/difftest.py --ref 127.0.0.1:6380 --target 127.0.0.1:7001 --password pw --json compat-auth.json
   artifacts:
     when: always
     paths:
       - compat.json
+      - compat-auth.json
 
 # The cluster (tools/compat/README.md): the cluster crate and our node in
 # cluster mode against a real Redis Cluster, stuart with three nodes end to
@@ -91,8 +97,10 @@ cluster-compat:
     - export CARGO_TARGET_DIR=$CI_PROJECT_DIR/target
     - bash tools/compat/cluster_compat.sh
     - bash tools/compat/stuart_cluster.sh
+    - bash tools/compat/stuart_cluster.sh --password pw
     - bash tools/compat/cluster_difftest.sh
     - bash tools/compat/migrate_check.sh --filler 100000
+    - bash tools/compat/migrate_check.sh --filler 100000 --password pw rebalance sigterm failover sigterm-primary
 
 # migrate_check with Lettuce 7.8.0 writers besides redis-py and redis-cli
 # (tools/compat/lettuce: jars from Maven Central, SHA-256 pinned, cached),

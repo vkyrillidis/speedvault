@@ -143,7 +143,7 @@ fn hand(stuart: &Stuart, primary: &NodeId) -> Outcome {
     }
     let mut stands: Vec<(Node, u64, bool)> = Vec::new();
     for r in &candidates {
-        match failover::fence(r, 0) {
+        match failover::fence(stuart, r, 0) {
             Ok((offset, complete)) => stands.push((r.clone(), offset, complete)),
             Err(e) => warning!("Can't ask replica {} of {primary} where it stands: {e}", r.id()),
         }
@@ -151,7 +151,7 @@ fn hand(stuart: &Stuart, primary: &NodeId) -> Outcome {
     let Some((chosen, _)) = failover::choose(&stands) else {
         return if stands.is_empty() { Outcome::NoReplica("no replica answered".into()) } else { Outcome::Copying };
     };
-    let mut p = match keeper::connect(&node) {
+    let mut p = match keeper::connect(stuart, &node) {
         Ok(link) => link,
         Err(e) => return Outcome::Missed(format!("can't reach it: {e}")),
     };
@@ -160,7 +160,7 @@ fn hand(stuart: &Stuart, primary: &NodeId) -> Outcome {
         Ok(offset) => offset,
         Err(e) => return Outcome::Missed(e.to_string()),
     };
-    let reached = keeper::connect(&chosen).and_then(|mut r| {
+    let reached = keeper::connect(stuart, &chosen).and_then(|mut r| {
         loop {
             let (at, complete) = failover::fence_on(&mut r, 0)?;
             if complete && at >= offset {

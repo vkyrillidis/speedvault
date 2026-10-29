@@ -89,7 +89,7 @@ fn fail_over(stuart: &Stuart, primary: &NodeId, dead: bool) -> Result<bool, Stri
     // Fenced, each saying its offset and whether its copy is complete.
     let mut fenced: Vec<(cluster::Node, u64, bool)> = Vec::new();
     for r in &candidates {
-        match fence(r, FENCE) {
+        match fence(stuart, r, FENCE) {
             Ok((offset, complete)) => fenced.push((r.clone(), offset, complete)),
             Err(e) => warning!("Can't fence replica {} of {primary}: {e}", r.id()),
         }
@@ -97,7 +97,7 @@ fn fail_over(stuart: &Stuart, primary: &NodeId, dead: bool) -> Result<bool, Stri
     let fenced_at = Instant::now();
     let lift = |except: Option<&NodeId>| {
         for (r, _, _) in fenced.iter().filter(|(r, _, _)| Some(r.id()) != except) {
-            if let Err(e) = fence(r, 0) {
+            if let Err(e) = fence(stuart, r, 0) {
                 warning!("Can't lift the fence of replica {}: {e}", r.id());
             }
         }
@@ -176,8 +176,8 @@ pub(crate) fn choose(fenced: &[(cluster::Node, u64, bool)]) -> Option<(cluster::
 
 /// `CLUSTER FENCE seconds` at `replica`: its offset, and whether its copy
 /// is complete.
-pub(crate) fn fence(replica: &cluster::Node, secs: u64) -> io::Result<(u64, bool)> {
-    fence_on(&mut keeper::connect(replica)?, secs)
+pub(crate) fn fence(stuart: &Stuart, replica: &cluster::Node, secs: u64) -> io::Result<(u64, bool)> {
+    fence_on(&mut keeper::connect(stuart, replica)?, secs)
 }
 
 /// The same, on a connection to the replica.

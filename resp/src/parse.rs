@@ -75,7 +75,20 @@ pub enum ProtocolError {
     /// An inline request has an unterminated quote, or a closing quote
     /// followed by something other than a space.
     UnbalancedQuotes,
+    /// Before the client has authenticated ([`Parser::set_unauthenticated`]):
+    /// more than [`UNAUTHENTICATED_MAX_ARGS`] arguments.
+    UnauthenticatedMultibulkLength,
+    /// Before the client has authenticated: an argument longer than
+    /// [`UNAUTHENTICATED_MAX_BULK_LEN`].
+    UnauthenticatedBulkLength,
 }
+
+/// Before a client has authenticated, Redis takes requests of at most this
+/// many arguments (`networking.c`), so that it can't be made to buffer much
+/// for a client that doesn't know the password.
+pub const UNAUTHENTICATED_MAX_ARGS: usize = 10;
+/// And arguments of at most this many bytes.
+pub const UNAUTHENTICATED_MAX_BULK_LEN: usize = 16384;
 
 impl ProtocolError {
     /// Appends the error reply Redis sends: `-ERR Protocol error: ...\r\n`.
@@ -92,6 +105,8 @@ impl ProtocolError {
             ProtocolError::TooBigMultibulkCount => b"too big mbulk count string",
             ProtocolError::TooBigBulkCount => b"too big bulk count string",
             ProtocolError::UnbalancedQuotes => b"unbalanced quotes in request",
+            ProtocolError::UnauthenticatedMultibulkLength => b"unauthenticated multibulk length",
+            ProtocolError::UnauthenticatedBulkLength => b"unauthenticated bulk length",
         };
         out.error_parts(&[b"ERR Protocol error: ", text]);
     }
@@ -111,6 +126,8 @@ impl fmt::Display for ProtocolError {
             ProtocolError::TooBigMultibulkCount => "too big mbulk count string",
             ProtocolError::TooBigBulkCount => "too big bulk count string",
             ProtocolError::UnbalancedQuotes => "unbalanced quotes in request",
+            ProtocolError::UnauthenticatedMultibulkLength => "unauthenticated multibulk length",
+            ProtocolError::UnauthenticatedBulkLength => "unauthenticated bulk length",
         };
         write!(f, "Protocol error: {text}")
     }
@@ -144,6 +161,8 @@ const NO_BULK: usize = usize::MAX;
 #[derive(Debug)]
 pub struct Parser {
     limits: Limits,
+    /// The client hasn't authenticated: the smaller limits apply.
+    unauthenticated: bool,
     /// Byte ranges of the arguments read so far: into the caller's buffer for
     /// multibulk requests, into `scratch` for inline ones (`inline`).
     args: Vec<Range<usize>>,
@@ -166,6 +185,7 @@ impl Parser {
     pub fn new(limits: Limits) -> Parser {
         Parser {
             limits,
+            unauthenticated: false,
             args: Vec::new(),
             scratch: Vec::new(),
             inline: false,
@@ -178,6 +198,15 @@ impl Parser {
 
     pub fn limits(&self) -> &Limits {
         &self.limits
+    }
+
+    /// Whether the client has yet to authenticate: if so, a multibulk
+    /// request may have at most [`UNAUTHENTICATED_MAX_ARGS`] arguments of
+    /// at most [`UNAUTHENTICATED_MAX_BULK_LEN`] bytes, as in Redis (inline
+    /// requests aren't limited). Checked as each count arrives, so a
+    /// request that authenticates lifts them for the next one.
+    pub fn set_unauthenticated(&mut self, unauthenticated: bool) {
+        self.unauthenticated = unauthenticated;
     }
 
     /// Parses the request at the start of `buf`. See [`Parser`] for how to
@@ -229,6 +258,9 @@ impl Parser {
             Some(n) if n as u64 <= self.limits.max_args as u64 => n as usize,
             _ => return Err(ProtocolError::InvalidMultibulkLength),
         };
+        if self.unauthenticated && count > UNAUTHENTICATED_MAX_ARGS {
+            return Err(ProtocolError::UnauthenticatedMultibulkLength);
+        }
         // Reserve for small requests only: the count is the client's claim, the bytes aren't here yet.
         self.args.reserve(count.min(1024));
         self.remaining = count;
@@ -241,7 +273,7 @@ impl Parser {
             if self.bulk_len == NO_BULK {
                 let start = self.pos;
                 if let Some((len, next)) = bulk_len_fast(buf, start) {
-                    if len <= self.limits.max_bulk_len as u64 {
+                    if len <= self.limits.max_bulk_len as u64 && !(self.unauthenticated && len > UNAUTHENTICATED_MAX_BULK_LEN as u64) {
                         self.bulk_len = len as usize;
                         self.pos = next;
                         self.scanned = 0;
@@ -260,6 +292,9 @@ impl Parser {
                     Some(n) if n >= 0 && n as u64 <= self.limits.max_bulk_len as u64 => n as usize,
                     _ => return Err(ProtocolError::InvalidBulkLength),
                 };
+                if self.unauthenticated && self.bulk_len > UNAUTHENTICATED_MAX_BULK_LEN {
+                    return Err(ProtocolError::UnauthenticatedBulkLength);
+                }
                 self.pos = cr + 2;
             }
             // The value and two more bytes, which Redis skips without checking that they are "\r\n".
@@ -615,6 +650,43 @@ mod tests {
         }
         assert_eq!(parse_one(b"*2147483647\r\n"), Ok(None));
         assert_eq!(parse_one(b"*-9223372036854775808\r\n"), Ok(Some((23, vec![]))));
+    }
+
+    #[test]
+    fn unauthenticated_limits() {
+        // Checked against Redis 8.10.2: each fails as soon as its count
+        // arrives, and only past the general checks.
+        let parse = |input: &[u8], unauthenticated: bool| {
+            let mut p = Parser::new(Limits::default());
+            p.set_unauthenticated(unauthenticated);
+            p.parse(input).map(|r| matches!(r, Parsed::Complete { .. }))
+        };
+        let ten = [&b"*10\r\n"[..], &b"$1\r\na\r\n".repeat(10)].concat();
+        assert_eq!(parse(&ten, true), Ok(true));
+        assert_eq!(parse(b"*11\r\n", true), Err(ProtocolError::UnauthenticatedMultibulkLength));
+        assert_eq!(parse(b"*11\r\n", false), Ok(false));
+        assert_eq!(parse(b"*2147483648\r\n", true), Err(ProtocolError::InvalidMultibulkLength));
+        assert_eq!(parse(b"*-1\r\n", true), Ok(true));
+        let big = [&b"*1\r\n$16384\r\n"[..], &[b'x'; 16384], b"\r\n"].concat();
+        assert_eq!(parse(&big, true), Ok(true));
+        assert_eq!(parse(b"*1\r\n$16385\r\n", true), Err(ProtocolError::UnauthenticatedBulkLength));
+        assert_eq!(parse(b"*1\r\n$16385\r", true), Ok(false), "not before its line has ended");
+        assert_eq!(parse(b"*1\r\n$16385\r\n", false), Ok(false));
+        assert_eq!(parse(b"*1\r\n$536870913\r\n", true), Err(ProtocolError::InvalidBulkLength));
+        let mut out = Encoder::new(crate::Protocol::Resp2);
+        ProtocolError::UnauthenticatedBulkLength.encode(&mut out);
+        ProtocolError::UnauthenticatedMultibulkLength.encode(&mut out);
+        assert_eq!(
+            out.as_bytes(),
+            b"-ERR Protocol error: unauthenticated bulk length\r\n-ERR Protocol error: unauthenticated multibulk length\r\n"
+        );
+        // Lifted between requests.
+        let mut p = Parser::new(Limits::default());
+        p.set_unauthenticated(true);
+        let auth = b"*2\r\n$4\r\nAUTH\r\n$2\r\npw\r\n";
+        assert_eq!(p.parse(auth), Ok(Parsed::Complete { consumed: auth.len() }));
+        p.set_unauthenticated(false);
+        assert_eq!(p.parse(b"*11\r\n"), Ok(Parsed::Incomplete));
     }
 
     #[test]

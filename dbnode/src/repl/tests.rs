@@ -31,6 +31,8 @@ fn node_with(backlog: usize, store: store::Store, config: Config) -> Node {
         commands_processed: Cell::new(0),
         commands_refused_oom: Cell::new(0),
         maxmemory: Cell::new(0),
+        password: RefCell::new(None),
+        auth_failures: Cell::new(0),
         startup_memory: 0,
         peak_memory: Cell::new(0),
         cluster: None,
@@ -39,7 +41,9 @@ fn node_with(backlog: usize, store: store::Store, config: Config) -> Node {
 }
 
 fn client() -> Client {
-    Client::new(1, None, None, -1)
+    let client = Client::new(1, None, None, -1);
+    client.authenticated.set(true);
+    client
 }
 
 /// Runs each request of `bytes` (RESP) at `node`; the replies.

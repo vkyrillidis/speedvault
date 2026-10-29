@@ -1,7 +1,8 @@
 //! `stuart [PORT | HOST:PORT] --state FILE [--auto] [--create-when N] [--replicas N] [--fail-after SECONDS]
-//! [--moves-per-source N] [--max-moves N] [--loglevel LEVEL] [--metrics PORT | HOST:PORT]`: serves on 127.0.0.1:7600 by default. Exits on
+//! [--moves-per-source N] [--max-moves N] [--loglevel LEVEL] [--metrics PORT | HOST:PORT] [--requirepass-file PATH | --requirepass PASSWORD]`: serves on 127.0.0.1:7600 by default. Exits on
 //! SIGINT, and on SIGTERM once the nodes stopping with it were told to (at most 15 s; see `linger`).
 
+use dbnode::auth;
 use dbnode::log::{self, Level};
 use dbnode::{notice, warning};
 use std::net::{SocketAddr, TcpListener};
@@ -13,6 +14,7 @@ use stuart::{Config, Moves};
 const DEFAULT_ADDR: &str = "127.0.0.1:7600";
 const USAGE: &str = "usage: speedvault-stuart [PORT | HOST:PORT] --state FILE [--auto] [--create-when N] [--replicas N] [--fail-after SECONDS]
               [--moves-per-source N] [--max-moves N] [--loglevel LEVEL] [--metrics PORT | HOST:PORT]
+              [--requirepass-file PATH | --requirepass PASSWORD]
   PORT | HOST:PORT    where to listen (default 127.0.0.1:7600; a bare port listens on all interfaces)
   --state FILE        the nodes and the slot table, written before stuart acts on them and read at start
   --auto              keep the slots even over the nodes by itself: nodes joining get slots, leaving
@@ -30,19 +32,37 @@ const USAGE: &str = "usage: speedvault-stuart [PORT | HOST:PORT] --state FILE [-
   --max-moves N       slots moving at once in all (default 512)
   --loglevel LEVEL    warning, notice (default) or verbose, like Redis's loglevel
   --metrics PORT | HOST:PORT  serve GET /metrics (Prometheus), /healthz and /ready over HTTP there
-                      (a bare port listens on all interfaces). Default: off
+                      (a bare port listens on all interfaces). Default: off; it needs no password
+  --requirepass-file PATH  the cluster's password (the file's contents, one line end dropped: a
+                      mounted Kubernetes Secret), the nodes' --requirepass: stuart's port requires
+                      it (AUTH), and stuart logs in with it to the nodes
+  --requirepass PASSWORD  the same, given here (seen by anyone who can list processes)
   --help, --version";
 
 #[derive(Debug, PartialEq)]
 enum Command {
-    Serve { addr: SocketAddr, state: PathBuf, create_when: Option<usize>, replicas: usize, fail_after: Duration, moves: Moves, auto: bool, level: Level, metrics: Option<SocketAddr> },
+    Serve {
+        addr: SocketAddr,
+        state: PathBuf,
+        create_when: Option<usize>,
+        replicas: usize,
+        fail_after: Duration,
+        moves: Moves,
+        auto: bool,
+        level: Level,
+        metrics: Option<SocketAddr>,
+        requirepass: Option<String>,
+        requirepass_file: Option<PathBuf>,
+    },
     Help,
     Version,
 }
 
 fn main() -> ExitCode {
-    let (addr, state, create_when, replicas, fail_after, moves, auto, level, metrics) = match parse_args(std::env::args().skip(1)) {
-        Some(Command::Serve { addr, state, create_when, replicas, fail_after, moves, auto, level, metrics }) => (addr, state, create_when, replicas, fail_after, moves, auto, level, metrics),
+    let (addr, state, create_when, replicas, fail_after, moves, auto, level, metrics, requirepass, requirepass_file) = match parse_args(std::env::args().skip(1)) {
+        Some(Command::Serve { addr, state, create_when, replicas, fail_after, moves, auto, level, metrics, requirepass, requirepass_file }) => {
+            (addr, state, create_when, replicas, fail_after, moves, auto, level, metrics, requirepass, requirepass_file)
+        }
         Some(Command::Help) => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -57,6 +77,13 @@ fn main() -> ExitCode {
         }
     };
     log::set_level(level);
+    let password = match auth::password(requirepass, requirepass_file.as_deref()) {
+        Ok(password) => password,
+        Err(why) => {
+            eprintln!("speedvault-stuart: {why}");
+            return ExitCode::from(2);
+        }
+    };
     if let Err(e) = dbnode::exit_on_signals() {
         warning!("Can't handle SIGTERM/SIGINT: {e}");
     }
@@ -77,8 +104,9 @@ fn main() -> ExitCode {
         }
     };
     let http = metrics.as_ref().and_then(|m| m.local_addr().ok()).map_or(String::new(), |a| format!("; metrics on http://{a}/metrics"));
-    notice!("speedvault-stuart {} (pid {}) ready on {addr}{http}", env!("CARGO_PKG_VERSION"), std::process::id());
-    let error = stuart::serve(listener, metrics, Config { state, create_when, moves, auto, replicas, fail_after });
+    let auth = if password.is_some() { "; password required" } else { "" };
+    notice!("speedvault-stuart {} (pid {}) ready on {addr}{auth}{http}", env!("CARGO_PKG_VERSION"), std::process::id());
+    let error = stuart::serve(listener, metrics, Config { state, create_when, moves, auto, replicas, fail_after, password });
     warning!("stuart stopped: {}", error.err().map_or("no error".to_string(), |e| e.to_string()));
     ExitCode::FAILURE
 }
@@ -87,6 +115,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Option<Command> {
     let (mut addr, mut state, mut create_when, mut level) = (None, None, None, Level::Notice);
     let (mut moves, mut auto, mut metrics, mut replicas) = (Moves::default(), false, None, 0);
     let mut fail_after = stuart::FAIL_AFTER;
+    let (mut requirepass, mut requirepass_file) = (None, None);
     let positive = |arg: Option<String>| arg?.parse::<usize>().ok().filter(|&n| n > 0);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -101,12 +130,17 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Option<Command> {
             "--moves-per-source" => moves.per_source = positive(args.next())?,
             "--max-moves" => moves.total = positive(args.next())?,
             "--metrics" => metrics = Some(parse_addr(&args.next()?)?),
+            "--requirepass" => requirepass = Some(args.next()?),
+            "--requirepass-file" => requirepass_file = Some(PathBuf::from(args.next()?)),
             _ if addr.is_none() && !arg.starts_with('-') => addr = Some(parse_addr(&arg)?),
             _ => return None,
         }
     }
     let addr = addr.unwrap_or_else(|| DEFAULT_ADDR.parse().unwrap());
-    Some(Command::Serve { addr, state: state?, create_when, replicas, fail_after, moves, auto, level, metrics })
+    if requirepass.is_some() && requirepass_file.is_some() {
+        return None;
+    }
+    Some(Command::Serve { addr, state: state?, create_when, replicas, fail_after, moves, auto, level, metrics, requirepass, requirepass_file })
 }
 
 /// A bare port listens on all interfaces.
@@ -128,7 +162,19 @@ mod tests {
     #[test]
     fn arguments() {
         let serve = |addr: &str, state: &str, level| {
-            Some(Command::Serve { addr: addr.parse().unwrap(), state: state.into(), create_when: None, replicas: 0, fail_after: stuart::FAIL_AFTER, moves: Moves::default(), auto: false, level, metrics: None })
+            Some(Command::Serve {
+                addr: addr.parse().unwrap(),
+                state: state.into(),
+                create_when: None,
+                replicas: 0,
+                fail_after: stuart::FAIL_AFTER,
+                moves: Moves::default(),
+                auto: false,
+                level,
+                metrics: None,
+                requirepass: None,
+                requirepass_file: None,
+            })
         };
         assert_eq!(parse(&["--state", "s"]), serve("127.0.0.1:7600", "s", Level::Notice));
         assert_eq!(parse(&["7601", "--state", "/var/lib/stuart"]), serve("0.0.0.0:7601", "/var/lib/stuart", Level::Notice));
@@ -142,6 +188,12 @@ mod tests {
         let Some(Command::Serve { metrics, .. }) = parse(&["--state", "s", "--metrics", "9121"]) else { panic!() };
         assert_eq!(metrics, Some("0.0.0.0:9121".parse().unwrap()));
         assert_eq!(parse(&["--state", "s", "--metrics"]), None);
+        let Some(Command::Serve { requirepass, requirepass_file, .. }) = parse(&["--state", "s", "--requirepass", "pw"]) else { panic!() };
+        assert_eq!((requirepass.as_deref(), requirepass_file), (Some("pw"), None));
+        let Some(Command::Serve { requirepass, requirepass_file, .. }) = parse(&["--state", "s", "--requirepass-file", "/p"]) else { panic!() };
+        assert_eq!((requirepass, requirepass_file), (None, Some(PathBuf::from("/p"))));
+        assert_eq!(parse(&["--state", "s", "--requirepass", "a", "--requirepass-file", "b"]), None);
+        assert_eq!(parse(&["--state", "s", "--requirepass"]), None);
         for bad in ["0", "-1", "x", ""] {
             assert_eq!(parse(&["--state", "s", "--create-when", bad]), None, "{bad:?}");
         }

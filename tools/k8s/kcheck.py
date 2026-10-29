@@ -82,6 +82,8 @@ STUART = os.environ.get("STUART", "stuart")
 PORT = 7000
 CTL = os.environ.get("CTL", "/tmp/kcheck")
 REPLICAS = int(os.environ.get("REPLICAS", "0"))
+# kind_check.sh --auth: every client logs in (the writers through migrate_check's).
+mc.PASSWORD = os.environ.get("SPEEDVAULT_PASSWORD") or None
 
 
 class K8sCluster(mc.Cluster):
@@ -92,10 +94,10 @@ class K8sCluster(mc.Cluster):
         self.base = 7600
 
     def stuart(self):
-        return mc.redis.Redis(host=STUART, port=7600, socket_timeout=10)
+        return mc.redis.Redis(password=mc.PASSWORD, host=STUART, port=7600, socket_timeout=10)
 
     def node(self, host: str):
-        return mc.redis.Redis(host=host, port=PORT, socket_timeout=30)
+        return mc.redis.Redis(password=mc.PASSWORD, host=host, port=PORT, socket_timeout=30)
 
     def node_ports(self) -> List[str]:
         """The nodes stuart knows that aren't leaving, by host."""
@@ -273,7 +275,7 @@ def run(args) -> int:
 def filler_kept(n: int) -> List[str]:
     """With replicas, a node killed loses no filler key: written before,
     its replica had them."""
-    rc = mc.RedisCluster(host=SEED, port=PORT)
+    rc = mc.RedisCluster(password=mc.PASSWORD, host=SEED, port=PORT)
     lost = wrong = 0
     for start in range(0, n, 2000):
         p = rc.pipeline()

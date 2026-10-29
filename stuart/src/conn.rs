@@ -9,6 +9,7 @@
 use crate::state::State;
 use crate::{keeper, Stuart};
 use cluster::{key_hash_slot, reply, Node, NodeId};
+use dbnode::auth::{self, Login};
 use dbnode::{notice, verbose, warning};
 use reactor::TcpStream;
 use resp::{Args, Encoder, Limits, Parsed, Parser, Protocol};
@@ -44,14 +45,21 @@ fn serve(mut conn: &TcpStream, stuart: &Rc<Stuart>) -> io::Result<()> {
     let mut out = Encoder::new(Protocol::Resp2);
     let mut buf = vec![0; 16 * 1024];
     let (mut start, mut end) = (0, 0);
+    // As a node's clients (see `dbnode::auth`): with a password, only
+    // AUTH, HELLO and QUIT until the client has logged in.
+    let mut authenticated = stuart.password.is_none();
     loop {
         let mut close = false;
         while !close {
+            parser.set_unauthenticated(!authenticated);
             match parser.parse(&buf[start..end]) {
                 Ok(Parsed::Complete { consumed }) => {
                     let args = parser.args(&buf[start..end]);
-                    if !args.is_empty() && execute(&args, stuart, id, &mut out) == Flow::Close {
-                        close = true;
+                    // No arguments: nothing to run, no reply.
+                    match args.iter().next().map(|name| String::from_utf8_lossy(name).to_ascii_lowercase()) {
+                        None => {}
+                        Some(name) if !authenticated && !auth::allowed_before_auth(&name) => out.error(auth::NOAUTH),
+                        Some(_) => close = execute(&args, stuart, id, &mut authenticated, &mut out) == Flow::Close,
                     }
                     start += consumed;
                 }
@@ -86,7 +94,7 @@ fn serve(mut conn: &TcpStream, stuart: &Rc<Stuart>) -> io::Result<()> {
     }
 }
 
-fn execute(args: &Args, stuart: &Rc<Stuart>, client: u64, out: &mut Encoder) -> Flow {
+fn execute(args: &Args, stuart: &Rc<Stuart>, client: u64, authenticated: &mut bool, out: &mut Encoder) -> Flow {
     let name = String::from_utf8_lossy(&args[0]).to_ascii_lowercase();
     let sub = args.get(1).map(|s| String::from_utf8_lossy(s).to_ascii_lowercase());
     match (name.as_str(), sub.as_deref(), args.len()) {
@@ -96,7 +104,13 @@ fn execute(args: &Args, stuart: &Rc<Stuart>, client: u64, out: &mut Encoder) -> 
             out.ok();
             return Flow::Close;
         }
-        ("hello", _, _) => hello(args, client, out),
+        ("hello", _, _) => hello(args, stuart, client, authenticated, out),
+        ("auth", _, n) if n >= 2 => {
+            let args: Vec<&[u8]> = args.iter().collect();
+            if auth::auth(&args, stuart.password.as_deref(), true, out) == Login::Ok {
+                *authenticated = true;
+            }
+        }
         ("command", Some("docs"), _) => out.map(0),
         ("command", Some("count"), 2) => out.integer(0),
         ("command", _, _) => out.array(0),
@@ -171,7 +185,7 @@ fn execute(args: &Args, stuart: &Rc<Stuart>, client: u64, out: &mut Encoder) -> 
                 out.error_parts(&[b"ERR unknown subcommand '", &args[1], b"'. Try ", upper.as_bytes(), b" HELP."]);
             }
         }
-        ("ping" | "echo" | "cluster" | "stuart" | "client", _, _) => {
+        ("ping" | "echo" | "cluster" | "stuart" | "client" | "auth", _, _) => {
             out.error(format!("ERR wrong number of arguments for '{name}' command").as_bytes())
         }
         _ if KEYED.contains(&name.as_str()) => {
@@ -192,17 +206,39 @@ fn execute(args: &Args, stuart: &Rc<Stuart>, client: u64, out: &mut Encoder) -> 
     Flow::Continue
 }
 
-/// `HELLO [2|3]`, answered as the dbnode answers it (clients pick features
-/// by `version`); `INFO` tells stuart apart.
-fn hello(args: &Args, client: u64, out: &mut Encoder) {
-    match args.get(1) {
-        None => {}
-        Some(b"2") => out.set_protocol(Protocol::Resp2),
-        Some(b"3") => out.set_protocol(Protocol::Resp3),
+/// `HELLO [2|3 [AUTH username password] [SETNAME clientname]]`, answered
+/// as the dbnode answers it (clients pick features by `version`; the name
+/// is taken and forgotten); `INFO` tells stuart apart.
+fn hello(args: &Args, stuart: &Stuart, client: u64, authenticated: &mut bool, out: &mut Encoder) {
+    let protocol = match args.get(1) {
+        None => None,
+        Some(b"2") => Some(Protocol::Resp2),
+        Some(b"3") => Some(Protocol::Resp3),
         Some(_) => return out.error(b"NOPROTO unsupported protocol version"),
+    };
+    let (mut login, mut i) = (None, 2);
+    while i < args.len() {
+        let (opt, more) = (&args[i], args.len() - 1 - i);
+        if opt.eq_ignore_ascii_case(b"auth") && more >= 2 {
+            login = Some((&args[i + 1], &args[i + 2]));
+            i += 3;
+        } else if opt.eq_ignore_ascii_case(b"setname") && more >= 1 {
+            i += 2;
+        } else {
+            return out.error_parts(&[b"ERR Syntax error in HELLO option '", opt, b"'"]);
+        }
     }
-    if args.len() > 2 {
-        return out.error_parts(&[b"ERR Syntax error in HELLO option '", &args[2], b"'"]);
+    if let Some((user, pass)) = login {
+        if !auth::check(stuart.password.as_deref(), user, pass) {
+            return out.error(auth::WRONGPASS);
+        }
+        *authenticated = true;
+    }
+    if !*authenticated {
+        return out.error(auth::HELLO_NOAUTH);
+    }
+    if let Some(protocol) = protocol {
+        out.set_protocol(protocol);
     }
     let proto = if out.protocol() == Protocol::Resp3 { 3 } else { 2 };
     out.map(7);

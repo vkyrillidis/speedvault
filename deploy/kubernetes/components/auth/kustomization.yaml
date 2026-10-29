@@ -1,0 +1,66 @@
+# A password for the cluster, Redis's requirepass: the nodes and stuart
+# read it from the Secret speedvault-auth (its key `password`), made apart
+# from the manifests so that the password is in none of them:
+#
+#   kubectl -n db create secret generic speedvault-auth --from-literal=password="$(openssl rand -base64 24)"
+#
+# To add to an overlay of the base:
+#
+#   components:
+#     - <path to>/deploy/kubernetes/components/auth
+#
+# Clients then log in with it (redis-cli -a or REDISCLI_AUTH, redis-py's
+# password=, Lettuce's RedisURI.withPassword); stuart's port requires it
+# too. The probes and /metrics stay open. The pods start only once the
+# Secret exists; a changed Secret takes effect as the pods restart (a
+# rolling restart: until every pod has the new one, the old and the new
+# can't reach each other).
+
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+patches:
+  - target:
+      kind: StatefulSet
+      name: speedvault
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --requirepass-file
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: /etc/speedvault/auth/password
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts
+        value:
+          - name: auth
+            mountPath: /etc/speedvault/auth
+            readOnly: true
+      - op: add
+        path: /spec/template/spec/volumes
+        value:
+          - name: auth
+            secret:
+              secretName: speedvault-auth
+  - target:
+      kind: StatefulSet
+      name: stuart
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --requirepass-file
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: /etc/speedvault/auth/password
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts/-
+        value:
+          name: auth
+          mountPath: /etc/speedvault/auth
+          readOnly: true
+      - op: add
+        path: /spec/template/spec/volumes
+        value:
+          - name: auth
+            secret:
+              secretName: speedvault-auth

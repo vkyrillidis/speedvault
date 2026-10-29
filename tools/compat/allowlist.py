@@ -20,6 +20,12 @@ ALLOW = {
                                "same bytes at once get the error and a close): we reply the error, as Redis 7 did",
         "proto_too_big_bulk_count": "Redis 8.10.2 waits forever for a bulk count of 70000 digits (even a million); "
                                     "we refuse it past 64 KiB, as Redis 7 did",
+        "auth_pipelined_wrong*": "Redis 8.10.2 sends no reply at all to a failed AUTH while replies are pending "
+                                 "(addAuthErrReply), so the client's replies no longer line up with its requests: "
+                                 "we reply -WRONGPASS",
+        "auth_limit_split": "Redis 8.10.2 never answers a bad bulk length whose line ends in a later read (any bad "
+                            "length, with or without a password; the same bytes at once get the error and a close): we "
+                            "reply the error, as Redis 7.0.15 does",
     },
     # Redis vs Redis must be identical: nothing allowed.
     "none": {},

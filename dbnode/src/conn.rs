@@ -56,6 +56,8 @@ fn serve(mut conn: &TcpStream, node: &Node) -> io::Result<Closed> {
     // Listed in CLIENT LIST until this function returns, however it returns.
     let registration = node.clients.register(conn.peer_addr().ok(), conn.local_addr().ok(), conn.as_raw_fd());
     let client = &*registration.client;
+    // Connected while there is no password: authenticated (see `auth`).
+    client.authenticated.set(node.password.borrow().is_none());
     conn.set_read_timeout(node.config.idle_timeout)?;
     let mut parser = Parser::new(Limits::default());
     let mut out = Encoder::new(Protocol::Resp2);
@@ -69,13 +71,17 @@ fn serve(mut conn: &TcpStream, node: &Node) -> io::Result<Closed> {
         let mut closed = None;
         let mut commands = 0;
         while closed.is_none() {
+            parser.set_unauthenticated(!client.authenticated.get());
             match parser.parse(&buf[start..end]) {
                 Ok(Parsed::Complete { consumed }) => {
                     let args = parser.args(&buf[start..end]);
                     // A replica asking for the stream: the connection is
-                    // its feed from here on (see `repl`).
+                    // its feed from here on (see `repl`). It logs in
+                    // first, as any client.
                     if args.len() == 4 && args[0].eq_ignore_ascii_case(b"REPLSYNC") {
-                        if let Some(feed) = crate::repl::primary::attach(&args, node, &mut out) {
+                        if !client.authenticated.get() {
+                            out.error(crate::auth::NOAUTH);
+                        } else if let Some(feed) = crate::repl::primary::attach(&args, node, &mut out) {
                             conn.write_all(out.as_bytes())?;
                             crate::repl::primary::serve(conn, node, feed)?;
                             return Ok(Closed::Replica);
@@ -86,7 +92,9 @@ fn serve(mut conn: &TcpStream, node: &Node) -> io::Result<Closed> {
                     // A node syncing slots from here (a slot moving by
                     // snapshot): the same, a feed of those slots.
                     if args.len() >= 3 && args[0].eq_ignore_ascii_case(b"SLOTSYNC") {
-                        if let Some(feed) = crate::repl::primary::attach_slots(&args, node, &mut out) {
+                        if !client.authenticated.get() {
+                            out.error(crate::auth::NOAUTH);
+                        } else if let Some(feed) = crate::repl::primary::attach_slots(&args, node, &mut out) {
                             conn.write_all(out.as_bytes())?;
                             crate::repl::primary::serve(conn, node, feed)?;
                             return Ok(Closed::Replica);

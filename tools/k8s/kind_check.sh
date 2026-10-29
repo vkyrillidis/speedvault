@@ -72,10 +72,14 @@
 # at 95.5%, hpa-cpu 5 -> 6 (each node 55% busy, the HPA at 40%), hpa-down
 # 6 -> 3.
 #
+# --auth runs them with a password (tools/k8s/auth: the kind overlay with
+# components/auth, from a Secret made here): the checker logs in with it,
+# without Lettuce (LettuceLoad doesn't log in).
+#
 # For each, when the HPA asked for more pods, when they were ready, and
 # when their slots had arrived, from the start of the load.
 #
-#   tools/k8s/kind_check.sh [--keep] [--reuse] [--autoscale] [--no-replicas] [--out DIR] [SCENARIO...]
+#   tools/k8s/kind_check.sh [--keep] [--reuse] [--autoscale] [--no-replicas] [--auth] [--out DIR] [SCENARIO...]
 #
 # --keep leaves the kind cluster up at the end; --reuse uses one that is
 # already there (and rebuilds the images). --out DIR keeps memtier's JSON
@@ -124,6 +128,7 @@ KEEP=0
 REUSE=0
 AUTOSCALE=0
 REPLICAS=1
+AUTH=0
 OUT=""
 SCENARIOS=()
 while [ $# -gt 0 ]; do
@@ -132,12 +137,21 @@ while [ $# -gt 0 ]; do
     --reuse) REUSE=1; shift;;
     --autoscale) AUTOSCALE=1; shift;;
     --no-replicas) REPLICAS=0; shift;;
+    --auth) AUTH=1; shift;;
     --out) OUT="$2"; mkdir -p "$OUT"; shift 2;;
     -h|--help) sed -n '2,99p' "$0" | sed '/^set -euo/,$d'; exit 0;;
     -*) echo "unknown argument: $1" >&2; exit 2;;
     *) SCENARIOS+=("$1"); shift;;
   esac
 done
+# The checker's commands, with the password to log in with (--auth).
+AUTH_ENV=()
+if [ "$AUTH" = 1 ]; then
+  [ "$AUTOSCALE" = 0 ] && [ "$REPLICAS" = 1 ] || { echo "--auth goes without --autoscale and --no-replicas" >&2; exit 2; }
+  PASSWORD="kind-check-$RANDOM$RANDOM"
+  AUTH_ENV=(env SPEEDVAULT_PASSWORD="$PASSWORD" REDISCLI_AUTH="$PASSWORD")
+  LETTUCE=""
+fi
 if [ ${#SCENARIOS[@]} -eq 0 ]; then
   if [ "$AUTOSCALE" = 1 ]; then
     SCENARIOS=(hpa-memory hpa-cpu hpa-down rollout delete)
@@ -236,6 +250,10 @@ if [ "$AUTOSCALE" = 1 ]; then
 else
   OVERLAY="$ROOT/deploy/kubernetes/overlays/kind"
   [ "$REPLICAS" = 1 ] || OVERLAY="$HERE/no-replicas"
+  if [ "$AUTH" = 1 ]; then
+    OVERLAY="$HERE/auth"
+    k create secret generic speedvault-auth --from-literal=password="$PASSWORD" --dry-run=client -o yaml | k apply -f - >/dev/null
+  fi
   k apply -k "$OVERLAY" >/dev/null
   k apply -k "$ROOT/deploy/kubernetes/overlays/autoscaling" --dry-run=server >/dev/null
   say "the autoscaling overlay passes a server-side dry run"
@@ -277,6 +295,8 @@ spec:
           value: stuart.$NS.svc
         - name: REPLICAS
           value: "$REPLICAS"
+        - name: SPEEDVAULT_PASSWORD
+          value: "${PASSWORD:-}"
 EOF
   for _ in $(seq 400); do
     if kc logs checker 2>/dev/null | grep -qx writing; then return 0; fi
@@ -289,7 +309,7 @@ EOF
 }
 
 stop_checker() {  # stop_checker N: the checker's verdict once N nodes are even
-  kc exec checker -- python3 /app/k8s/kcheck.py stop "$1"
+  kc exec checker -- "${AUTH_ENV[@]}" python3 /app/k8s/kcheck.py stop "$1"
   local phase=""
   for _ in $(seq 400); do
     phase=$(kc get pod checker -o jsonpath='{.status.phase}')
@@ -301,12 +321,12 @@ stop_checker() {  # stop_checker N: the checker's verdict once N nodes are even
 }
 
 check() {  # check ARGS...: kcheck.py ARGS in the running checker, its output indented
-  kc exec checker -- env REPLICAS="$REPLICAS" python3 /app/k8s/kcheck.py "$@" | sed 's/^/    /'
+  kc exec checker -- "${AUTH_ENV[@]}" env REPLICAS="$REPLICAS" python3 /app/k8s/kcheck.py "$@" | sed 's/^/    /'
   return "${PIPESTATUS[0]}"
 }
 
 counts() {  # stuart's counters: "slots_moved=N handovers=N demotions=N"
-  kc exec checker -- python3 /app/k8s/kcheck.py counts
+  kc exec checker -- "${AUTH_ENV[@]}" python3 /app/k8s/kcheck.py counts
 }
 
 count() {  # count NAME COUNTS: NAME's value in COUNTS
@@ -333,7 +353,7 @@ restore_worker() {  # the worker worker-stop stopped: started again, untainted
 
 stuart_nodes() {  # once stuart answers through its Service (it may have just restarted)
   for _ in $(seq 30); do
-    kc exec checker -- redis-cli -h "stuart.$NS.svc" -p 7600 STUART NODES 2>/dev/null | grep . && return 0
+    kc exec checker -- "${AUTH_ENV[@]}" redis-cli -h "stuart.$NS.svc" -p 7600 STUART NODES 2>/dev/null | grep . && return 0
     sleep 1
   done
   echo "stuart doesn't answer, or knows no nodes" >&2
@@ -394,7 +414,7 @@ watch_scale() {  # watch_scale N T0: the HPA asks for N, they're ready; what hap
 }
 
 even() {  # even N T0: N nodes hold even shares, nothing moves
-  kc exec checker -- python3 /app/k8s/kcheck.py even "$1" >/dev/null
+  kc exec checker -- "${AUTH_ENV[@]}" python3 /app/k8s/kcheck.py even "$1" >/dev/null
   say "  +$(($(date +%s) - $2))s $1 nodes hold even shares of the slots" | tee -a "$TIMELINE"
 }
 
@@ -456,7 +476,7 @@ load_result() {  # waits for memtier to finish; its seconds summarized, against 
   sed -n '/^{/,$p' "${OUT:-/tmp}/load.json.tmp" > "${OUT:-/tmp}/load-$1.json"
   sed '/^{/,$d' "${OUT:-/tmp}/load.json.tmp" | sed 's/^/    /'
   rm -f "${OUT:-/tmp}/load.json.tmp"
-  kc exec -i checker -- python3 /app/k8s/kcheck.py load < "${OUT:-/tmp}/load-$1.json" | sed 's/^/    /' | tee -a "$TIMELINE"
+  kc exec -i checker -- "${AUTH_ENV[@]}" python3 /app/k8s/kcheck.py load < "${OUT:-/tmp}/load-$1.json" | sed 's/^/    /' | tee -a "$TIMELINE"
   [ "$phase" = Succeeded ] || { echo "memtier_benchmark failed ($phase)" >&2; return 1; }
 }
 
@@ -515,7 +535,7 @@ scenario() {
       nodes_ready $BASE
       start_checker $BASE
       local pod=speedvault-1 before
-      [ "$REPLICAS" = 0 ] || pod=$(kc exec checker -- python3 /app/k8s/kcheck.py primary)
+      [ "$REPLICAS" = 0 ] || pod=$(kc exec checker -- "${AUTH_ENV[@]}" python3 /app/k8s/kcheck.py primary)
       before=$(counts)
       local uid; uid=$(k get pod "$pod" -o jsonpath='{.metadata.uid}')
       say "  deleting $pod"
@@ -536,7 +556,7 @@ scenario() {
       nodes_ready $BASE
       start_checker $BASE
       local pod=speedvault-1
-      [ "$REPLICAS" = 0 ] || pod=$(kc exec checker -- python3 /app/k8s/kcheck.py primary)
+      [ "$REPLICAS" = 0 ] || pod=$(kc exec checker -- "${AUTH_ENV[@]}" python3 /app/k8s/kcheck.py primary)
       check lossy "$pod"
       local uid; uid=$(k get pod "$pod" -o jsonpath='{.metadata.uid}')
       k delete pod "$pod" --grace-period=0 --force >/dev/null 2>&1

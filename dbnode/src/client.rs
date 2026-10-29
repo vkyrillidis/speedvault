@@ -45,6 +45,10 @@ pub(crate) struct Client {
     /// `CLIENT NO-TOUCH on` (flag `T`). The store keeps no access times,
     /// so it changes nothing else.
     pub(crate) no_touch: Cell<bool>,
+    /// It may run commands: it logged in (`AUTH`), or connected while
+    /// the node had no password (see [`crate::auth`]). False until the
+    /// connection says.
+    pub(crate) authenticated: Cell<bool>,
     /// Bytes read and written, commands run, reads that brought requests
     /// and the commands they brought (Redis 8's `tot-net-in`, `tot-net-out`,
     /// `tot-cmds`, `read-events`, `avg-pipeline-len-sum` and `-cnt`).
@@ -76,6 +80,7 @@ impl Client {
             lib_name: RefCell::new(None),
             lib_ver: RefCell::new(None),
             no_touch: Cell::new(false),
+            authenticated: Cell::new(false),
             net_in: Cell::new(0),
             net_out: Cell::new(0),
             cmds: Cell::new(0),
@@ -89,7 +94,7 @@ impl Client {
     /// printable ASCII without spaces is allowed. Returns false (and
     /// changes nothing) if the name is invalid.
     pub(crate) fn set_name(&self, name: &[u8]) -> bool {
-        if !name.iter().all(|&b| (b'!'..=b'~').contains(&b)) {
+        if !valid_name(name) {
             return false;
         }
         *self.name.borrow_mut() = (!name.is_empty()).then(|| name.to_vec());
@@ -134,6 +139,12 @@ impl Client {
     pub(crate) fn wrote(&self, n: usize) {
         self.net_out.set(self.net_out.get() + n as u64);
     }
+}
+
+/// Whether `name` may be a client's name: printable ASCII without spaces
+/// ("" too: it removes the name).
+pub(crate) fn valid_name(name: &[u8]) -> bool {
+    name.iter().all(|&b| (b'!'..=b'~').contains(&b))
 }
 
 /// Every connected client, by id (so `CLIENT LIST` is in connection order).

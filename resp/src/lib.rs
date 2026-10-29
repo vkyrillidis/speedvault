@@ -41,4 +41,4 @@ mod encode;
 mod parse;
 
 pub use encode::{format_double, format_integer, Encoder, Protocol};
-pub use parse::{Args, Limits, Parsed, Parser, ProtocolError};
+pub use parse::{Args, Limits, Parsed, Parser, ProtocolError, UNAUTHENTICATED_MAX_ARGS, UNAUTHENTICATED_MAX_BULK_LEN};

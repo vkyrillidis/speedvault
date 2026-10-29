@@ -59,7 +59,12 @@ impl Stuart {
             let log = std::fs::read_to_string(&stuart.2).unwrap_or_default();
             panic!("stuart on {addr} answered once, then: {e}; the process: {status:?}; its log: {log}");
         }
-        let info = stuart.client().text(&["INFO"]);
+        let mut c = stuart.client();
+        if let Some(i) = extra.iter().position(|&a| a == "--requirepass-file") {
+            let password = std::fs::read_to_string(extra[i + 1]).unwrap();
+            assert_eq!(c.text(&["AUTH", password.trim_end()]), "+OK");
+        }
+        let info = c.text(&["INFO"]);
         let pid = format!("\r\nprocess_id:{}\r\n", stuart.0.id());
         assert!(info.contains(&pid), "another process listens on {addr}: {info:?}");
         stuart
@@ -495,15 +500,24 @@ struct Follower {
     slots: std::collections::HashMap<u16, String>,
     seed: String,
     redirects: usize,
+    /// Each new connection logs in with it first.
+    password: Option<&'static str>,
 }
 
 impl Follower {
     fn new(seed: SocketAddr) -> Follower {
-        Follower { conns: Default::default(), slots: Default::default(), seed: seed.to_string(), redirects: 0 }
+        Follower { conns: Default::default(), slots: Default::default(), seed: seed.to_string(), redirects: 0, password: None }
     }
 
     fn conn(&mut self, addr: &str) -> &mut Client {
-        self.conns.entry(addr.to_string()).or_insert_with(|| Client::connect(addr.parse().unwrap()))
+        let password = self.password;
+        self.conns.entry(addr.to_string()).or_insert_with(|| {
+            let mut c = Client::connect(addr.parse().unwrap());
+            if let Some(password) = password {
+                assert_eq!(c.text(&["AUTH", password]), "+OK");
+            }
+            c
+        })
     }
 
     fn text(&mut self, args: &[&str]) -> String {
@@ -1852,6 +1866,83 @@ fn replicas_are_assigned_as_nodes_join() {
     assert_eq!(s.text(&["STUART", "JOIN", &x, "127.0.0.1", "1", "zone", "w3", "name", "pod-x"]), "+OK");
     let nodes = s.text(&["STUART", "NODES"]);
     assert!(nodes.lines().any(|l| l.starts_with(&x) && l.contains(" name=pod-x zone=w3")), "{nodes}");
+}
+
+/// A dbnode joining `stuart` with the cluster's `password`.
+fn node_with_password(stuart: SocketAddr, password: &str) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = dbnode::Config {
+        cluster: Some(dbnode::Announce { host: "127.0.0.1".into(), port: addr.port() }),
+        stuart: Some(stuart.to_string()),
+        password: Some(dbnode::auth::Secret(password.as_bytes().to_vec())),
+        ..dbnode::Config::default()
+    };
+    thread::spawn(move || dbnode::serve(listener, None, config).unwrap());
+    addr
+}
+
+/// One password for the cluster (`--requirepass-file` at stuart, the same
+/// at the nodes): stuart's port requires it, a node with another one can't
+/// join, and with it every link logs in: stuart's to the nodes (tables,
+/// INFO), the replicas' to their primaries, the slot copies' to their
+/// sources.
+#[test]
+fn a_cluster_with_a_password() {
+    let dir = temp_dir("password");
+    let file = dir.join("password");
+    std::fs::write(&file, "s3cret\n").unwrap();
+    let stuart = Stuart::start_with(free_port(), &dir.join("state"), &["--auto", "--replicas", "1", "--requirepass-file", file.to_str().unwrap()]);
+    let mut s = stuart.client();
+    assert_eq!(s.text(&["STUART", "NODES"]), "-NOAUTH Authentication required.");
+    assert_eq!(s.text(&["AUTH", "s3cret\n"]), "-WRONGPASS invalid username-password pair or user is disabled.");
+    assert!(s.text(&["HELLO", "3"]).starts_with("-NOAUTH HELLO must be called with the client already authenticated"));
+    assert_eq!(s.text(&["HELLO", "3", "AUTH", "default", "wrong"]), "-WRONGPASS invalid username-password pair or user is disabled.");
+    assert_eq!(s.text(&["AUTH", "default", "s3cret"]), "+OK");
+    let mut h = stuart.client();
+    assert_eq!(String::from_utf8(h.call(&["HELLO", "2", "AUTH", "default", "s3cret"])).unwrap().lines().next(), Some("*14"));
+    assert!(!h.text(&["STUART", "NODES"]).starts_with("-NOAUTH"));
+
+    // Another password: refused at the join.
+    let stranger = node_with_password(stuart.1, "wrong");
+    let mut nodes = Vec::new();
+    for i in 1..=4 {
+        nodes.push(node_with_password(stuart.1, "s3cret"));
+        wait_until("the node joins", || s.text(&["STUART", "NODES"]).lines().filter(|l| l.contains(" up ")).count() == i);
+    }
+    wait_until_long("the slots are even", Duration::from_secs(30), || {
+        let epoch = epoch_of(&mut s);
+        let listed = s.text(&["STUART", "NODES"]);
+        up_and_acked(&mut s, epoch) == 4 && listed.matches(" slots=8192 ").count() == 2 && s.text(&["STUART", "MIGRATIONS"]).is_empty()
+    });
+    assert!(!s.text(&["STUART", "NODES"]).contains(&id_of_with(stranger, "wrong")), "the stranger joined");
+    let mut c = Client::connect(nodes[0]);
+    assert_eq!(c.text(&["CLUSTER", "MYID"]), "-NOAUTH Authentication required.");
+
+    // Writes reach the replicas.
+    let mut f = Follower::new(stuart.1);
+    f.password = Some("s3cret");
+    let keys = keys_in(0..=16383, 200);
+    for k in &keys {
+        assert_eq!(f.text(&["SET", k, "v"]), "+OK");
+    }
+    let listed = s.text(&["STUART", "NODES"]);
+    let replica = nodes.iter().copied().find(|&n| listed.lines().any(|l| l.starts_with(&id_of_with(n, "s3cret")) && l.contains(" replica-of="))).unwrap();
+    let mut r = Client::connect(replica);
+    assert_eq!(r.text(&["AUTH", "s3cret"]), "+OK");
+    wait_until("the replica is synced", || String::from_utf8(r.call(&["ROLE"])).unwrap().contains("$9\r\nconnected\r\n"));
+    assert_eq!(r.text(&["READONLY"]), "+OK");
+    let mine: Vec<&String> = keys.iter().filter(|k| !r.text(&["GET", k]).starts_with("-MOVED")).collect();
+    assert!(!mine.is_empty());
+    wait_until("the writes reached the replica", || mine.iter().all(|k| r.text(&["GET", k]) == "v"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `CLUSTER MYID` at `addr`, logged in with `password`.
+fn id_of_with(addr: SocketAddr, password: &str) -> String {
+    let mut c = Client::connect(addr);
+    assert_eq!(c.text(&["AUTH", password]), "+OK");
+    c.text(&["CLUSTER", "MYID"])
 }
 
 /// A dbnode joining `stuart` that announces a proxy's address: once the

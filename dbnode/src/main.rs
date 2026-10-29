@@ -1,12 +1,14 @@
 //! `dbnode [PORT | HOST:PORT] [--timeout SECONDS] [--busy-poll USEC] [--loglevel LEVEL]
-//! [--maxmemory BYTES | N%] [--metrics PORT | HOST:PORT] [--cluster [--announce HOST:PORT] [--stuart HOST:PORT [--name NAME] [--zone ZONE] [--drain-timeout SECONDS] [--leave-linger SECONDS]]
+//! [--maxmemory BYTES | N%] [--metrics PORT | HOST:PORT] [--requirepass-file PATH | --requirepass PASSWORD] [--cluster [--announce HOST:PORT] [--stuart HOST:PORT [--name NAME] [--zone ZONE] [--drain-timeout SECONDS] [--leave-linger SECONDS]]
 //! [--migrate-batch KEYS] [--migrate-pause USEC] [--migrate-chunk ELEMENTS]]`: serves on 127.0.0.1:7000 by default.
 //! Exits on SIGTERM or SIGINT; with `--stuart`, the first SIGTERM leaves the cluster first.
 
+use dbnode::auth;
 use dbnode::log::{self, Level};
 use dbnode::memory::{Counting, Human, Limit};
 use dbnode::{notice, valid_name, warning, Announce, Config, Migrate, DRAIN_TIMEOUT, LEAVE_LINGER};
 use std::net::{SocketAddr, TcpListener};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -19,7 +21,7 @@ const DEFAULT_ADDR: &str = "127.0.0.1:7000";
 /// the server sleeps: 1.37x Redis's GET/s at -P 1 instead of 0.87x (WSL2).
 const DEFAULT_BUSY_POLL: Duration = Duration::from_micros(20);
 const USAGE: &str = "usage: speedvault-server [PORT | HOST:PORT] [--timeout SECONDS] [--busy-poll USEC] [--loglevel LEVEL]
-              [--maxmemory BYTES | N%] [--metrics PORT | HOST:PORT]
+              [--maxmemory BYTES | N%] [--metrics PORT | HOST:PORT] [--requirepass-file PATH | --requirepass PASSWORD]
               [--cluster [--announce HOST:PORT] [--stuart HOST:PORT [--name NAME] [--zone ZONE] [--drain-timeout SECONDS] [--leave-linger SECONDS]]
                          [--migrate-batch KEYS] [--migrate-pause USEC] [--migrate-chunk ELEMENTS]]
   PORT | HOST:PORT    where to listen (default 127.0.0.1:7000; a bare port listens on all interfaces)
@@ -31,7 +33,11 @@ const USAGE: &str = "usage: speedvault-server [PORT | HOST:PORT] [--timeout SECO
                       noeviction) and keys moving here; a size (2gb, 500mb, bytes) or a share of
                       the container's memory limit (75%; refused without one). Default 0: no limit
   --metrics PORT | HOST:PORT  serve GET /metrics (Prometheus), /healthz and /ready over HTTP there
-                      (a bare port listens on all interfaces). Default: off
+                      (a bare port listens on all interfaces). Default: off; it needs no password
+  --requirepass-file PATH  require this password (the file's contents, one line end
+                      dropped: a mounted Kubernetes Secret) as Redis's requirepass: clients AUTH
+                      first. In a cluster every node and stuart take the same one, and log in with it
+  --requirepass PASSWORD  the same, given here (seen by anyone who can list processes)
   --cluster           cluster mode (Redis Cluster protocol): serve the slots a table pushed with
                       CLUSTER SETTABLE assigns, redirect the others with MOVED
   --announce HOST:PORT  the address clients reach this node at (default: where it listens;
@@ -73,6 +79,8 @@ enum Command {
         leave_linger: Duration,
         maxmemory: Limit,
         metrics: Option<SocketAddr>,
+        requirepass: Option<String>,
+        requirepass_file: Option<PathBuf>,
     },
     Help,
     Version,
@@ -81,9 +89,9 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    let (addr, timeout, busy_poll, level, cluster, stuart, name, zone, migrate, drain_timeout, leave_linger, maxmemory, metrics) = match parse_args(std::env::args().skip(1)) {
-        Some(Command::Serve { addr, timeout, busy_poll, level, cluster, stuart, name, zone, migrate, drain_timeout, leave_linger, maxmemory, metrics }) => {
-            (addr, timeout, busy_poll, level, cluster, stuart, name, zone, migrate, drain_timeout, leave_linger, maxmemory, metrics)
+    let (addr, timeout, busy_poll, level, cluster, stuart, name, zone, migrate, drain_timeout, leave_linger, maxmemory, metrics, requirepass, requirepass_file) = match parse_args(std::env::args().skip(1)) {
+        Some(Command::Serve { addr, timeout, busy_poll, level, cluster, stuart, name, zone, migrate, drain_timeout, leave_linger, maxmemory, metrics, requirepass, requirepass_file }) => {
+            (addr, timeout, busy_poll, level, cluster, stuart, name, zone, migrate, drain_timeout, leave_linger, maxmemory, metrics, requirepass, requirepass_file)
         }
         Some(Command::Help) => {
             println!("{USAGE}");
@@ -110,6 +118,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let password = match auth::password(requirepass, requirepass_file.as_deref()) {
+        Ok(password) => password,
+        Err(why) => {
+            eprintln!("speedvault-server: {why}");
+            return ExitCode::from(2);
+        }
+    };
     if let Err(e) = dbnode::exit_on_signals() {
         warning!("Can't handle SIGTERM/SIGINT: {e}");
     }
@@ -130,13 +145,14 @@ fn main() -> ExitCode {
     let idle = timeout.filter(|t| !t.is_zero()).map_or("never".to_string(), |t| format!("{}s", t.as_secs()));
     let max = if maxmemory == 0 { "none".to_string() } else { format!("{} ({maxmemory} bytes)", Human(maxmemory)) };
     let http = metrics.as_ref().and_then(|m| m.local_addr().ok()).map_or(String::new(), |a| format!(", metrics on http://{a}/metrics"));
+    let auth = if password.is_some() { ", password required" } else { "" };
     notice!(
-        "speedvault-server {} (pid {}) ready on {addr}; idle timeout {idle}, busy-poll {} us, maxmemory {max}{http}",
+        "speedvault-server {} (pid {}) ready on {addr}; idle timeout {idle}, busy-poll {} us, maxmemory {max}{auth}{http}",
         env!("CARGO_PKG_VERSION"),
         std::process::id(),
         busy_poll.as_micros()
     );
-    let error = dbnode::serve(listener, metrics, Config { idle_timeout: timeout, busy_poll, cluster, stuart, name, zone, migrate, drain_timeout, leave_linger: Some(leave_linger), maxmemory });
+    let error = dbnode::serve(listener, metrics, Config { idle_timeout: timeout, busy_poll, cluster, stuart, name, zone, migrate, drain_timeout, leave_linger: Some(leave_linger), maxmemory, password });
     warning!("Server stopped: {}", error.err().map_or("no error".to_string(), |e| e.to_string()));
     ExitCode::FAILURE
 }
@@ -146,6 +162,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Option<Command> {
     let (mut timeout, mut busy_poll, mut level) = (None, DEFAULT_BUSY_POLL, Level::Notice);
     let (mut cluster, mut announce, mut stuart, mut name, mut zone) = (false, None, None, None, None);
     let (mut migrate, mut drain_timeout, mut leave_linger, mut maxmemory, mut metrics) = (Migrate::default(), None, None, Limit::Bytes(0), None);
+    let (mut requirepass, mut requirepass_file) = (None, None);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return Some(Command::Help),
@@ -164,6 +181,8 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Option<Command> {
             "--migrate-chunk" => migrate.chunk = args.next()?.parse().ok().filter(|&n| n > 0)?,
             "--maxmemory" => maxmemory = Limit::parse(&args.next()?)?,
             "--metrics" => metrics = Some(parse_addr(&args.next()?)?),
+            "--requirepass" => requirepass = Some(args.next()?),
+            "--requirepass-file" => requirepass_file = Some(PathBuf::from(args.next()?)),
             "--drain-timeout" => drain_timeout = Some(Duration::from_secs(args.next()?.parse().ok().filter(|&n| n > 0)?)),
             "--leave-linger" => leave_linger = Some(Duration::from_secs(args.next()?.parse().ok()?)),
             _ if addr.is_none() && !arg.starts_with('-') => addr = Some(parse_addr(&arg)?),
@@ -173,6 +192,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Option<Command> {
     let addr = addr.unwrap_or_else(|| DEFAULT_ADDR.parse().unwrap());
     if stuart.is_some() && !cluster {
         return Some(Command::Invalid("--stuart needs --cluster"));
+    }
+    if requirepass.is_some() && requirepass_file.is_some() {
+        return Some(Command::Invalid("--requirepass and --requirepass-file exclude each other"));
     }
     if drain_timeout.is_some() && stuart.is_none() {
         return Some(Command::Invalid("--drain-timeout needs --stuart"));
@@ -197,7 +219,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Option<Command> {
         }
         (true, None) => Some(Announce { host: addr.ip().to_string(), port: addr.port() }),
     };
-    Some(Command::Serve { addr, timeout, busy_poll, level, cluster, stuart, name, zone, migrate, drain_timeout, leave_linger, maxmemory, metrics })
+    Some(Command::Serve { addr, timeout, busy_poll, level, cluster, stuart, name, zone, migrate, drain_timeout, leave_linger, maxmemory, metrics, requirepass, requirepass_file })
 }
 
 /// `host:port`, or `[v6 address]:port`; a host that `CLUSTER NODES` can
@@ -229,7 +251,7 @@ mod tests {
     fn serve(addr: &str, timeout: Option<u64>, level: Level) -> Option<Command> {
         let timeout = timeout.map(Duration::from_secs);
         let addr = addr.parse().unwrap();
-        Some(Command::Serve { addr, timeout, busy_poll: DEFAULT_BUSY_POLL, level, cluster: None, stuart: None, name: None, zone: None, migrate: Migrate::default(), drain_timeout: DRAIN_TIMEOUT, leave_linger: LEAVE_LINGER, maxmemory: Limit::Bytes(0), metrics: None })
+        Some(Command::Serve { addr, timeout, busy_poll: DEFAULT_BUSY_POLL, level, cluster: None, stuart: None, name: None, zone: None, migrate: Migrate::default(), drain_timeout: DRAIN_TIMEOUT, leave_linger: LEAVE_LINGER, maxmemory: Limit::Bytes(0), metrics: None, requirepass: None, requirepass_file: None })
     }
 
     fn announced(args: &[&str]) -> Option<Announce> {
@@ -336,6 +358,14 @@ mod tests {
         let Some(Command::Serve { metrics, .. }) = parse(&["--metrics", "127.0.0.1:9121"]) else { panic!() };
         assert_eq!(metrics, Some("127.0.0.1:9121".parse().unwrap()));
         for bad in [&["--metrics"][..], &["--metrics", "x"]] {
+            assert_eq!(parse(bad), None, "{bad:?}");
+        }
+        let Some(Command::Serve { requirepass, requirepass_file, .. }) = parse(&["--requirepass", "s3cret"]) else { panic!() };
+        assert_eq!((requirepass.as_deref(), requirepass_file), (Some("s3cret"), None));
+        let Some(Command::Serve { requirepass, requirepass_file, .. }) = parse(&["--requirepass-file", "/etc/speedvault/password"]) else { panic!() };
+        assert_eq!((requirepass, requirepass_file), (None, Some(PathBuf::from("/etc/speedvault/password"))));
+        assert_eq!(parse(&["--requirepass", "a", "--requirepass-file", "b"]), Some(Command::Invalid("--requirepass and --requirepass-file exclude each other")));
+        for bad in [&["--requirepass"][..], &["--requirepass-file"]] {
             assert_eq!(parse(bad), None, "{bad:?}");
         }
         for bad in [&["--maxmemory"][..], &["--maxmemory", "1.5gb"], &["--maxmemory", "0%"], &["--maxmemory", "-1"]] {

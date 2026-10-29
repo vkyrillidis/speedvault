@@ -69,7 +69,7 @@ pub(crate) fn keep(stuart: Rc<Stuart>, id: NodeId) {
         if link.is_none() {
             // Its memory first: no slot moves to it until stuart knows
             // whether it is full.
-            match connect(&node).and_then(|mut l| info(&mut l).map(|i| (l, i))) {
+            match connect(&stuart, &node).and_then(|mut l| info(&mut l).map(|i| (l, i))) {
                 Ok((l, (memory, offset))) => {
                     link = Some(l);
                     stuart.report(&id, true, None);
@@ -147,14 +147,22 @@ fn linger(stuart: &Stuart, id: &NodeId, link: &mut Link) {
     }
 }
 
-/// Connects and checks that the node there is `node`.
-pub(crate) fn connect(node: &Node) -> io::Result<Link> {
+/// Connects, logs in with the cluster's password if there is one, and
+/// checks that the node there is `node`.
+pub(crate) fn connect(stuart: &Stuart, node: &Node) -> io::Result<Link> {
     let addr = dbnode::resolve(node.host(), node.port(), TIMEOUT)?;
     let stream = TcpStream::connect_timeout(addr, TIMEOUT)?;
     let _ = stream.set_nodelay(true);
     stream.set_read_timeout(Some(TIMEOUT))?;
     stream.set_write_timeout(Some(TIMEOUT))?;
     let mut link = Link { stream, to: (node.host().to_string(), node.port()), buf: Vec::new(), pushed: 0, offsets: Some(Vec::new()) };
+    if let Some(password) = &stuart.password {
+        match call(&mut link, &[b"AUTH", b"default", password])? {
+            Reply::Simple(_) => {}
+            Reply::Error(e) => return Err(io::Error::other(format!("AUTH: {e}"))),
+            other => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("AUTH: {other:?}"))),
+        }
+    }
     match call(&mut link, &[b"CLUSTER", b"MYID"])? {
         Reply::Bulk(id) if id == node.id().as_bytes() => Ok(link),
         Reply::Bulk(other) => Err(io::Error::other(format!(

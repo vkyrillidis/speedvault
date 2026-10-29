@@ -14,6 +14,11 @@ other tool):
 - `components/no-replicas`: the base without replicas (three nodes, all
   primaries: half the pods, but a pod lost loses its keys, and a rolling
   update moves every key; see "What happens when").
+- `components/auth`: a password, from a Secret `speedvault-auth` that you
+  make (`kubectl create secret generic speedvault-auth
+  --from-literal=password=...`): the nodes and stuart require it and log
+  in to each other with it; clients `AUTH` with it. The probes and
+  `/metrics` need none.
 - `overlays/kind`: what `tools/k8s/kind_check.sh` tests in kind (the image
   built locally, small requests).
 

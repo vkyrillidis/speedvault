@@ -13,7 +13,7 @@ standard library only.
 | `build_redis.sh` | Builds the reference Redis, 8.10.2, from its release tag (the commit pinned) into `.redis`; CI uses it too |
 | `client_startup_capture.sh` | Runs redis-cli, redis-benchmark and redis-py through the proxy and logs what they send. The output for Redis 7.0.15 is in `captures/redis-7.0.15-client-startup.log` |
 | `cluster_compat.sh`, `cluster_compat.py` | The `cluster` crate against a real Redis Cluster: `CLUSTER KEYSLOT` on random keys, `CLUSTER SLOTS SHARDS NODES` byte for byte |
-| `stuart_cluster.sh` | stuart and three dbnodes from the release binaries, end to end: join, `STUART CREATE`, `redis-cli -c` seeded with stuart and with a node, `redis-cli --cluster check`, a stuart restart, a node restart and `STUART ASSIGN` |
+| `stuart_cluster.sh` | stuart and three dbnodes from the release binaries, end to end: join, `STUART CREATE`, `redis-cli -c` seeded with stuart and with a node, `redis-cli --cluster check`, a stuart restart, a node restart and `STUART ASSIGN`; with `--password`, all of it with one (and the refusals without it) |
 | `compose_smoke.sh` | `docker-compose.yml` end to end: stuart and three nodes come up (`--create-when 3`), keys spread and are found from any node, `redis-benchmark --cluster`, a stuart restart keeps the table, a node stopped leaves its keys to the others and started again gets its share back, `down` is quick |
 | `cluster_difftest.sh`, `cluster_difftest.py` | Our cluster beside a 3-node Redis Cluster with the same layout: the same requests to each node pair, the same redis-py `RedisCluster` script, `redis-cli -c`, `redis-benchmark --cluster`, writes while stuart restarts, a slot migrating (`ASK`, `TRYAGAIN`) |
 | `migrate_check.sh`, `migrate_check.py` | Slots moving under load: counters `INCR`ed through redis-py, `redis-cli -c` and Lettuce during `REBALANCE` and `DRAIN`, with stuart or a node killed mid-move; no write lost or doubled. The redirects each client gets during and after a rebalance |
@@ -37,6 +37,9 @@ python3 difftest.py --ref 127.0.0.1:6393 --target 127.0.0.1:7000
 python3 difftest.py --ref ... --target ... -k 'split_*' -k =hello_3 --tag large --skip-slow -v
 python3 difftest.py --list                                   # all cases with their tags
 python3 difftest.py --show --target 127.0.0.1:7000 -k incr   # just print what the target replies
+# AUTH: both started with the password pw (redis-server --requirepass pw, speedvault-server --requirepass pw);
+# runs only the cases tagged auth, which need it (the main mode skips them)
+python3 difftest.py --ref 127.0.0.1:6394 --target 127.0.0.1:7001 --password pw
 ```
 
 - Each case is a list of steps (`Send` with optional chunking and delays,
@@ -99,6 +102,11 @@ key, DEL with 10000 keys; since phase 7 hashes, sets, lists and `SCAN`.
 - `client_setinfo`: 7.0 replies `unknown subcommand`. Redis 7.2+ replies
   `+OK`, and clients ignore the error either way.
 - `info_*`, `command_*`: only the type and a few markers are compared.
+- `auth_pipelined_wrong*`: Redis 8.10.2 sends no reply to a failed `AUTH`
+  while replies are pending, desynchronising the client; we reply
+  `-WRONGPASS`.
+- `auth_limit_split`: Redis 8.10.2 never answers a bad bulk length whose
+  line ends in a later read; we reply the error, as Redis 7.0.15 does.
 
 ### Validation results (2026-10-13)
 
@@ -271,8 +279,11 @@ above) or from pip.
 ## migrate_check.sh
 
 ```sh
-tools/compat/migrate_check.sh                   # [--base-port 7880] [--lettuce] [--filler N] [--keep] [SCENARIO...]
+tools/compat/migrate_check.sh                   # [--base-port 7880] [--lettuce] [--filler N] [--password PW] [--keep] [SCENARIO...]
 ```
+
+With `--password`, stuart and the nodes require it and every writer logs
+in (not Lettuce's).
 
 Slots moving while clients write (phase 5 milestone 6). Each scenario
 starts stuart on the base port and three dbnodes (four for `drain`; the

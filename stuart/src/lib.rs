@@ -78,6 +78,10 @@ pub struct Config {
     /// failed: a replica marked (its primary writes without it), a
     /// primary's replica promoted (see [`failover`]).
     pub fail_after: Duration,
+    /// The cluster's password (`--requirepass`, `--requirepass-file`; see
+    /// `dbnode::auth`): stuart's port requires it, and stuart logs in with
+    /// it to the nodes. `None`: none.
+    pub password: Option<dbnode::auth::Secret>,
 }
 
 /// How many slots move at once: out of one node (`--moves-per-source`)
@@ -117,6 +121,8 @@ pub(crate) struct Stuart {
     pub(crate) moves: Moves,
     pub(crate) auto: bool,
     pub(crate) fail_after: Duration,
+    /// The cluster's password, if any.
+    pub(crate) password: Option<Vec<u8>>,
     /// Per leaving node that holds nothing any more, the table epoch at
     /// which stuart first saw that: it is removed once it took that table.
     emptied: RefCell<HashMap<NodeId, u64>>,
@@ -599,6 +605,7 @@ pub fn serve(listener: net::TcpListener, metrics: Option<net::TcpListener>, conf
         moves: config.moves,
         auto: config.auto,
         fail_after: config.fail_after,
+        password: config.password.clone().map(|p| p.0),
         emptied: RefCell::new(HashMap::new()),
         left: RefCell::default(),
         owed: RefCell::default(),

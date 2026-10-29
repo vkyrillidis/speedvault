@@ -1,0 +1,11 @@
+# kind_check.sh --auth: the kind overlay with a password
+# (components/auth; kind_check.sh makes the Secret).
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../../deploy/kubernetes/overlays/kind
+
+components:
+  - ../../../deploy/kubernetes/components/auth

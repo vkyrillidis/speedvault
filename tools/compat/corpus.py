@@ -940,5 +940,83 @@ seq("value_with_crlf", ("SET", "crlf", b"ab\r\ncd"), ("GET", "crlf"))
 raw("two_sets_one_write", cmd("SET", "p1", "a") + cmd("SET", "p2", "b"), 2)
 raw("split_set", [cmd("SET", "ps", "abc")[:12], cmd("SET", "ps", "abc")[12:]], 1, delay=0.05)
 
+# --- AUTH (requirepass) ----------------------------------------------------
+# Tagged "auth": run only by `difftest.py --password pw`, against servers
+# started with that password (Redis: --requirepass pw; ours: --requirepass
+# pw); the other cases run without one. Each case starts unauthenticated
+# (the FLUSHALL before it logs in on a connection of its own); a case that
+# changes the password puts it back.
+AUTH = {"auth"}
+
+
+def any_hello(i: int, b: bytes) -> bytes:
+    """mask_hello on whatever entry is a HELLO reply."""
+    return mask_hello(b) if b.startswith((b"%7\r\n", b"*14\r\n")) else b
+
+
+def on(conn: int, *commands) -> list:
+    """Steps: each command on connection `conn`, its reply read."""
+    out = []
+    for c in commands:
+        out += [Send(_enc(c), conn=conn), Read(conn=conn)]
+    return out
+
+
+# Without a password (not tagged: the main run): the default user is `nopass`.
+seq("nopass_auth", ("AUTH", "x"), ("AUTH", "default", "x"), ("AUTH", "bob", "x"), ("AUTH", "DEFAULT", "x"),
+    ("AUTH", "internal connection", "x"), ("AUTH", "a", "b", "c"), ("HELLO", "3", "AUTH", "default", "x"),
+    ("HELLO", "2", "AUTH", "bob", "x"), ("HELLO", "2", "AUTH", "bob", "x", "SETNAME", "a b"),
+    ("CONFIG", "GET", "requirepass"), norm=[any_hello])
+raw("nopass_large_request", b"*12\r\n" + b"$5\r\nRPUSH\r\n" + b"$1\r\nl\r\n" + b"$20000\r\n" + b"x" * 20000 + b"\r\n" + b"$1\r\na\r\n" * 9, 1)
+seq("auth_required", ("PING",), ("GET", "k"), ("SET", "k", "v"), ("CLIENT", "SETNAME", "x"), ("CLUSTER", "INFO"),
+    ("COMMAND", "COUNT"), ("SELECT", "0"), ("INFO",), ("CONFIG", "GET", "requirepass"), ("FLUSHALL",), tags=AUTH)
+seq("auth_checks_before", ("FOO", "x"), ("GET",), ("CLIENT", "BOGUS"), ("HELLO", "4"), ("HELLO", "x"), ("AUTH",),
+    tags=AUTH, doc="unknown commands, arity and HELLO's version fail as without a password")
+seq("auth_hello_before", ("HELLO",), ("HELLO", "3"), ("HELLO", "3", "SETNAME", "x"), ("CLIENT", "GETNAME"), tags=AUTH)
+raw("auth_required_inline", b"PING\r\nGET k\r\n", 2, tags=AUTH)
+steps("auth_quit_before", Send(cmd("QUIT")), UntilClose(), tags=AUTH)
+seq("auth_forms", ("AUTH", "wrong"), ("AUTH", "default", "wrong"), ("AUTH", "bob", "pw"), ("AUTH", "PW"),
+    ("AUTH", "DEFAULT", "pw"), ("AUTH", "pw "), ("AUTH", ""), ("AUTH", "a", "b", "c"), ("PING",), ("AUTH", "pw"), ("PING",),
+    ("AUTH", "wrong"), ("PING",), ("AUTH", "default", "pw"), ("GET", "k"), tags=AUTH)
+seq("auth_internal_connection", ("AUTH", "internal connection", "pw"), ("PING",), tags=AUTH)
+seq("auth_hello", ("HELLO", "3", "AUTH", "default", "wrong"), ("HELLO", "3", "AUTH", "bob", "pw"),
+    ("HELLO", "3", "AUTH", "default", "wrong", "SETNAME", "a b"), ("HELLO", "3", "AUTH", "default"),
+    ("HELLO", "AUTH", "default", "pw"), ("PING",), ("HELLO", "3", "AUTH", "default", "pw", "SETNAME", "n1"),
+    ("CLIENT", "GETNAME"), ("HELLO", "2", "AUTH", "default", "wrong"), ("PING",), ("HELLO", "2"),
+    norm=[any_hello], tags=AUTH)
+seq("auth_hello_rejects_name_first", ("HELLO", "2", "AUTH", "default", "pw", "SETNAME", "a\nb"), ("PING",), tags=AUTH)
+pipe("auth_pipelined", [("AUTH", "pw"), ("SET", "k", "v"), ("GET", "k")], tags=AUTH)
+pipe("auth_pipelined_noauth_first", [("GET", "k"), ("AUTH", "pw"), ("GET", "k")], tags=AUTH)
+pipe("auth_pipelined_wrong", [("PING",), ("AUTH", "wrong"), ("PING",)], tags=AUTH)
+pipe("auth_pipelined_wrong_after", [("AUTH", "pw"), ("AUTH", "wrong"), ("PING",)], tags=AUTH)
+pipe("auth_pipelined_noauth_30", [("GET", "k")] * 30 + [("AUTH", "pw"), ("GET", "k")], tags=AUTH)
+raw("auth_limit_args", cmd("PING") + b"*11\r\n", CLOSE, tags=AUTH)
+raw("auth_limit_args_10", b"*10\r\n" + b"$1\r\na\r\n" * 10, 1, tags=AUTH)
+raw("auth_limit_bulk", b"*2\r\n$4\r\nAUTH\r\n$16385\r\n", CLOSE, tags=AUTH)
+raw("auth_limit_bulk_16384", b"*2\r\n$4\r\nAUTH\r\n$16384\r\n" + b"x" * 16384 + b"\r\n", 1, tags=AUTH)
+raw("auth_limit_lifted", cmd("AUTH", "pw") + b"*11\r\n" + b"$1\r\na\r\n" * 11, 2, tags=AUTH)
+raw("auth_limit_lifted_bulk", cmd("AUTH", "pw") + cmd("SET", "k", "x" * 20000) + cmd("STRLEN", "k"), 3, tags=AUTH)
+raw("auth_limit_split", [b"*2\r\n$4\r\nAUTH\r\n$", b"16385\r\n"], CLOSE, delay=0.05, tags=AUTH)
+raw("auth_limit_inline_unlimited", b"PING " + b"x " * 20 + b"\r\n", 1, tags=AUTH)
+raw("auth_inline", b"AUTH pw\r\nPING\r\n", 2, tags=AUTH)
+steps("auth_change_password",
+      *on(0, ("AUTH", "pw"), ("CONFIG", "GET", "requirepass"), ("CONFIG", "SET", "requirepass", "new"), ("PING",)),
+      *on(1, ("PING",), ("AUTH", "pw"), ("AUTH", "new"), ("PING",)),
+      *on(0, ("CONFIG", "GET", "req*"), ("CONFIG", "SET", "requirepass", "")),
+      *on(2, ("PING",), ("AUTH", "x"), ("AUTH", "default", "x"), ("AUTH", "bob", "x"), ("HELLO", "3", "AUTH", "default", "x"),
+          ("HELLO", "3", "AUTH", "bob", "x")),
+      *on(0, ("CONFIG", "GET", "requirepass"), ("CONFIG", "SET", "requirepass", "pw")),
+      *on(2, ("PING",)),
+      *on(3, ("PING",)),
+      *on(0, ("CONFIG", "SET", "requirepass", "x", "maxmemory", "bogus"), ("CONFIG", "SET", "requirepass", "a", "requirepass", "b"),
+          ("CONFIG", "GET", "requirepass")),
+      norm=[any_hello], tags=AUTH,
+      doc="clients authenticated stay so; one that connected without a password counts as authenticated")
+steps("auth_wrongpass_counted", *on(0, ("AUTH", "wrong"), ("HELLO", "2", "AUTH", "default", "wrong"), ("AUTH", "x", "y", "z"),
+                                    ("AUTH", "pw"), ("INFO", "stats")),
+      norm=[at(4, lambda b: b"<" + b"".join(l for l in b.split(b"\r\n") if l.startswith(b"acl_access_denied_auth")) + b">")],
+      tags=AUTH, doc="acl_access_denied_auth counts the wrong passwords, not the syntax errors")
+
+
 def by_name():
     return {c.name: c for c in CASES}

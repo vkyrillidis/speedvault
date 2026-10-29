@@ -465,6 +465,89 @@ fn no_idle_timeout_by_default() {
     c.call(&[b"CONFIG", b"GET", b"timeout"], b"*2\r\n$7\r\ntimeout\r\n$1\r\n0\r\n");
 }
 
+/// `--requirepass` (see `dbnode::auth`; the replies are checked against
+/// Redis 8.10.2 by difftest's auth cases): nothing but AUTH, HELLO and
+/// QUIT before the password, the links of replicas and slot copies
+/// included; a client connected while there was no password, or that
+/// logged in, stays authenticated when it changes.
+#[test]
+fn a_password_is_required() {
+    let password = Some(dbnode::auth::Secret(b"s3cret".to_vec()));
+    let addr = start_with(Config { password, ..Config::default() });
+    let mut c = Client::connect(addr);
+    const NOAUTH: &[u8] = b"-NOAUTH Authentication required.\r\n";
+    c.call(&[b"GET", b"k"], NOAUTH);
+    c.call(&[b"CONFIG", b"GET", b"requirepass"], NOAUTH);
+    c.call(&[b"GET"], b"-ERR wrong number of arguments for 'get' command\r\n");
+    c.call(&[b"REPLSYNC", b"x", b"?", b"-1"], NOAUTH);
+    c.call(&[b"SLOTSYNC", b"x", b"1"], NOAUTH);
+    c.call(&[b"AUTH", b"secret"], b"-WRONGPASS invalid username-password pair or user is disabled.\r\n");
+    c.call(&[b"HELLO", b"2", b"AUTH", b"default", b"s3cre"], b"-WRONGPASS invalid username-password pair or user is disabled.\r\n");
+    c.call(&[b"AUTH", b"default", b"s3cret"], OK);
+    c.call(&[b"GET", b"k"], NIL);
+    c.call(&[b"INFO", b"stats"], b"");
+    let mut stats = vec![0; 4096];
+    let n = std::io::Read::read(&mut c.0, &mut stats).unwrap();
+    assert!(String::from_utf8_lossy(&stats[..n]).contains("\r\nacl_access_denied_auth:2\r\n"));
+    c.call(&[b"CONFIG", b"GET", b"requirepass"], b"*2\r\n$11\r\nrequirepass\r\n$6\r\ns3cret\r\n");
+    let mut h = Client::connect(addr);
+    h.cmd(&[b"HELLO", b"3", b"AUTH", b"default", b"s3cret", b"SETNAME", b"h"]);
+    h.expect(b"%7\r\n$6\r\nserver\r\n");
+    let mut h = Client::connect(addr);
+    let name_error = b"-ERR Client names cannot contain spaces, newlines or special characters.\r\n";
+    h.call(&[b"HELLO", b"2", b"AUTH", b"default", b"s3cret", b"SETNAME", b"a b"], name_error);
+    h.call(&[b"PING"], NOAUTH);
+    h.cmd(&[b"HELLO", b"2", b"AUTH", b"default", b"s3cret", b"SETNAME", b"h"]);
+    h.expect(b"*14\r\n$6\r\nserver\r\n$5\r\nredis\r\n");
+
+    // Requests are small until then: 10 arguments, 16 KiB each.
+    let mut big = Client::connect(addr);
+    big.send(b"*11\r\n");
+    big.expect(b"-ERR Protocol error: unauthenticated multibulk length\r\n");
+    big.expect_closed();
+    let mut big = Client::connect(addr);
+    big.send(b"*2\r\n$4\r\nAUTH\r\n$16385\r\n");
+    big.expect(b"-ERR Protocol error: unauthenticated bulk length\r\n");
+    big.expect_closed();
+    let mut big = Client::connect(addr);
+    let value = vec![b'v'; 20000];
+    big.send(&[request(&[b"AUTH", b"s3cret"]), request(&[b"SET", b"k", &value]), request(&[b"STRLEN", b"k"])].concat());
+    big.expect(b"+OK\r\n+OK\r\n:20000\r\n");
+
+    // A new password: those logged in stay so, new clients need it.
+    c.call(&[b"CONFIG", b"SET", b"requirepass", b"other"], OK);
+    c.call(&[b"PING"], b"+PONG\r\n");
+    let mut d = Client::connect(addr);
+    d.call(&[b"AUTH", b"s3cret"], b"-WRONGPASS invalid username-password pair or user is disabled.\r\n");
+    d.call(&[b"AUTH", b"other"], OK);
+    // None: everyone may; one connected meanwhile stays authenticated.
+    c.call(&[b"CONFIG", b"SET", b"requirepass", b""], OK);
+    let mut e = Client::connect(addr);
+    e.call(&[b"PING"], b"+PONG\r\n");
+    c.call(&[b"CONFIG", b"SET", b"requirepass", b"s3cret"], OK);
+    e.call(&[b"PING"], b"+PONG\r\n");
+    Client::connect(addr).call(&[b"PING"], NOAUTH);
+}
+
+/// In cluster mode the password is the cluster's: set at start only.
+#[test]
+fn a_cluster_node_s_password_is_set_at_start() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cluster = Some(dbnode::Announce { host: "127.0.0.1".into(), port: addr.port() });
+    let password = Some(dbnode::auth::Secret(b"s3cret".to_vec()));
+    thread::spawn(move || dbnode::serve(listener, None, Config { cluster, password, ..Config::default() }).unwrap());
+    let mut c = Client::connect(addr);
+    c.call(&[b"CLUSTER", b"MYID"], b"-NOAUTH Authentication required.\r\n");
+    c.call(&[b"AUTH", b"internal connection", b"s3cret"], b"-WRONGPASS invalid internal password\r\n");
+    c.call(&[b"AUTH", b"s3cret"], OK);
+    c.call(
+        &[b"CONFIG", b"SET", b"requirepass", b"x"],
+        b"-ERR CONFIG SET failed (possibly related to argument 'requirepass') - in cluster mode the password is the cluster's, set at start (--requirepass, --requirepass-file)\r\n",
+    );
+    c.call(&[b"CONFIG", b"GET", b"requirepass"], b"*2\r\n$11\r\nrequirepass\r\n$6\r\ns3cret\r\n");
+}
+
 #[test]
 fn unknown_command() {
     let mut c = Client::connect(start());

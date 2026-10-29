@@ -16,6 +16,7 @@
 //! across a suspension, so the borrows can't overlap.
 
 mod admin;
+pub mod auth;
 mod client;
 mod cluster_mode;
 mod command;
@@ -86,6 +87,10 @@ pub struct Config {
     /// that may add memory are refused, and so are keys moving here. Zero
     /// (the default, like Redis): no limit.
     pub maxmemory: u64,
+    /// The password (`--requirepass`, `--requirepass-file`; see [`auth`]):
+    /// clients must authenticate, and in a cluster the node logs in with
+    /// it to stuart and the other nodes. `None` (the default): none.
+    pub password: Option<auth::Secret>,
 }
 
 /// Whether `name` can be a node's name for stuart (`--name`): printable,
@@ -151,6 +156,12 @@ pub(crate) struct Node {
     pub(crate) commands_refused_oom: Cell<u64>,
     /// `maxmemory`, which `CONFIG SET` changes; 0: none.
     pub(crate) maxmemory: Cell<u64>,
+    /// The password clients must give, which `CONFIG SET requirepass`
+    /// changes (standalone only); `None`: none.
+    pub(crate) password: RefCell<Option<Vec<u8>>>,
+    /// `AUTH`s (and `HELLO ... AUTH`s) refused with `-WRONGPASS`
+    /// (Redis's `acl_access_denied_auth`).
+    pub(crate) auth_failures: Cell<u64>,
     /// `used_memory` once the node was set up (`used_memory_startup`), and
     /// the most seen since (sampled, see `memory`).
     pub(crate) startup_memory: usize,
@@ -188,7 +199,7 @@ pub fn serve(listener: net::TcpListener, metrics: Option<net::TcpListener>, mut 
                 announce.port
             );
             if let Some(stuart) = &config.stuart {
-                let stuart = Arc::new(join::Stuart::new(stuart.clone()));
+                let stuart = Arc::new(join::Stuart::new(stuart.clone(), config.password.clone()));
                 cluster.stuart = Some(stuart.clone());
                 let (name, zone) = (config.name.clone(), config.zone.clone());
                 join::spawn(stuart.clone(), *cluster.myself(), announce.clone(), name, zone, cluster.joined.clone())?;
@@ -209,7 +220,7 @@ pub fn serve(listener: net::TcpListener, metrics: Option<net::TcpListener>, mut 
     };
     // Cluster mode lists the keys by slot, to count and move them.
     let store = if cluster.is_some() { Store::with_slots(cluster::key_hash_slot) } else { Store::new() };
-    let maxmemory = config.maxmemory;
+    let (maxmemory, password) = (config.maxmemory, config.password.clone());
     let node = Rc::new(Node {
         config,
         store: RefCell::new(store),
@@ -220,6 +231,8 @@ pub fn serve(listener: net::TcpListener, metrics: Option<net::TcpListener>, mut 
         commands_processed: Cell::new(0),
         commands_refused_oom: Cell::new(0),
         maxmemory: Cell::new(maxmemory),
+        password: RefCell::new(password.map(|p| p.0)),
+        auth_failures: Cell::new(0),
         startup_memory: memory::used(),
         peak_memory: Cell::new(memory::used()),
         cluster,

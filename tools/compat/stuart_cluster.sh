@@ -5,9 +5,10 @@
 # with stuart itself), redis-cli --cluster check, a stuart restart in the
 # middle, and a node restart (a new id at the same address: its slots are
 # lost until STUART ASSIGN gives them to it). Fails on the first wrong
-# answer; stops everything at the end.
+# answer; stops everything at the end. With --password, stuart and the
+# nodes require it (--requirepass), and redis-cli logs in (REDISCLI_AUTH).
 #
-#   tools/compat/stuart_cluster.sh [--base-port 7830]
+#   tools/compat/stuart_cluster.sh [--base-port 7830] [--password PASSWORD]
 #
 # stuart listens on the base port, the nodes on the next three.
 # CARGO_TARGET_DIR defaults to ~/target/speedvault.
@@ -15,10 +16,12 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 BASE=7830
+AUTH=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --base-port) BASE="$2"; shift 2;;
-    -h|--help) sed -n '2,13p' "$0"; exit 0;;
+    --password) AUTH=(--requirepass "$2"); export REDISCLI_AUTH="$2"; shift 2;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0;;
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
 done
@@ -39,7 +42,7 @@ cleanup() {
 }
 trap cleanup EXIT
 start_stuart() {
-  "$BIN/speedvault-stuart" "127.0.0.1:$S" --state "$DIR/state" --loglevel warning 2>>"$DIR/stuart.log" & STUART_PID=$!
+  "$BIN/speedvault-stuart" "127.0.0.1:$S" --state "$DIR/state" --loglevel warning "${AUTH[@]}" 2>>"$DIR/stuart.log" & STUART_PID=$!
   for _ in $(seq 50); do redis-cli -p "$S" ping >/dev/null 2>&1 && return; sleep 0.1; done
   echo "stuart didn't start; see $DIR/stuart.log" >&2; exit 1
 }
@@ -58,9 +61,14 @@ nodes_up() { [ "$(redis-cli -p "$S" stuart nodes | grep -c " up .*acked=$1 ")" =
 
 start_stuart
 for p in "${NODES[@]}"; do
-  "$BIN/speedvault-server" "127.0.0.1:$p" --cluster --stuart "127.0.0.1:$S" --loglevel warning 2>>"$DIR/node-$p.log" & PIDS+=($!)
+  "$BIN/speedvault-server" "127.0.0.1:$p" --cluster --stuart "127.0.0.1:$S" --loglevel warning "${AUTH[@]}" 2>>"$DIR/node-$p.log" & PIDS+=($!)
 done
 wait_for "the 3 nodes joined and are up" nodes_up 0
+if [ ${#AUTH[@]} -gt 0 ]; then
+  check "stuart without the password" "NOAUTH Authentication required." "$(env -u REDISCLI_AUTH redis-cli -p "$S" stuart nodes)"
+  check "a node without the password" "NOAUTH Authentication required." "$(env -u REDISCLI_AUTH redis-cli -p "${NODES[0]}" get foo)"
+  check "a wrong password" "AUTH failed: WRONGPASS invalid username-password pair or user is disabled." "$(REDISCLI_AUTH=wrong redis-cli -p "${NODES[0]}" get foo 2>&1 | head -1)"
+fi
 check "STUART CREATE" OK "$(redis-cli -p "$S" stuart create)"
 wait_for "every node took table epoch 1" epochs_are 1
 wait_for "stuart knows" nodes_up 1
@@ -101,7 +109,7 @@ old_id=$(redis-cli -p "$p" cluster myid)
 range=$(redis-cli -p "$S" stuart table | awk -v id="$old_id" '$1 == id {print $NF}')   # e.g. 10923-16383
 first=${range%-*}; last=${range#*-}
 kill -KILL "${PIDS[$owner]}"; wait "${PIDS[$owner]}" 2>/dev/null || true
-"$BIN/speedvault-server" "127.0.0.1:$p" --cluster --stuart "127.0.0.1:$S" --loglevel warning 2>>"$DIR/node-$p.log" & PIDS[$owner]=$!
+"$BIN/speedvault-server" "127.0.0.1:$p" --cluster --stuart "127.0.0.1:$S" --loglevel warning "${AUTH[@]}" 2>>"$DIR/node-$p.log" & PIDS[$owner]=$!
 new_id_joined() { new_id=$(redis-cli -p "$p" cluster myid 2>/dev/null) && [ -n "$new_id" ] && [ "$new_id" != "$old_id" ] &&
   redis-cli -p "$S" stuart nodes | grep -q "^$new_id "; }
 wait_for "the restarted node joined with a new id" new_id_joined

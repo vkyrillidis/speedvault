@@ -41,6 +41,27 @@ What real clients send on connect (captured from Redis, see
 - **redis-cli** sends `HELLO 3` with `-3`, and `COMMAND DOCS` when
   interactive (an error reply makes it fall back).
 
+**Passwords** (`AUTH`, after the Redis 8.10.2 milestone) copy Redis
+8.10.2's `requirepass`: the order of the checks (unknown command and
+arity before `-NOAUTH`; in `HELLO`, the version, then each option, a bad
+name before the password, then the login), `AUTH`'s replies with and
+without a password (`default` is the one user, case-sensitive; the
+internal-connection user name gets Redis's errors), the 10-argument and
+16 KiB limits on requests before the login, and that changing the
+password keeps clients logged in. Deliberately different:
+
+- A failed `AUTH` always gets `-WRONGPASS`. Redis 8.10.2 sends no reply at
+  all to one while replies are pending (`addAuthErrReply` returns if
+  `clientHasPendingReplies`): a client pipelining it gets one reply too few,
+  and every later reply answers the wrong request.
+- In cluster mode `CONFIG SET requirepass` is refused: the password is the
+  cluster's (the nodes and stuart log in to each other with it), set when
+  they start.
+- No `ACL`, no users but `default`, no `RESET`; `INFO stats` has only
+  `acl_access_denied_auth` of the ACL counters.
+- Redis 8.10.2 never answers a bad bulk length whose line ends in a later
+  read (an unauthenticated one too); we reply its error, as 7.0.15 does.
+
 Being faster than Redis comes in two steps: on one core, through cheaper I/O
 (fibers, edge-triggered epoll, batched writes; see
 [performance](../performance.md) for how the first run, 0.84–0.94× Redis

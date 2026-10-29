@@ -11,10 +11,15 @@ per-case normalisers).
   python3 difftest.py --list
   python3 difftest.py --show --target 127.0.0.1:7000 -k hello_3   # just print transcripts
 
+  # AUTH: both servers started with the password "pw" (Redis --requirepass pw,
+  # ours --requirepass pw): runs only the cases tagged "auth", which need it
+  python3 difftest.py --ref 127.0.0.1:6379 --target 127.0.0.1:7000 --password pw
+
 Cases with `expected=` are compared against those bytes instead of the
 reference server.
 
-Before each case both servers get a FLUSHALL on a separate connection.
+Before each case both servers get a FLUSHALL on a separate connection
+(after AUTH with --password).
 
 Exit status: 0 if every case matched or is allow-listed (allowlist.py),
 1 otherwise, 2 on usage errors.
@@ -40,14 +45,20 @@ END_CHECK = 0.03
 
 
 class Runner:
-    def __init__(self, addr: str, timeout_scale: float = 1.0):
+    def __init__(self, addr: str, timeout_scale: float = 1.0, password: Optional[str] = None):
         self.host, self.port = parse_addr(addr)
         self.addr = addr
         self.scale = timeout_scale
+        self.password = password
 
     def flushall(self) -> Optional[str]:
         try:
             with Conn(self.host, self.port, timeout=5) as c:
+                if self.password is not None:
+                    c.send(cmd("AUTH", self.password))
+                    raw, _ = c.read_reply()
+                    if raw != b"+OK\r\n":
+                        return f"AUTH replied {raw!r}"
                 c.send(cmd("FLUSHALL"))
                 raw, _ = c.read_reply()
                 if raw != b"+OK\r\n":
@@ -225,9 +236,11 @@ def main(argv=None) -> int:
     ap.add_argument("-v", "--verbose", action="store_true", help="print full transcripts of failing cases")
     ap.add_argument("--json", help="write results to this file")
     ap.add_argument("--list", action="store_true", help="list the selected cases and exit")
+    ap.add_argument("--password", help="the servers' password: run only the cases tagged auth (which need it)")
     args = ap.parse_args(argv)
 
-    cases = select(corpus.CASES, args)
+    # The auth cases need servers with a password; the others, without.
+    cases = [c for c in select(corpus.CASES, args) if ("auth" in c.tags) == (args.password is not None)]
     if args.list:
         for c in cases:
             flags = ",".join(sorted(c.tags | ({"slow"} if c.slow else set())
@@ -246,8 +259,8 @@ def main(argv=None) -> int:
         pat, _, reason = a.partition("=")
         allow[pat] = reason or "(command line)"
 
-    ref = Runner(args.ref, args.timeout_scale) if args.ref else None
-    tgt = Runner(args.target, args.timeout_scale)
+    ref = Runner(args.ref, args.timeout_scale, args.password) if args.ref else None
+    tgt = Runner(args.target, args.timeout_scale, args.password)
     flush = not args.no_flush
     print(f"difftest: {len(cases)} cases, ref={args.ref}, target={args.target}, flush={flush}")
 
@@ -320,7 +333,7 @@ def main(argv=None) -> int:
     print(f"\n{summary}  ({dt:.1f}s)")
     if args.json:
         with open(args.json, "w") as f:
-            json.dump({"ref": args.ref, "target": args.target, "mode": mode, "counts": counts, "results": results}, f,
+            json.dump({"ref": args.ref, "target": args.target, "auth": args.password is not None, "counts": counts, "results": results}, f,
                       indent=1)
     return 1 if counts["FAIL"] else 0
 

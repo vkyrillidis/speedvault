@@ -75,8 +75,13 @@ See [running a cluster](docs/cluster.md) and [Kubernetes](docs/kubernetes.md)
   SUNIONCARD SDIFFCARD SSCAN`.
 - **Lists:** `LPUSH RPUSH LPUSHX RPUSHX LPOP RPOP LLEN LRANGE LINDEX LSET
   LINSERT LREM LTRIM LPOS LMOVE LMOVEM RPOPLPUSH LMPOP`.
-- **Connection and server:** `PING ECHO HELLO SELECT 0 QUIT CLIENT COMMAND
-  INFO`, `CONFIG GET` and `SET`.
+- **Connection and server:** `PING ECHO HELLO AUTH SELECT 0 QUIT CLIENT
+  COMMAND INFO`, `CONFIG GET` and `SET`.
+- **A password:** `--requirepass-file PATH` (or `--requirepass`), Redis's
+  `requirepass`: clients `AUTH` (or `HELLO 3 AUTH default ...`) first. A
+  cluster has one: every node and stuart take it, log in to each other
+  with it, and stuart's port requires it too; `/metrics` and the probes
+  stay open. There are no ACL users.
 - **Cluster:** `CLUSTER SLOTS SHARDS NODES INFO MYID MYSHARDID KEYSLOT COUNTKEYSINSLOT
   GETKEYSINSLOT`, `ASKING READONLY READWRITE`, with `-MOVED`, `-ASK` and
   `-TRYAGAIN` redirects as Redis Cluster sends them.
@@ -85,8 +90,8 @@ See [running a cluster](docs/cluster.md) and [Kubernetes](docs/kubernetes.md)
 - **Memory:** `--maxmemory` with Redis's `noeviction` (`-OOM` on writes past
   it). Small hashes, sets and lists are packed as Redis packs them.
 
-Not yet: authentication (`AUTH`), TLS, sorted sets, blocking list
-commands, pub/sub, transactions, scripting, eviction policies other than
+Not yet: TLS, ACL users, sorted sets, blocking list commands, pub/sub,
+transactions, scripting, eviction policies other than
 `noeviction`, and databases other than 0. There is no persistence (RDB or
 AOF) by design: replicas keep the data, and a pod stopping hands over to
 its replica first. Replies are checked against Redis
