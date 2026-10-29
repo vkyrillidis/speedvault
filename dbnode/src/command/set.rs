@@ -166,6 +166,50 @@ pub(super) fn sintercard(args: &Args, store: &mut Store, out: &mut Encoder) -> F
     integer_reply(store.sintercard(&keys, limit).map(|n| n as i64), out)
 }
 
+/// `SUNIONCARD numkeys key [key ...] [APPROX] [LIMIT limit]` (Redis
+/// 8.10) and `SDIFFCARD numkeys key [key ...] [LIMIT limit]`, which takes
+/// no `APPROX`.
+pub(super) fn card(args: &Args, store: &mut Store, out: &mut Encoder, op: SetOp) -> Flow {
+    let numkeys = match parse_i64(&args[1]) {
+        Some(n) if n >= 1 => n as u64,
+        _ => {
+            out.error(b"ERR numkeys should be greater than 0");
+            return Flow::Continue;
+        }
+    };
+    if numkeys > args.len() as u64 - 2 {
+        out.error(b"ERR Number of keys can't be greater than number of args");
+        return Flow::Continue;
+    }
+    let keys_end = 2 + numkeys as usize;
+    let (mut limit, mut approx) = (0, false);
+    let mut i = keys_end;
+    while i < args.len() {
+        if args[i].eq_ignore_ascii_case(b"limit") && i + 1 < args.len() {
+            i += 1;
+            match parse_i64(&args[i]) {
+                Some(n) if n >= 0 => limit = n as usize,
+                _ => {
+                    out.error(b"ERR LIMIT can't be negative");
+                    return Flow::Continue;
+                }
+            }
+        } else if op == SetOp::Union && args[i].eq_ignore_ascii_case(b"approx") {
+            approx = true;
+        } else {
+            syntax_error(out);
+            return Flow::Continue;
+        }
+        i += 1;
+    }
+    let keys: Vec<&[u8]> = args.iter().skip(2).take(keys_end - 2).collect();
+    let n = match op {
+        SetOp::Union => store.sunioncard(&keys, approx, limit),
+        _ => store.sdiffcard(&keys, limit),
+    };
+    integer_reply(n.map(|n| n as i64), out)
+}
+
 /// `SUNIONSTORE`, `SINTERSTORE`, `SDIFFSTORE`.
 pub(super) fn combine_store(args: &Args, store: &mut Store, out: &mut Encoder, op: SetOp) -> Flow {
     integer_reply(store.combine_store(op, &args[1], &members_of(args, 2)).map(|n| n as i64), out)

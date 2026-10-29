@@ -91,7 +91,7 @@ impl Store {
     pub fn hincr_by_float(&mut self, key: &[u8], field: &[u8], incr: &[u8]) -> Result<Vec<u8>, Error> {
         let incr = match float::parse(incr) {
             None => return Err(Error::NotFloat),
-            Some(Number::Infinite) => return Err(Error::NanOrInfinity),
+            Some(Number::Infinite(_)) => return Err(Error::NanOrInfinity),
             Some(incr) => incr,
         };
         // Creating first is safe: only a field already there can fail.

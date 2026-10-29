@@ -1,7 +1,7 @@
 use std::fmt;
 
 /// Why a command failed. `Display` gives Redis's exact message (checked
-/// against Redis 7.0.15), so the dbnode replies `-{error}`.
+/// against Redis 8.10.2), so the dbnode replies `-{error}`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The key holds a value of another type (a list where a string was
@@ -37,6 +37,24 @@ pub enum Error {
     NoSuchKey,
     /// `LSET` past the end of the list.
     IndexOutOfRange,
+    /// A digest to compare with (`IFDEQ`, `IFDNE`) that isn't 16 bytes.
+    DigestLength,
+    /// `DELEX` with a condition, of a key that isn't a string.
+    DelexNotString,
+    /// An option Redis doesn't know, or not at that place.
+    Syntax,
+    /// `INCREX`'s errors (Redis 8.8), with Redis's messages.
+    IncrexNotInteger,
+    IncrexNotFloat,
+    IncrexInfinite,
+    /// `LBOUND` or `UBOUND` (named) that isn't a float or an integer.
+    BoundNotFloat(&'static str),
+    BoundNotInteger(&'static str),
+    BoundsReversed,
+    EnxWithoutExpiry,
+    ValueInfinite,
+    AppliedInfinite,
+    AppliedOverflow,
 }
 
 impl fmt::Display for Error {
@@ -57,6 +75,19 @@ impl fmt::Display for Error {
             Error::NotFinite => f.write_str("ERR increment would produce NaN or Infinity"),
             Error::NoSuchKey => f.write_str("ERR no such key"),
             Error::IndexOutOfRange => f.write_str("ERR index out of range"),
+            Error::DigestLength => f.write_str("ERR must be exactly 16 hexadecimal characters"),
+            Error::DelexNotString => f.write_str("ERR Key should be of string type if conditions are specified"),
+            Error::Syntax => f.write_str("ERR syntax error"),
+            Error::IncrexNotInteger => f.write_str("ERR Increment is not an integer or out of range"),
+            Error::IncrexNotFloat => f.write_str("ERR Increment is not a valid float"),
+            Error::IncrexInfinite => f.write_str("ERR BYFLOAT increment cannot be Infinity"),
+            Error::BoundNotFloat(bound) => write!(f, "ERR {bound} is not a valid float"),
+            Error::BoundNotInteger(bound) => write!(f, "ERR {bound} is not an integer or out of range"),
+            Error::BoundsReversed => f.write_str("ERR LBOUND can't be greater than UBOUND"),
+            Error::EnxWithoutExpiry => f.write_str("ERR ENX flag requires an expiration"),
+            Error::ValueInfinite => f.write_str("ERR value cannot be Infinity"),
+            Error::AppliedInfinite => f.write_str("ERR applied increment would be Infinity"),
+            Error::AppliedOverflow => f.write_str("ERR applied increment would overflow"),
         }
     }
 }

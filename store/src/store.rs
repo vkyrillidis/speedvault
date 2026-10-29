@@ -193,6 +193,24 @@ pub enum SetCond {
     Nx,
     /// `XX`: only if the key exists.
     Xx,
+    /// `IFEQ value` (Redis 8.4): only if the key holds this string; the
+    /// value is given to [`Store::set_if`].
+    IfEq,
+    /// `IFNE value`: unless the key holds this string (a missing key is
+    /// set).
+    IfNe,
+    /// `IFDEQ digest`: only if the string's [`digest`](Store::digest) is
+    /// this one (16 hex digits, either case).
+    IfDeq,
+    /// `IFDNE digest`: unless it is (a missing key is set).
+    IfDne,
+}
+
+impl SetCond {
+    /// Whether it compares the key's value (`IFEQ` and the others).
+    fn matches(self) -> bool {
+        matches!(self, SetCond::IfEq | SetCond::IfNe | SetCond::IfDeq | SetCond::IfDne)
+    }
 }
 
 /// The options of `SET`, parsed by the dbnode (which also rejects the
@@ -294,6 +312,32 @@ pub struct Store {
     /// `KEYS`, `SCAN`), as Redis 8 hides a slot it imports. In order;
     /// usually empty.
     held: Vec<u16>,
+}
+
+/// Whether `value` satisfies an `IFEQ`, `IFNE`, `IFDEQ` or `IFDNE`
+/// condition with `matching`: the value compared byte for byte, the digest
+/// as hex in either case (after checking it's 16 bytes).
+fn value_matches(value: &[u8], cond: SetCond, matching: &[u8]) -> Result<bool, Error> {
+    Ok(match cond {
+        SetCond::IfEq => value == matching,
+        SetCond::IfNe => value != matching,
+        SetCond::IfDeq | SetCond::IfDne => {
+            if matching.len() != 16 {
+                return Err(Error::DigestLength);
+            }
+            let same = crate::xxh3::digest(value).eq_ignore_ascii_case(matching);
+            same == (cond == SetCond::IfDeq)
+        }
+        _ => unreachable!("a condition on the value"),
+    })
+}
+
+/// `INCREX`'s reply: the new value and the increment applied, integers or
+/// floats (written as `INCRBYFLOAT` writes them).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IncrexReply {
+    Ints(i64, i64),
+    Floats(Vec<u8>, Vec<u8>),
 }
 
 /// What a write did, when it isn't what the command says as sent, or a key
@@ -432,9 +476,15 @@ impl Store {
 
     /// `SET` with its options; see [`SetReply`] for what it returns.
     pub fn set(&mut self, key: &[u8], value: &[u8], opts: SetOptions) -> Result<SetReply, Error> {
+        self.set_if(key, value, opts, b"")
+    }
+
+    /// [`set`](Self::set) with an `IFEQ`, `IFNE`, `IFDEQ` or `IFDNE`
+    /// condition (`opts.cond`), `matching` the value or digest it names.
+    pub fn set_if(&mut self, key: &[u8], value: &[u8], opts: SetOptions, matching: &[u8]) -> Result<SetReply, Error> {
         // As in Redis: a bad expiry first, then the type check of GET, then
-        // the condition.
-        let at = self.expire_at_for_set(opts.expiry)?;
+        // the condition: whether the key exists, then its type and value.
+        let at = self.expire_at_for(opts.expiry, "set")?;
         let now = self.now;
         // With an expiry the effect is the absolute time, or a delete.
         let recorded = at.is_some() && self.effects.is_some();
@@ -444,11 +494,14 @@ impl Store {
                 e.as_str()?;
             }
         }
-        let blocked = match opts.cond {
-            SetCond::Always => false,
+        let mut blocked = match opts.cond {
+            SetCond::Always | SetCond::IfNe | SetCond::IfDne => false,
             SetCond::Nx => entry.is_some(),
-            SetCond::Xx => entry.is_none(),
+            SetCond::Xx | SetCond::IfEq | SetCond::IfDeq => entry.is_none(),
         };
+        if let Some(e) = entry.as_ref().filter(|_| opts.cond.matches()) {
+            blocked = !value_matches(e.as_str()?, opts.cond, matching)?;
+        }
         if blocked {
             let reply = match entry {
                 _ if !opts.get => SetReply::NotSet,
@@ -498,9 +551,239 @@ impl Store {
         Ok(if opts.get { SetReply::Old(old) } else { SetReply::Ok })
     }
 
-    /// The absolute expiry time `SET` asks for, checked like Redis does: the
-    /// number must be positive and the time must fit an `i64`.
-    fn expire_at_for_set(&self, expiry: SetExpiry) -> Result<Option<i64>, Error> {
+    /// `DIGEST`: the string's XXH3 hash, as 16 lowercase hex digits (Redis
+    /// 8.4); `None` for a missing key.
+    pub fn digest(&mut self, key: &[u8]) -> Result<Option<[u8; 16]>, Error> {
+        match self.live(key) {
+            Some(e) => Ok(Some(crate::xxh3::digest(e.as_str()?))),
+            None => Ok(None),
+        }
+    }
+
+    /// `DELEX key [IFEQ|IFNE|IFDEQ|IFDNE value]` (Redis 8.4), `cond` the
+    /// condition (`Always`: none, a plain `DEL`): whether the key went. A
+    /// missing key is no error; with a condition, a key of another type is.
+    pub fn delex(&mut self, key: &[u8], cond: SetCond, matching: &[u8]) -> Result<bool, Error> {
+        if !cond.matches() {
+            return Ok(self.del(key));
+        }
+        let Some(e) = self.live(key) else { return Ok(false) };
+        let value = e.as_str().map_err(|_| Error::DelexNotString)?;
+        if !value_matches(value, cond, matching)? {
+            return Ok(false);
+        }
+        Ok(self.remove(key).is_some())
+    }
+
+    /// `MSETEX numkeys key value ... [NX|XX] [EX|PX|EXAT|PXAT n|KEEPTTL]`
+    /// (Redis 8.4): every pair set, with one expiry, unless `NX` finds a
+    /// key or `XX` misses one (then none is, and it's false). The expiry is
+    /// checked first, then every key, then they're set.
+    pub fn msetex(&mut self, pairs: &[(&[u8], &[u8])], cond: SetCond, expiry: SetExpiry) -> Result<bool, Error> {
+        self.expire_at_for(expiry, "msetex")?;
+        for (key, _) in pairs {
+            let found = self.live(key).is_some();
+            if (cond == SetCond::Nx && found) || (cond == SetCond::Xx && !found) {
+                return Ok(false);
+            }
+        }
+        for (key, value) in pairs {
+            self.set(key, value, SetOptions { expiry, ..SetOptions::default() }).map_err(|e| match e {
+                Error::InvalidExpireTime(_) => Error::InvalidExpireTime("msetex"),
+                e => e,
+            })?;
+        }
+        Ok(true)
+    }
+
+    /// `INCREX key [BYINT n|BYFLOAT f] [LBOUND l] [UBOUND u] [SATURATE]
+    /// [EX|PX|EXAT|PXAT t|PERSIST] [ENX]` (Redis 8.8), `opts` what follows
+    /// the key. Adds to the integer (or float) at `key`, 0 if missing; a
+    /// result past the bounds (or the type's range) leaves the key as it is
+    /// and replies the value and 0, unless `SATURATE` caps it. The TTL is
+    /// kept unless an expiry or `PERSIST` says otherwise; `ENX` sets the
+    /// expiry only on a key without one. The effect is a `SET` of the
+    /// result (`PXAT`, or `KEEPTTL`), a `DEL` if the time had come, nothing
+    /// if refused. Parsed and checked in Redis's order
+    /// (`parseIncrExArgumentsOrReply`, `increxCommand`).
+    pub fn increx(&mut self, key: &[u8], opts: &[&[u8]]) -> Result<IncrexReply, Error> {
+        enum Expiry {
+            Keep,
+            Persist,
+            /// `None` if its number isn't an integer: an error once the
+            /// bounds and ENX are checked, as in Redis.
+            At(Option<SetExpiry>),
+        }
+        let (mut by_int, mut by_float) = (None, None);
+        let (mut lower, mut upper): (Option<&[u8]>, Option<&[u8]>) = (None, None);
+        let (mut saturate, mut enx) = (false, false);
+        let mut expiry = Expiry::Keep;
+        let mut i = 0;
+        while i < opts.len() {
+            let (opt, next) = (opts[i], opts.get(i + 1).copied());
+            let is = |name: &[u8]| opt.eq_ignore_ascii_case(name);
+            let unit: Option<fn(i64) -> SetExpiry> = [&b"ex"[..], b"px", b"exat", b"pxat"]
+                .iter()
+                .position(|name| is(name))
+                .map(|n| [SetExpiry::Ex, SetExpiry::Px, SetExpiry::ExAt, SetExpiry::PxAt][n]);
+            let no_expiry = matches!(expiry, Expiry::Keep);
+            match next {
+                Some(n) if is(b"byint") && by_int.is_none() && by_float.is_none() => {
+                    by_int = Some(parse_i64(n).ok_or(Error::IncrexNotInteger)?);
+                    i += 1;
+                }
+                Some(n) if is(b"byfloat") && by_int.is_none() && by_float.is_none() => {
+                    by_float = Some(match float::parse(n) {
+                        None => return Err(Error::IncrexNotFloat),
+                        Some(Number::Infinite(_)) => return Err(Error::IncrexInfinite),
+                        Some(Number::Finite(f)) => f,
+                    });
+                    i += 1;
+                }
+                Some(n) if is(b"lbound") && lower.is_none() => {
+                    lower = Some(n);
+                    i += 1;
+                }
+                Some(n) if is(b"ubound") && upper.is_none() => {
+                    upper = Some(n);
+                    i += 1;
+                }
+                _ if is(b"saturate") && !saturate => saturate = true,
+                _ if is(b"enx") && !enx && !matches!(expiry, Expiry::Persist) => enx = true,
+                _ if is(b"persist") && no_expiry && !enx => expiry = Expiry::Persist,
+                Some(n) if unit.is_some() && no_expiry => {
+                    expiry = Expiry::At(parse_i64(n).map(unit.expect("matched")));
+                    i += 1;
+                }
+                _ => return Err(Error::Syntax),
+            }
+            i += 1;
+        }
+        // The bounds, by the increment's kind; then ENX; then the expiry.
+        enum Bounds {
+            Ints(i64, i64),
+            Floats(Number, Number),
+        }
+        let bounds = if by_float.is_some() {
+            let parse = |b: Option<&[u8]>, name, default| match b {
+                None => Ok(Number::Finite(default)),
+                Some(b) => float::parse(b).ok_or(Error::BoundNotFloat(name)),
+            };
+            let (lb, ub) = (parse(lower, "LBOUND", LongDouble::MAX.neg())?, parse(upper, "UBOUND", LongDouble::MAX)?);
+            if lb > ub {
+                return Err(Error::BoundsReversed);
+            }
+            Bounds::Floats(lb, ub)
+        } else {
+            let parse = |b: Option<&[u8]>, name, default| b.map_or(Ok(default), |b| parse_i64(b).ok_or(Error::BoundNotInteger(name)));
+            let (lb, ub) = (parse(lower, "LBOUND", i64::MIN)?, parse(upper, "UBOUND", i64::MAX)?);
+            if lb > ub {
+                return Err(Error::BoundsReversed);
+            }
+            Bounds::Ints(lb, ub)
+        };
+        if enx && matches!(expiry, Expiry::Keep) {
+            return Err(Error::EnxWithoutExpiry);
+        }
+        let at = match expiry {
+            Expiry::At(None) => return Err(Error::NotInteger),
+            Expiry::At(Some(e)) => self.expire_at_for(e, "increx")?,
+            _ => None,
+        };
+
+        let now = self.now;
+        let (found, has_ttl, current) = match self.live(key) {
+            Some(e) => (true, e.has_ttl(), Some(e.as_str()?.to_vec())),
+            None => (false, false, None),
+        };
+        let (reply, written) = match bounds {
+            Bounds::Floats(lb, ub) => {
+                let old = match current.as_deref().map(float::parse) {
+                    None => LongDouble::ZERO,
+                    Some(None) => return Err(Error::NotFloat),
+                    Some(Some(Number::Infinite(_))) => return Err(Error::ValueInfinite),
+                    Some(Some(Number::Finite(v))) => v,
+                };
+                let incr = by_float.expect("a float increment");
+                let sum = old.add(incr);
+                let out_of_range = sum.is_none_or(|v| Number::Finite(v) > ub || Number::Finite(v) < lb);
+                let value = if !out_of_range {
+                    Number::Finite(sum.expect("in range"))
+                } else if !saturate {
+                    let mut v = Vec::new();
+                    old.write(&mut v);
+                    self.effect(|| Effect::Nothing);
+                    return Ok(IncrexReply::Floats(v, b"0".to_vec()));
+                } else if sum.is_none() {
+                    if incr.is_negative() { lb } else { ub }
+                } else if sum.is_some_and(|v| Number::Finite(v) > ub) {
+                    ub
+                } else {
+                    lb
+                };
+                let Number::Finite(value) = value else { return Err(Error::AppliedInfinite) };
+                let delta = value.add(old.neg()).ok_or(Error::AppliedInfinite)?;
+                let (mut v, mut d) = (Vec::new(), Vec::new());
+                value.write(&mut v);
+                delta.write(&mut d);
+                (IncrexReply::Floats(v.clone(), d), v)
+            }
+            Bounds::Ints(lb, ub) => {
+                let old = match current.as_deref().map(parse_i64) {
+                    None => 0,
+                    Some(None) => return Err(Error::NotInteger),
+                    Some(Some(v)) => v,
+                };
+                let incr = by_int.unwrap_or(1);
+                let sum = old.checked_add(incr);
+                let value = match sum {
+                    Some(v) if v <= ub && v >= lb => v,
+                    _ if !saturate => {
+                        self.effect(|| Effect::Nothing);
+                        return Ok(IncrexReply::Ints(old, 0));
+                    }
+                    None if incr >= 0 => ub,
+                    None => lb,
+                    Some(v) if v > ub => ub,
+                    Some(_) => lb,
+                };
+                let delta = value.checked_sub(old).ok_or(Error::AppliedOverflow)?;
+                (IncrexReply::Ints(value, delta), value.to_string().into_bytes())
+            }
+        };
+        let set_expiry = at.filter(|_| !enx || !has_ttl);
+        if set_expiry.is_some_and(|at| at <= now) {
+            // The time has come: the key goes (if it was there).
+            if found {
+                self.remove(key);
+            }
+            self.effect(|| if found { Effect::As(vec![b"DEL".to_vec(), key.to_vec()]) } else { Effect::Nothing });
+            return Ok(reply);
+        }
+        match self.live(key) {
+            Some(e) => e.set_str(&written),
+            None => self.insert(key, &written, None),
+        }
+        if matches!(reply, IncrexReply::Floats(..)) {
+            self.live(key).expect("just written").mark_float();
+        }
+        let mut effect = vec![b"SET".to_vec(), key.to_vec(), written];
+        if matches!(expiry, Expiry::Persist) {
+            self.set_ttl(key, None);
+        } else if let Some(at) = set_expiry {
+            self.set_ttl(key, Some(at));
+            effect.extend([b"PXAT".to_vec(), at.to_string().into_bytes()]);
+        } else {
+            effect.push(b"KEEPTTL".to_vec());
+        }
+        self.effect(|| Effect::As(effect));
+        Ok(reply)
+    }
+
+    /// The absolute expiry time `SET` (or `cmd`) asks for, checked like
+    /// Redis does: the number must be positive and the time must fit an
+    /// `i64`.
+    fn expire_at_for(&self, expiry: SetExpiry, cmd: &'static str) -> Result<Option<i64>, Error> {
         let (n, unit, base) = match expiry {
             SetExpiry::Clear | SetExpiry::KeepTtl => return Ok(None),
             SetExpiry::Ex(n) => (n, 1000, self.now),
@@ -509,7 +792,7 @@ impl Store {
             SetExpiry::PxAt(n) => (n, 1, 0),
         };
         let at = n.checked_mul(unit).and_then(|ms| ms.checked_add(base)).filter(|_| n > 0);
-        at.map(Some).ok_or(Error::InvalidExpireTime("set"))
+        at.map(Some).ok_or(Error::InvalidExpireTime(cmd))
     }
 
     /// `MSET`: plain `SET`s, the last one wins for a repeated key.

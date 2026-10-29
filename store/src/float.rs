@@ -30,12 +30,24 @@ const TEN_TO_17: u128 = 100_000_000_000_000_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Number {
     Finite(LongDouble),
-    /// `inf` or `infinity` (a value out of range isn't read at all).
-    Infinite,
+    /// `inf` or `infinity`, negative or not (a value out of range isn't
+    /// read at all).
+    Infinite(bool),
 }
 
 impl LongDouble {
     pub(crate) const ZERO: LongDouble = LongDouble { neg: false, mant: 0, exp: MIN_EXP };
+    /// `LDBL_MAX`.
+    pub(crate) const MAX: LongDouble = LongDouble { neg: false, mant: u64::MAX, exp: MAX_EXP };
+
+    pub(crate) fn neg(self) -> LongDouble {
+        LongDouble { neg: !self.neg, ..self }
+    }
+
+    /// Whether it's below zero (`-0` isn't).
+    pub(crate) fn is_negative(self) -> bool {
+        self.neg && self.mant != 0
+    }
 
     /// `self + other`; `None` if the sum overflows to infinity.
     pub(crate) fn add(self, other: LongDouble) -> Option<LongDouble> {
@@ -130,6 +142,42 @@ impl LongDouble {
     }
 }
 
+impl PartialOrd for LongDouble {
+    fn partial_cmp(&self, other: &LongDouble) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for LongDouble {
+    /// The numbers' order, `-0` equal to `0`.
+    fn cmp(&self, other: &LongDouble) -> Ordering {
+        let sign = |x: &LongDouble| if x.mant == 0 { 0 } else if x.neg { -1 } else { 1 };
+        match sign(self).cmp(&sign(other)) {
+            Ordering::Equal if sign(self) == 0 => Ordering::Equal,
+            Ordering::Equal => {
+                let magnitude = (self.exp, self.mant).cmp(&(other.exp, other.mant));
+                if self.neg { magnitude.reverse() } else { magnitude }
+            }
+            by_sign => by_sign,
+        }
+    }
+}
+
+impl PartialOrd for Number {
+    /// Infinities at the ends.
+    fn partial_cmp(&self, other: &Number) -> Option<Ordering> {
+        let rank = |n: &Number| match n {
+            Number::Infinite(true) => 0,
+            Number::Finite(_) => 1,
+            Number::Infinite(false) => 2,
+        };
+        Some(match (self, other) {
+            (Number::Finite(a), Number::Finite(b)) => a.cmp(b),
+            _ => rank(self).cmp(&rank(other)),
+        })
+    }
+}
+
 impl Number {
     /// `self + other`; `None` if it's infinite.
     pub(crate) fn add(self, other: Number) -> Option<LongDouble> {
@@ -198,7 +246,7 @@ pub(crate) fn parse(s: &[u8]) -> Option<Number> {
         _ => (false, s),
     };
     if s.eq_ignore_ascii_case(b"inf") || s.eq_ignore_ascii_case(b"infinity") {
-        return Some(Number::Infinite);
+        return Some(Number::Infinite(neg));
     }
     let value = match s {
         [b'0', b'x' | b'X', hex @ ..] => parse_hex(neg, hex),
@@ -573,7 +621,7 @@ mod tests {
     #[test]
     fn infinities_and_zeros() {
         for s in ["inf", "-inf", "INF", "Infinity", "+infinity"] {
-            assert_eq!(parse(s.as_bytes()), Some(Number::Infinite), "{s}");
+            assert!(matches!(parse(s.as_bytes()), Some(Number::Infinite(_))), "{s}");
         }
         assert_eq!(parse(b"0e99999999999"), Some(Number::Finite(LongDouble::ZERO)));
         assert_eq!(text(num("-0").add(num("-0")).unwrap()), "0");

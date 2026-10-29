@@ -735,6 +735,80 @@ seq("oom_noeviction", ("SET", "k", "v"), ("SET", "n", "1"), ("CONFIG", "SET", "m
 pipe("oom_pipelined", [("CONFIG", "SET", "maxmemory", "1"), ("SET", "a", "1"), ("GET", "a"), ("INCR", "c"),
                        ("PING",), ("CONFIG", "SET", "maxmemory", "0"), ("INCR", "c")])
 
+# --- Redis 8 (7.2 to 8.10): commands, options, encodings ------------------
+seq("r8_embstr_by_key_length", ("SET", "k", "x" * 40), ("OBJECT", "ENCODING", "k"), ("SET", "k", "x" * 41), ("OBJECT", "ENCODING", "k"),
+    ("SET", "k" * 20, "x" * 21), ("OBJECT", "ENCODING", "k" * 20), ("SET", "k" * 20, "x" * 22), ("OBJECT", "ENCODING", "k" * 20),
+    ("SET", "k", "x" * 30, "EX", "100"), ("OBJECT", "ENCODING", "k"), ("SET", "k", "12"), ("APPEND", "k", "3"),
+    ("OBJECT", "ENCODING", "k"), ("SET", "f", "1.5"), ("INCRBYFLOAT", "f", "1.5"), ("OBJECT", "ENCODING", "f"),
+    ("SET", "f", "4"), ("OBJECT", "ENCODING", "f"))
+seq("r8_list_encodings", ("RPUSH", "l", *["y" * 100 for _ in range(70)]), ("OBJECT", "ENCODING", "l"),
+    ("RPUSH", "l", *["y" * 100 for _ in range(20)]), ("OBJECT", "ENCODING", "l"), ("LTRIM", "l", "0", "50"), ("OBJECT", "ENCODING", "l"),
+    ("LTRIM", "l", "0", "30"), ("OBJECT", "ENCODING", "l"), ("RPUSH", "big", "z" * 9000), ("OBJECT", "ENCODING", "big"),
+    ("RPOP", "big"), ("RPUSH", "m", "a"), ("LSET", "m", "5", "z" * 9000), ("OBJECT", "ENCODING", "m"),
+    ("RPUSH", "n", "a"), ("LINSERT", "n", "BEFORE", "nope", "z" * 9000), ("OBJECT", "ENCODING", "n"))
+seq("r8_set_encodings", ("SADD", "s", "1", "2", "x"), ("OBJECT", "ENCODING", "s"), ("SMEMBERS", "s"), ("SSCAN", "s", "0", "COUNT", "1"),
+    ("SADD", "t", *[f"m{i}" for i in range(128)]), ("OBJECT", "ENCODING", "t"), ("SADD", "t", "m128"), ("OBJECT", "ENCODING", "t"),
+    ("SADD", "u", *[f"m{i}" for i in range(129)]), ("OBJECT", "ENCODING", "u"), ("SADD", "v", "y" * 65), ("OBJECT", "ENCODING", "v"))
+seq("r8_client_setinfo", ("CLIENT", "SETINFO", "lib-name", "redis-py"), ("CLIENT", "SETINFO", "LIB-VER", "5.0.1"),
+    ("CLIENT", "SETINFO", "lib-name", "a b"), ("CLIENT", "SETINFO", "lib-x", "v"), ("CLIENT", "SETINFO", "lib-name"),
+    ("CLIENT", "NO-TOUCH", "on"), ("CLIENT", "NO-TOUCH", "OFF"), ("CLIENT", "NO-TOUCH", "x"))
+seq("r8_sunioncard_sdiffcard", ("SADD", "a", "1", "2", "3", "x"), ("SADD", "b", "3", "4", "y"), ("SET", "str", "v"),
+    ("SUNIONCARD", "2", "a", "b"), ("SUNIONCARD", "3", "a", "b", "nokey", "LIMIT", "3"), ("SUNIONCARD", "2", "a", "b", "APPROX"),
+    ("SUNIONCARD", "2", "a", "b", "approx", "LIMIT", "2"), ("SUNIONCARD", "2", "a", "str"), ("SUNIONCARD", "0", "a"),
+    ("SUNIONCARD", "3", "a", "b"), ("SUNIONCARD", "2", "a", "b", "LIMIT", "-1"), ("SUNIONCARD", "2", "a", "b", "FOO"),
+    ("SDIFFCARD", "2", "a", "b"), ("SDIFFCARD", "2", "a", "a"), ("SDIFFCARD", "2", "nokey", "a"), ("SDIFFCARD", "2", "a", "b", "LIMIT", "1"),
+    ("SDIFFCARD", "2", "a", "b", "APPROX"))
+seq("r8_sunioncard_approx_big", ("SADD", "p", *[f"e{i}" for i in range(6000)]), ("SADD", "q", *[f"e{i}" for i in range(3000, 9000)]),
+    ("SADD", "r", *[str(i) for i in range(0, 2000, 3)]), ("SUNIONCARD", "3", "p", "q", "r", "APPROX"),
+    ("SUNIONCARD", "2", "p", "q", "APPROX", "LIMIT", "5000"), ("SUNIONCARD", "2", "p", "q"), ("SDIFFCARD", "2", "p", "q"))
+seq("r8_digest", *[c for i, n in enumerate([0, 1, 3, 4, 8, 9, 16, 17, 128, 129, 240, 241, 1024, 1025, 3000])
+                   for c in (("SET", f"d{i}", bytes((j * 31 + n) % 256 for j in range(n))), ("DIGEST", f"d{i}"))],
+    ("SET", "i", "12345"), ("DIGEST", "i"), ("DIGEST", "nokey"), ("RPUSH", "l", "a"), ("DIGEST", "l"))
+seq("r8_set_if", ("SET", "k", "v1"), ("SET", "k", "v2", "IFEQ", "v1"), ("SET", "k", "v3", "IFEQ", "no"), ("GET", "k"),
+    ("SET", "k", "v4", "IFNE", "v2"), ("SET", "k", "v5", "IFNE", "zz"), ("SET", "new", "x", "IFEQ", "v"), ("SET", "new", "x", "IFNE", "v"),
+    ("DIGEST", "k"), ("SET", "k", "v6", "IFDEQ", "short"), ("SET", "k", "v6", "IFDNE", "0123456789ABCDEF", "GET"),
+    ("SET", "k", "v7", "IFEQ", "v6", "NX"), ("SET", "k", "v7", "IFEQ", "a", "IFNE", "b"), ("SET", "k", "v7", "IFEQ"),
+    ("RPUSH", "l", "a"), ("SET", "l", "x", "IFEQ", "a"), ("SET", "l", "x", "IFDEQ", "short"), ("SET", "nx2", "x", "IFDEQ", "short"))
+seq("r8_delex", ("SET", "k", "abc"), ("DELEX", "k", "IFEQ", "no"), ("DELEX", "k", "IFNE", "abc"), ("DELEX", "k", "IFEQ", "abc"),
+    ("EXISTS", "k"), ("SET", "k", "abc"), ("DELEX", "k", "IFDEQ", "short"), ("DELEX", "k", "IFDNE", "0000000000000000"),
+    ("DELEX", "k", "FOO", "x"), ("DELEX", "nokey", "FOO", "x"), ("DELEX", "k", "IFEQ"), ("DELEX", "k"), ("RPUSH", "l", "a"),
+    ("DELEX", "l", "IFEQ", "a"), ("DELEX", "l"))
+seq("r8_msetex", ("MSETEX", "2", "a", "1", "b", "2"), ("MGET", "a", "b"), ("MSETEX", "2", "a", "1", "c", "3", "NX"), ("EXISTS", "c"),
+    ("MSETEX", "2", "c", "1", "d", "3", "NX", "EX", "100"), ("TTL", "c"), ("MSETEX", "1", "zz", "1", "XX"),
+    ("MSETEX", "1", "c", "z", "KEEPTTL"), ("TTL", "c"), ("MSETEX", "1", "c", "z"), ("TTL", "c"), ("MSETEX", "0", "a", "1"),
+    ("MSETEX", "x", "a", "1"), ("MSETEX", "2", "a", "1"), ("MSETEX", "1", "a", "1", "GET"), ("MSETEX", "1", "a", "1", "EX", "0"),
+    ("MSETEX", "1", "a", "1", "EX", "x"), ("MSETEX", "1", "a", "1", "NX", "XX"), ("MSETEX", "1", "a", "1", "EXAT", "1"), ("EXISTS", "a"),
+    norm=[at(5, int_range(98, 100)), at(8, int_range(98, 100))])
+seq("r8_increx", ("INCREX", "n"), ("INCREX", "n", "BYINT", "10"), ("INCREX", "n", "BYINT", "100", "UBOUND", "50"),
+    ("INCREX", "n", "BYINT", "100", "UBOUND", "50", "SATURATE"), ("INCREX", "n", "BYINT", "-100", "LBOUND", "0", "SATURATE"),
+    ("SET", "m", "9223372036854775800"), ("INCREX", "m", "BYINT", "100"), ("INCREX", "m", "BYINT", "100", "SATURATE"),
+    ("SET", "m", "-9223372036854775808"), ("INCREX", "m", "BYINT", "1", "UBOUND", "5", "LBOUND", "5", "SATURATE"),
+    ("SET", "m", "9223372036854775807"), ("INCREX", "m", "LBOUND", "-10", "UBOUND", "-5", "SATURATE"),
+    ("INCREX", "x", "BYINT", "a"), ("INCREX", "x", "BYINT", "1", "BYFLOAT", "2"), ("INCREX", "x", "LBOUND", "5", "UBOUND", "1"),
+    ("INCREX", "x", "UBOUND", "1.5"), ("INCREX", "x", "FOO"), ("INCREX", "x", "ENX"), ("INCREX", "x", "PERSIST", "ENX"),
+    ("INCREX", "x", "EX", "0"), ("INCREX", "x", "LBOUND", "9", "UBOUND", "1", "EX", "x"), ("SET", "s", "abc"), ("INCREX", "s"),
+    ("INCREX", "nokey", "BYINT", "5", "UBOUND", "3"), ("EXISTS", "nokey"), ("INCREX", "t", "EX", "100"), ("TTL", "t"),
+    ("INCREX", "t", "EX", "200", "ENX"), ("TTL", "t"), ("INCREX", "t", "PERSIST"), ("TTL", "t"), ("INCREX", "t", "EXAT", "1"),
+    ("EXISTS", "t"), norm=[at(26, int_range(98, 100)), at(28, int_range(98, 100))])
+seq("r8_increx_float", ("INCREX", "f", "BYFLOAT", "1.5"), ("INCREX", "f", "BYFLOAT", "0.1"), ("OBJECT", "ENCODING", "f"),
+    ("INCREX", "f", "BYFLOAT", "10", "UBOUND", "5"), ("INCREX", "f", "BYFLOAT", "10", "UBOUND", "5", "SATURATE"),
+    ("INCREX", "f", "BYFLOAT", "-100", "LBOUND", "-2.5", "SATURATE"), ("INCREX", "f", "BYFLOAT", "inf"), ("INCREX", "f", "BYFLOAT", "x"),
+    ("INCREX", "f", "BYFLOAT", "1", "UBOUND", "-inf"), ("SET", "g", "1e4932"), ("INCREX", "g", "BYFLOAT", "1e4932"),
+    ("INCREX", "g", "BYFLOAT", "1e4932", "SATURATE"), ("STRLEN", "g"), ("SET", "g", "inf"), ("INCREX", "g", "BYFLOAT", "1"),
+    ("SET", "g", "-1e4932"), ("INCREX", "g", "BYFLOAT", "-1e4932", "SATURATE", "UBOUND", "1e4932"),
+    ("HELLO", "3"), ("INCREX", "f", "BYFLOAT", "0.25"), ("INCREX", "n3"), norm=[at(17, mask_hello)])
+seq("r8_lmovem", ("RPUSH", "s", "a", "b", "c", "d", "e"), ("LMOVEM", "s", "d", "LEFT", "RIGHT"),
+    ("LMOVEM", "s", "d", "LEFT", "RIGHT", "COUNT", "2", "BULK"), ("LMOVEM", "s", "d", "RIGHT", "LEFT", "COUNT", "5", "OBO"),
+    ("LRANGE", "d", "0", "-1"), ("EXISTS", "s"), ("RPUSH", "s", "1", "2", "3", "4"), ("LMOVEM", "s", "d", "RIGHT", "LEFT", "COUNT", "3", "BULK"),
+    ("LMOVEM", "d", "d", "LEFT", "RIGHT", "COUNT", "3", "OBO"), ("LRANGE", "d", "0", "-1"),
+    ("LMOVEM", "d", "e", "LEFT", "LEFT", "EXACTLY", "100", "BULK"), ("LMOVEM", "d", "e", "LEFT", "LEFT", "EXACTLY", "3", "BULK"),
+    ("LMOVEM", "nokey", "e", "LEFT", "LEFT"), ("LMOVEM", "e", "d", "UP", "LEFT"), ("LMOVEM", "e", "d", "LEFT", "LEFT", "COUNT", "0", "OBO"),
+    ("LMOVEM", "e", "d", "LEFT", "LEFT", "COUNT", "1"), ("LMOVEM", "e", "d", "LEFT", "LEFT", "COUNT", "1", "ALL"),
+    ("SET", "str", "v"), ("LMOVEM", "e", "str", "LEFT", "LEFT"), ("LMOVEM", "nokey", "str", "LEFT", "LEFT"))
+for _c in [("MSETEX", "1", "k"), ("DELEX",), ("DIGEST",), ("DIGEST", "a", "b"), ("INCREX",), ("SUNIONCARD", "1"),
+           ("SDIFFCARD", "1"), ("LMOVEM", "a", "b", "LEFT")]:
+    seq("arity_" + "_".join(a.lower() for a in _c), _c)
+
 # --- unknown commands ----------------------------------------------------
 seq("unknown_command", ("FOO",), ("FOO", "a", "b"), ("foo", "x y"))
 seq("unknown_command_long_arg", ("FOO", "x" * 300, "y"))

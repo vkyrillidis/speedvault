@@ -202,10 +202,11 @@ fn the_backlog_keeps_the_last_bytes() {
 
 #[test]
 fn write_flags_are_redis_s() {
-    // Redis 7.0.15's COMMAND INFO: the commands flagged `write`, of ours.
+    // Redis 8.10.2's COMMAND INFO: the commands flagged `write`, of ours.
     let redis = "set del incr mset decr incrby decrby incrbyfloat setnx getdel append expire pexpire expireat pexpireat \
                  persist flushall flushdb hset hdel hmset hincrby hsetnx hincrbyfloat sadd srem spop smove sunionstore \
-                 sinterstore sdiffstore lpush rpush lpop rpop lset linsert lrem ltrim lpushx rpushx lmove rpoplpush lmpop";
+                 sinterstore sdiffstore lpush rpush lpop rpop lset linsert lrem ltrim lpushx rpushx lmove rpoplpush lmpop \
+                 delex increx lmovem msetex";
     let ours: BTreeSet<&str> = COMMANDS.iter().filter(|c| c.write).map(|c| c.name).collect();
     assert_eq!(ours, redis.split_whitespace().collect());
     assert!(COMMANDS.iter().all(|c| c.subcommands.iter().all(|s| !s.write)));

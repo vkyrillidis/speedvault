@@ -214,6 +214,50 @@ impl Store {
     }
 }
 
+impl Store {
+    /// `LMOVEM src dst LEFT|RIGHT LEFT|RIGHT [COUNT|EXACTLY n OBO|BULK]`
+    /// (Redis 8.10): up to `count` elements (exactly, or none, with
+    /// `exactly`) moved from `src`'s `from` end to `dst`'s `to` end, in the
+    /// order they now have in `dst`, which is also the reply's; `None` if
+    /// nothing moved. The block keeps its order in the source (`BULK`), or
+    /// each element is pushed as popped (`obo`). As Redis's
+    /// `lmovemMoveAndReply`: popped one by one, the destination's encoding
+    /// converted once for the block; the source converts back only when the
+    /// destination is another key.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lmovem(&mut self, src: &[u8], dst: &[u8], from: End, to: End, count: usize, exactly: bool, obo: bool) -> Result<Option<Vec<Box<[u8]>>>, Error> {
+        let len = self.list_at(src)?.map_or(0, List::len);
+        let n = match exactly {
+            true if len < count => return Ok(None),
+            _ => count.min(len),
+        };
+        if n == 0 {
+            return Ok(None);
+        }
+        self.list_at(dst)?;
+        let l = self.list_mut(src)?.expect("not empty");
+        let mut moved: Vec<Box<[u8]>> = (0..n).map(|_| if from == End::Left { l.pop_front() } else { l.pop_back() }.expect("counted")).collect();
+        if if obo { to == End::Left } else { from == End::Right } {
+            moved.reverse();
+        }
+        if src != dst && self.list_mut(dst)?.is_none() {
+            self.insert_value(dst, Value::List(Box::default()), None);
+        }
+        let d = self.list_mut(dst)?.expect("made above");
+        d.grow(moved.iter().map(|e| &e[..]));
+        if to == End::Left {
+            moved.iter().rev().for_each(|e| d.push_front(e));
+        } else {
+            moved.iter().for_each(|e| d.push_back(e));
+        }
+        if src != dst {
+            self.list_mut(src)?.expect("still there").shrink();
+            self.drop_if_empty(src);
+        }
+        Ok(Some(moved))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::{put_other, store};

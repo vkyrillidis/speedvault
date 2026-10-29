@@ -39,8 +39,9 @@ pub(crate) struct Command {
     /// the end) and step; `(0, 0, 0)` for none, and for a `movable` command.
     pub(crate) keys: (i32, i32, i32),
     /// Redis's `movablekeys`, the one kind there is so far (`SINTERCARD`,
-    /// `LMPOP`): `args[1]` is how many keys follow it.
-    pub(crate) movable: bool,
+    /// `LMPOP`, `MSETEX`): `args[1]` is how many keys follow it, this many
+    /// arguments apart (2 for `MSETEX`'s key and value pairs); 0 if not.
+    pub(crate) movable: i32,
     run: Run,
     /// Redis's `denyoom` flag: refused while the node uses more than
     /// `maxmemory` (the commands that may add memory).
@@ -66,12 +67,17 @@ const KEY: (i32, i32, i32) = (1, 1, 1);
 const ALL_KEYS: (i32, i32, i32) = (1, -1, 1);
 
 const fn data(name: &'static str, arity: i32, keys: (i32, i32, i32), run: fn(&Args, &mut Store, &mut Encoder) -> Flow) -> Command {
-    Command { name, arity, keys, run: Run::Data(run), denyoom: false, write: false, movable: false, subcommands: &[] }
+    Command { name, arity, keys, run: Run::Data(run), denyoom: false, write: false, movable: 0, subcommands: &[] }
 }
 
 /// A data command whose keys follow a count at `args[1]`.
 const fn movable(name: &'static str, arity: i32, run: fn(&Args, &mut Store, &mut Encoder) -> Flow) -> Command {
-    Command { movable: true, ..data(name, arity, NO_KEYS, run) }
+    Command { movable: 1, ..data(name, arity, NO_KEYS, run) }
+}
+
+/// [`movable`], each key followed by a value.
+const fn movable_pairs(name: &'static str, arity: i32, run: fn(&Args, &mut Store, &mut Encoder) -> Flow) -> Command {
+    Command { movable: 2, ..data(name, arity, NO_KEYS, run) }
 }
 
 /// `cmd`, flagged `denyoom` (and `write`).
@@ -89,7 +95,7 @@ pub(crate) const fn conn(
     arity: i32,
     run: fn(&Args, &Node, &Client, &mut Encoder) -> Flow,
 ) -> Command {
-    Command { name, arity, keys: NO_KEYS, run: Run::Conn(run), denyoom: false, write: false, movable: false, subcommands: &[] }
+    Command { name, arity, keys: NO_KEYS, run: Run::Conn(run), denyoom: false, write: false, movable: 0, subcommands: &[] }
 }
 
 /// A container command. `run` handles it without a subcommand, where its
@@ -100,13 +106,18 @@ const fn container(
     run: fn(&Args, &Node, &Client, &mut Encoder) -> Flow,
     subcommands: &'static [Command],
 ) -> Command {
-    Command { name, arity, keys: NO_KEYS, run: Run::Conn(run), denyoom: false, write: false, movable: false, subcommands }
+    Command { name, arity, keys: NO_KEYS, run: Run::Conn(run), denyoom: false, write: false, movable: 0, subcommands }
 }
 
 /// Looked up front to back: the hot commands first.
 pub(crate) const COMMANDS: &[Command] = &[
     data("get", 2, KEY, get),
     denyoom(data("set", -3, KEY, set)),
+    denyoom(movable_pairs("msetex", -4, msetex)),
+    write(data("delex", -2, KEY, delex)),
+    data("digest", 2, KEY, digest),
+    denyoom(data("increx", -2, KEY, increx)),
+    denyoom(data("lmovem", -5, (1, 2, 1), list::lmovem)),
     write(data("del", -2, ALL_KEYS, del)),
     data("ping", -1, NO_KEYS, ping),
     denyoom(data("incr", 2, KEY, |args, store, out| incr(args, store, out, 1))),
@@ -180,6 +191,8 @@ pub(crate) const COMMANDS: &[Command] = &[
     denyoom(data("sinterstore", -3, ALL_KEYS, |args, store, out| set::combine_store(args, store, out, SetOp::Inter))),
     denyoom(data("sdiffstore", -3, ALL_KEYS, |args, store, out| set::combine_store(args, store, out, SetOp::Diff))),
     movable("sintercard", -3, set::sintercard),
+    movable("sunioncard", -3, |args, store, out| set::card(args, store, out, SetOp::Union)),
+    movable("sdiffcard", -3, |args, store, out| set::card(args, store, out, SetOp::Diff)),
     denyoom(data("lpush", -3, KEY, |args, store, out| list::push(args, store, out, End::Left, false))),
     denyoom(data("rpush", -3, KEY, |args, store, out| list::push(args, store, out, End::Right, false))),
     write(data("lpop", -2, KEY, |args, store, out| list::pop(args, store, out, End::Left, "lpop"))),
@@ -331,11 +344,14 @@ impl Command {
     /// does (its `getkeys` procedure); a count below 1 or past the
     /// arguments means no keys, and the command then fails by itself.
     pub(crate) fn key_range(&self, args: &Args) -> Option<(i32, i32, i32)> {
-        if !self.movable {
+        if self.movable == 0 {
             return (self.keys != NO_KEYS).then_some(self.keys);
         }
         let n = parse_i64(&args[1]).unwrap_or_else(|| i64::from(atoi(&args[1])));
-        (1..=args.len() as i64 - 2).contains(&n).then(|| (2, 1 + n as i32, 1))
+        let step = i64::from(self.movable);
+        // The last key must be an argument (Redis's keynum key spec).
+        let last = n.checked_sub(1).and_then(|k| k.checked_mul(step)).and_then(|k| k.checked_add(2));
+        last.filter(|&last| n >= 1 && last < args.len() as i64).map(|last| (2, last as i32, step as i32))
     }
 
     /// Whether `name` is this command's short name (after the `|` of a
@@ -442,18 +458,8 @@ fn get(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {
 }
 
 fn set(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {
-    let opts = match set_options(args) {
-        Ok(opts) => opts,
-        Err(SetOptionError::Syntax) => {
-            syntax_error(out);
-            return Flow::Continue;
-        }
-        Err(SetOptionError::NotInteger) => {
-            store_error(store::Error::NotInteger, out);
-            return Flow::Continue;
-        }
-    };
-    match store.set(&args[1], &args[2], opts) {
+    let Some((opts, matching)) = set_options_or_reply(args, 3, true, out) else { return Flow::Continue };
+    match store.set_if(&args[1], &args[2], opts, matching) {
         Ok(SetReply::Ok) => out.ok(),
         Ok(SetReply::NotSet | SetReply::Old(None)) => out.null(),
         Ok(SetReply::Old(Some(old))) => out.bulk(&old),
@@ -462,18 +468,36 @@ fn set(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {
     Flow::Continue
 }
 
+/// [`set_options`], or the error replied and `None`.
+fn set_options_or_reply<'a>(args: &Args<'a>, from: usize, set: bool, out: &mut Encoder) -> Option<(SetOptions, &'a [u8])> {
+    match set_options(args, from, set) {
+        Ok(parsed) => Some(parsed),
+        Err(SetOptionError::Syntax) => {
+            syntax_error(out);
+            None
+        }
+        Err(SetOptionError::NotInteger) => {
+            store_error(store::Error::NotInteger, out);
+            None
+        }
+    }
+}
+
 enum SetOptionError {
     Syntax,
     NotInteger,
 }
 
-/// The options after `SET key value`, with Redis 7.0's rules: `NX` and `XX`
-/// exclude each other, `KEEPTTL` and the four expiry options exclude each
-/// other, but repeating one is fine (the last value wins). Any other word,
-/// or an expiry option without a value, is a syntax error. Only once all
-/// options are known is the expiry value read as an integer; whether it's in
-/// range is the store's to check.
-fn set_options(args: &Args) -> Result<SetOptions, SetOptionError> {
+/// The options of `SET key value` (from `args[from]`), or of `MSETEX`
+/// without `set` (which takes no `GET` and no `IF...`), with Redis 8's
+/// rules (`parseExtendedStringArgumentsOrReply`): `NX`, `XX`, `IFEQ`,
+/// `IFNE`, `IFDEQ` and `IFDNE` exclude each other, `KEEPTTL` and the four
+/// expiry options exclude each other, but repeating one is fine (the last
+/// value wins). Any other word, or an option without its value, is a
+/// syntax error. Only once all options are known is the expiry value read
+/// as an integer; whether it's in range is the store's to check. Also the
+/// value an `IF...` condition compares with.
+fn set_options<'a>(args: &Args<'a>, from: usize, set: bool) -> Result<(SetOptions, &'a [u8]), SetOptionError> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Unit {
         Ex,
@@ -492,15 +516,27 @@ fn set_options(args: &Args) -> Result<SetOptions, SetOptionError> {
     let mut opts = SetOptions::default();
     let mut keep_ttl = false;
     let mut expiry: Option<(Unit, &[u8])> = None;
-    let mut i = 3;
+    let mut matching: &[u8] = b"";
+    // A condition, unless another one is already there.
+    let cond_ok = |opts: &SetOptions, cond: SetCond| opts.cond == SetCond::Always || opts.cond == cond;
+    const MATCHING: [(&[u8], SetCond); 4] = [(b"ifeq", SetCond::IfEq), (b"ifne", SetCond::IfNe), (b"ifdeq", SetCond::IfDeq), (b"ifdne", SetCond::IfDne)];
+    let mut i = from;
     while i < args.len() {
         let opt = &args[i];
         let next = args.get(i + 1);
-        if opt.eq_ignore_ascii_case(b"nx") && opts.cond != SetCond::Xx {
+        let named = MATCHING.iter().find(|(name, _)| opt.eq_ignore_ascii_case(name)).map(|&(_, c)| c);
+        if opt.eq_ignore_ascii_case(b"nx") && cond_ok(&opts, SetCond::Nx) {
             opts.cond = SetCond::Nx;
-        } else if opt.eq_ignore_ascii_case(b"xx") && opts.cond != SetCond::Nx {
+        } else if opt.eq_ignore_ascii_case(b"xx") && cond_ok(&opts, SetCond::Xx) {
             opts.cond = SetCond::Xx;
-        } else if opt.eq_ignore_ascii_case(b"get") {
+        } else if let (true, Some(cond), Some(value)) = (set, named, next) {
+            if !cond_ok(&opts, cond) {
+                return Err(SetOptionError::Syntax);
+            }
+            opts.cond = cond;
+            matching = value;
+            i += 1;
+        } else if set && opt.eq_ignore_ascii_case(b"get") {
             opts.get = true;
         } else if opt.eq_ignore_ascii_case(b"keepttl") && expiry.is_none() {
             keep_ttl = true;
@@ -528,7 +564,87 @@ fn set_options(args: &Args) -> Result<SetOptions, SetOptionError> {
             }
         }
     };
-    Ok(opts)
+    Ok((opts, matching))
+}
+
+/// `MSETEX numkeys key value [key value ...] [NX|XX] [EX|PX|EXAT|PXAT
+/// n|KEEPTTL]` (Redis 8.4): 1 if set, 0 if `NX` or `XX` stopped it.
+fn msetex(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {
+    let n = match parse_i64(&args[1]) {
+        Some(n) if (1..=i64::from(i32::MAX)).contains(&n) => n as usize,
+        _ => {
+            out.error(b"ERR invalid numkeys value");
+            return Flow::Continue;
+        }
+    };
+    if 2 * n + 2 > args.len() {
+        out.error(b"ERR wrong number of key-value pairs");
+        return Flow::Continue;
+    }
+    let Some((opts, _)) = set_options_or_reply(args, 2 * n + 2, false, out) else { return Flow::Continue };
+    let pairs: Vec<(&[u8], &[u8])> = (0..n).map(|k| (&args[2 + 2 * k], &args[3 + 2 * k])).collect();
+    integer_reply(store.msetex(&pairs, opts.cond, opts.expiry).map(i64::from), out)
+}
+
+/// `DELEX key [IFEQ|IFNE|IFDEQ|IFDNE value]` (Redis 8.4): 1 if the key
+/// went, 0 if not.
+fn delex(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {
+    let cond = match args.len() {
+        2 => SetCond::Always,
+        4 => match [(&b"ifeq"[..], SetCond::IfEq), (b"ifne", SetCond::IfNe), (b"ifdeq", SetCond::IfDeq), (b"ifdne", SetCond::IfDne)]
+            .into_iter()
+            .find(|(name, _)| c_str(&args[2], usize::MAX).eq_ignore_ascii_case(name))
+        {
+            Some((_, cond)) => cond,
+            // Redis looks at the key first: the condition only matters if
+            // there's a string to compare.
+            None => match store.get(&args[1]) {
+                Ok(None) => return integer_reply(Ok(0), out),
+                Err(_) => return integer_reply(Err(store::Error::DelexNotString), out),
+                Ok(Some(_)) => {
+                    out.error(b"ERR Invalid condition. Use IFEQ, IFNE, IFDEQ, or IFDNE");
+                    return Flow::Continue;
+                }
+            },
+        },
+        _ => {
+            arity_error("delex", out);
+            return Flow::Continue;
+        }
+    };
+    let matching = args.get(3).unwrap_or(b"");
+    integer_reply(store.delex(&args[1], cond, matching).map(i64::from), out)
+}
+
+/// `INCREX key [options]` (Redis 8.8): `[value, increment]`, integers or
+/// doubles.
+fn increx(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {
+    let opts: Vec<&[u8]> = args.iter().skip(2).collect();
+    match store.increx(&args[1], &opts) {
+        Ok(store::IncrexReply::Ints(value, delta)) => {
+            out.array(2);
+            out.integer(value);
+            out.integer(delta);
+        }
+        Ok(store::IncrexReply::Floats(value, delta)) => {
+            out.array(2);
+            out.double_text(&value);
+            out.double_text(&delta);
+        }
+        Err(e) => store_error(e, out),
+    }
+    Flow::Continue
+}
+
+/// `DIGEST key` (Redis 8.4): the string's XXH3 hash in hex, nil without
+/// the key.
+fn digest(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {
+    match store.digest(&args[1]) {
+        Ok(Some(hex)) => out.bulk(&hex),
+        Ok(None) => out.null(),
+        Err(e) => store_error(e, out),
+    }
+    Flow::Continue
 }
 
 fn del(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {

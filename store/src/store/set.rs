@@ -7,6 +7,7 @@
 
 use super::{Effect, Store, Value};
 use crate::collections::Set;
+use crate::hll::Hll;
 use crate::Error;
 
 
@@ -212,6 +213,40 @@ impl Store {
         sets.sort_by_key(|s| s.len());
         let limit = if limit == 0 { usize::MAX } else { limit };
         Ok(sets[0].iter().filter(|m| sets[1..].iter().all(|s| s.contains(m))).take(limit).count())
+    }
+
+    /// `SUNIONCARD`: how many members the union has, at most `limit` (0:
+    /// no limit). With `approx`, Redis's HyperLogLog estimate of it, at
+    /// most `limit` too (Redis checks the estimate as it goes and stops once
+    /// it reaches `limit`; as registers only grow, that gives the same).
+    pub fn sunioncard(&mut self, keys: &[&[u8]], approx: bool, limit: usize) -> Result<usize, Error> {
+        self.check_sets(keys)?;
+        let limit = if limit == 0 { usize::MAX } else { limit };
+        let sets: Vec<&Set> = self.sets(keys).into_iter().flatten().collect();
+        let members = sets.iter().flat_map(|s| s.iter());
+        if approx {
+            let mut hll = Hll::new();
+            members.for_each(|m| hll.add(m));
+            return Ok(usize::try_from(hll.count()).unwrap_or(usize::MAX).min(limit));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for m in members {
+            if seen.insert(m) && seen.len() >= limit {
+                break;
+            }
+        }
+        Ok(seen.len())
+    }
+
+    /// `SDIFFCARD`: how many members of the first set no other has, at most
+    /// `limit` (0: no limit).
+    pub fn sdiffcard(&mut self, keys: &[&[u8]], limit: usize) -> Result<usize, Error> {
+        self.check_sets(keys)?;
+        let limit = if limit == 0 { usize::MAX } else { limit };
+        let sets = self.sets(keys);
+        let Some(first) = sets[0] else { return Ok(0) };
+        let others: Vec<&Set> = sets[1..].iter().flatten().copied().collect();
+        Ok(first.iter().filter(|m| !others.iter().any(|s| s.contains(m))).take(limit).count())
     }
 
     /// Checks that each of `keys` that exists holds a set (expiring the

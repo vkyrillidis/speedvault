@@ -182,6 +182,15 @@ impl Encoder {
         }
     }
 
+    /// A double already written (Redis's `long double`s, as `INCREX`
+    /// replies them): `,` in RESP3, a bulk string in RESP2.
+    pub fn double_text(&mut self, text: &[u8]) {
+        match self.protocol {
+            Protocol::Resp2 => self.bulk(text),
+            Protocol::Resp3 => self.line_parts(b',', &[text]),
+        }
+    }
+
     /// `#t` / `#f` in RESP3, `:1` / `:0` in RESP2.
     pub fn boolean(&mut self, b: bool) {
         self.out.extend_from_slice(match (self.protocol, b) {

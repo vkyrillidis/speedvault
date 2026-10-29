@@ -134,6 +134,59 @@ pub(super) fn lrem(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {
     integer_reply(integer_arg(&args[2]).and_then(|count| store.lrem(&args[1], count, &args[3])).map(|n| n as i64), out)
 }
 
+/// `LMOVEM source destination LEFT|RIGHT LEFT|RIGHT [COUNT|EXACTLY count
+/// OBO|BULK]` (Redis 8.10): the elements moved, or a nil array.
+pub(super) fn lmovem(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {
+    let end = |arg: &[u8]| match arg {
+        a if a.eq_ignore_ascii_case(b"left") => Some(End::Left),
+        a if a.eq_ignore_ascii_case(b"right") => Some(End::Right),
+        _ => None,
+    };
+    let (Some(from), Some(to)) = (end(&args[3]), end(&args[4])) else {
+        syntax_error(out);
+        return Flow::Continue;
+    };
+    let (count, exactly, obo) = match args.len() {
+        5 => (1, false, false),
+        8 => {
+            let exactly = match &args[5] {
+                a if a.eq_ignore_ascii_case(b"count") => false,
+                a if a.eq_ignore_ascii_case(b"exactly") => true,
+                _ => {
+                    syntax_error(out);
+                    return Flow::Continue;
+                }
+            };
+            let count = match parse_i64(&args[6]) {
+                Some(n) if n >= 1 => usize::try_from(n).unwrap_or(usize::MAX),
+                _ => return error(b"ERR count should be greater than 0", out),
+            };
+            let obo = match &args[7] {
+                a if a.eq_ignore_ascii_case(b"obo") => true,
+                a if a.eq_ignore_ascii_case(b"bulk") => false,
+                _ => {
+                    syntax_error(out);
+                    return Flow::Continue;
+                }
+            };
+            (count, exactly, obo)
+        }
+        _ => {
+            syntax_error(out);
+            return Flow::Continue;
+        }
+    };
+    match store.lmovem(&args[1], &args[2], from, to, count, exactly, obo) {
+        Ok(Some(moved)) => {
+            out.array(moved.len());
+            moved.iter().for_each(|e| out.bulk(e));
+        }
+        Ok(None) => out.null_array(),
+        Err(e) => store_error(e, out),
+    }
+    Flow::Continue
+}
+
 /// `LPOS key element [RANK rank] [COUNT num] [MAXLEN len]`.
 pub(super) fn lpos(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {
     let mut opts = LposOptions::default();
