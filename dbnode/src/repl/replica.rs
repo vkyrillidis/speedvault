@@ -225,7 +225,9 @@ fn follow(node: &Node, primary: &cluster::Node) -> io::Result<()> {
     match (words[0], id, words.get(2).and_then(|o| o.parse::<u64>().ok())) {
         ("+FULLRESYNC", Some(id), Some(_)) => {
             notice!("Syncing from scratch from {}:{} (its stream {id})", primary.host(), primary.port());
+            let watched = crate::multi::present_watched(node, None);
             node.store.borrow_mut().flush();
+            crate::multi::deleted(node, watched);
             link.replid.set(None);
             link.syncing.set(Some(id));
             link.offset.set(0);
@@ -259,6 +261,12 @@ fn follow(node: &Node, primary: &cluster::Node) -> io::Result<()> {
             match parser.parse(&buf[start..end]) {
                 Ok(Parsed::Complete { consumed }) => {
                     let args = parser.args(&buf[start..end]);
+                    // A transaction waits until its EXEC is here too: then
+                    // it's applied whole, in this loop, which doesn't
+                    // suspend, so no client sees it half done.
+                    if args.len() == 1 && args[0].eq_ignore_ascii_case(b"MULTI") && !whole_transaction(&buf[start + consumed..end]) {
+                        break;
+                    }
                     if !args.is_empty() {
                         apply(node, &args, consumed, &mut staging, &mut out)?;
                     }
@@ -268,6 +276,8 @@ fn follow(node: &Node, primary: &cluster::Node) -> io::Result<()> {
                 Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
             }
         }
+        // Its clients watching keys it changed.
+        crate::multi::touched(node);
         // The copy's end and a new ping at once (the lease, and a copy's
         // next batch, wait for it); what came, once applied (for WAIT), at
         // most every ACK_GAP, so a read waits no longer than that while
@@ -292,6 +302,21 @@ fn follow(node: &Node, primary: &cluster::Node) -> io::Result<()> {
         }
         end += read(&conn, &mut buf[end..], node)?;
     }
+}
+
+/// Whether `bytes`, what follows a transaction's `MULTI` in the stream,
+/// hold its `EXEC`.
+fn whole_transaction(bytes: &[u8]) -> bool {
+    let mut parser = Parser::new(Limits::default());
+    let mut at = 0;
+    while let Ok(Parsed::Complete { consumed }) = parser.parse(&bytes[at..]) {
+        let args = parser.args(&bytes[at..]);
+        if args.len() == 1 && args[0].eq_ignore_ascii_case(b"EXEC") {
+            return true;
+        }
+        at += consumed;
+    }
+    false
 }
 
 /// `REPLACK offset ping` (ours, Redis's `REPLCONF ACK`): the stream
@@ -396,7 +421,9 @@ fn execute(node: &Node, args: &resp::Args, staging: &mut Staging, out: &mut Enco
         let slot = args.get(1).and_then(store::parse_i64).filter(|s| (0..cluster::SLOTS as i64).contains(s) && args.len() == 2);
         let slot = slot.ok_or_else(|| bad("a bad REPLDROPSLOT"))? as u16;
         staging.retain(|key, _| cluster::key_hash_slot(key) != slot);
+        let watched = crate::multi::present_watched(node, Some(slot));
         node.store.borrow_mut().drop_slot(slot);
+        crate::multi::deleted(node, watched);
         return Ok(());
     }
     if args[0].eq_ignore_ascii_case(b"REPLSYNCED") {
@@ -409,11 +436,20 @@ fn execute(node: &Node, args: &resp::Args, staging: &mut Staging, out: &mut Enco
         notice!("Synced: {} keys, at offset {offset}", node.store.borrow().dbsize());
         return Ok(());
     }
-    if args[0].eq_ignore_ascii_case(b"FLUSHALL") || args[0].eq_ignore_ascii_case(b"FLUSHDB") {
+    // A transaction's bounds: the follow loop applies it whole at once.
+    if args[0].eq_ignore_ascii_case(b"MULTI") || args[0].eq_ignore_ascii_case(b"EXEC") {
+        return Ok(());
+    }
+    let flush = args[0].eq_ignore_ascii_case(b"FLUSHALL") || args[0].eq_ignore_ascii_case(b"FLUSHDB");
+    if flush {
         staging.clear();
     }
+    let watched = if flush { crate::multi::present_watched(node, None) } else { Vec::new() };
     out.clear();
     command::apply(args, node, out);
+    if flush {
+        crate::multi::deleted(node, watched);
+    }
     if out.as_bytes().first() == Some(&b'-') {
         verbose!("A command from the primary failed: {}", String::from_utf8_lossy(out.as_bytes()).trim_end());
     }

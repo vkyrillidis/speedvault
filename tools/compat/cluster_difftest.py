@@ -157,6 +157,15 @@ def requests(keys: List[bytes]) -> List[Tuple]:
                    ("SINTERCARD", "2abc", st, st), ("SINTERCARD", " 2", st, other),
                    ("LMPOP", "2", l, l2, "LEFT"), ("LMPOP", "1", l2, "RIGHT", "COUNT", "2"), ("LMPOP", "2", l, other, "LEFT"),
                    ("LMPOP", "3", l, "LEFT"), ("LMPOP", "0", l, "LEFT"), ("LMPOP", "2", l, "LEFT")]
+    # Transactions: each command checked as queued (MOVED aborts it), EXEC
+    # as one command of all their keys (CROSSSLOT, MOVED).
+    for i, k in enumerate(keys[::2]):
+        other = keys[(i + len(keys) // 3) % len(keys)]
+        tag1, tag2 = b"{" + k + b"}:t1", b"{" + k + b"}:t2"
+        probes += [("MULTI",), ("SET", tag1, "t"), ("INCR", tag2), ("GET", tag1), ("EXEC",),
+                   ("MULTI",), ("SET", k, "1"), ("SET", other, "2"), ("EXEC",), ("GET", k),
+                   ("MULTI",), ("PING",), ("MGET", tag1, tag2), ("EXEC",),
+                   ("WATCH", tag1, tag2), ("WATCH", k, other), ("MULTI",), ("INCR", tag1), ("EXEC",), ("UNWATCH",)]
     probes += [("SCAN", "0", "COUNT", "100000"), ("SCAN", "0", "MATCH", "*:h", "COUNT", "100000"),
                ("SCAN", "0", "TYPE", "list", "COUNT", "100000"), ("KEYS", "*"), ("KEYS", "*:s")]
     probes += [("CLUSTER", "COUNTKEYSINSLOT", "0"), ("DBSIZE",)]
@@ -287,6 +296,11 @@ def migrating_probes(t: bytes, other_a: bytes, key_b: bytes) -> List[Tuple[str, 
         ("C", [("GET", a1), ("ASKING",), ("GET", a1), ("GET", p1), nodes]),
         # Pipelined: ASKING applies to the request right after it.
         ("B", [("ASKING",), ("SET", a3, "1"), ("GET", a3), ("ASKING",), ("GET", a3)]),
+        # Transactions: at the target, ASKING holds through MULTI ... EXEC;
+        # without it, redirected as queued.
+        ("B", [("ASKING",), ("MULTI",), ("SET", a2, "x"), ("GET", a2), ("EXEC",), ("GET", a2),
+               ("MULTI",), ("GET", a2), ("EXEC",), ("ASKING",), ("MULTI",), ("MGET", a1, a3), ("EXEC",),
+               ("ASKING",), ("DEL", a2, a3)]),
     ]
 
 
@@ -465,6 +479,14 @@ def client_script(rc) -> List[Tuple[str, str]]:
     do("pipeline", pipe)
     do("getdel", lambda: [rc.getdel(f"p:{i}") for i in range(10)])
     do("type", lambda: [rc.type(k) for k in ["p:20", "nope"]])
+
+    def transaction():
+        p = rc.pipeline(transaction=True)
+        p.set("{x}a", 1)
+        p.incr("{x}b")
+        p.get("{x}a")
+        return p.execute()
+    do("transaction one tag", transaction)
     do("wrong type of int", lambda: rc.incr("user:100"))
     # Phase 7: the data types, and SCAN across the nodes.
     do("hset hgetall", lambda: [rc.hset(f"h:{i}", mapping={"b": i, "a": -i}) for i in range(20)]

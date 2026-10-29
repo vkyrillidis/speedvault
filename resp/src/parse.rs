@@ -384,6 +384,12 @@ pub struct Args<'a> {
 }
 
 impl<'a> Args<'a> {
+    /// Arguments at `ranges` of `data`: a request kept for later (a
+    /// transaction's queued commands).
+    pub fn new(data: &'a [u8], ranges: &'a [Range<usize>]) -> Args<'a> {
+        Args { data, ranges }
+    }
+
     pub fn len(&self) -> usize {
         self.ranges.len()
     }

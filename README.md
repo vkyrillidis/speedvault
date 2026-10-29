@@ -77,6 +77,11 @@ See [running a cluster](docs/cluster.md) and [Kubernetes](docs/kubernetes.md)
   LINSERT LREM LTRIM LPOS LMOVE LMOVEM RPOPLPUSH LMPOP`.
 - **Connection and server:** `PING ECHO HELLO AUTH SELECT 0 QUIT CLIENT
   COMMAND INFO`, `CONFIG GET` and `SET`.
+- **Transactions:** `MULTI EXEC DISCARD WATCH UNWATCH`, as Redis's: the
+  commands of a transaction run back to back, nothing else in between,
+  and reach the replicas whole; `WATCH` sees every write that changes a
+  key, its expiry, `FLUSHALL`. In a cluster, a transaction's keys are in
+  one slot (hash tags), as in Redis Cluster.
 - **A password:** `--requirepass-file PATH` (or `--requirepass`), Redis's
   `requirepass`: clients `AUTH` (or `HELLO 3 AUTH default ...`) first. A
   cluster has one: every node and stuart take it, log in to each other
@@ -90,8 +95,7 @@ See [running a cluster](docs/cluster.md) and [Kubernetes](docs/kubernetes.md)
 - **Memory:** `--maxmemory` with Redis's `noeviction` (`-OOM` on writes past
   it). Small hashes, sets and lists are packed as Redis packs them.
 
-Not yet: TLS, ACL users, sorted sets, blocking list commands, pub/sub,
-transactions, scripting, eviction policies other than
+Not yet: TLS, ACL users, sorted sets, blocking list commands, pub/sub, scripting, eviction policies other than
 `noeviction`, and databases other than 0. There is no persistence (RDB or
 AOF) by design: replicas keep the data, and a pod stopping hands over to
 its replica first. Replies are checked against Redis

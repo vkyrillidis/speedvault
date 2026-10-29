@@ -89,7 +89,11 @@ argument, only closing its own connection), pipelining (100 SETs,
 SELECT in the middle), a SET split at every byte boundary (32 cases), a
 pipeline and an inline command dripped one byte at a time, splits inside
 CRLF and across requests, 64 KiB chunks, 1 MiB and 10 MiB values, a 100 KB
-key, DEL with 10000 keys; since phase 7 hashes, sets, lists and `SCAN`.
+key, DEL with 10000 keys; since phase 7 hashes, sets, lists and `SCAN`;
+transactions (tag `tx`: `MULTI`/`EXEC`/`DISCARD` and their errors, the
+checks while queueing, `-OOM` at either end, RESP3, `CLIENT INFO` and
+`INFO` inside, and `WATCH` against each write command, once changing the
+key and once not, against expiry and `FLUSHALL`).
 
 ### Redis quirks the target may choose not to copy (allow-list if so)
 
@@ -290,7 +294,10 @@ starts stuart on the base port and three dbnodes (four for `drain`; the
 `--auto` ones as below) on the next ports, `STUART CREATE`, fills them with `--filler` keys (default
 200,000, 100-byte values, so that moves take a few seconds), and starts
 the writers: two redis-py `RedisCluster` threads and one `redis-cli -c`
-process fed on stdin, seeded with stuart, and with `--lettuce` a
+process fed on stdin, seeded with stuart, a redis-py thread sending
+transactions (`MULTI`, `INCR` of two keys of one slot, `EXEC`: the two
+must always be equal, a transaction never half applied, even through a
+failover), and with `--lettuce` a
 `LettuceLoad` per refresh mode (`default`, `off`, `fast`; `MODE@MS` also
 caps Lettuce's reconnect delay at MS ms, and `-Dlettuce.nodnscache` makes
 it resolve names uncached), seeded with the first node. Each failure is

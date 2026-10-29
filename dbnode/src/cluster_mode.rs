@@ -265,8 +265,8 @@ impl Cluster {
         (Ref::map(state, |s| &s.table), me)
     }
 
-    /// Whether this node serves the request's keys, at `keys` (the command
-    /// table's first, last, step). If not, writes why and returns false, in
+    /// Whether this node serves a request's `keys` (at least one; a
+    /// transaction's are all its commands'). If not, writes why, in
     /// Redis 8's order (`preprocessCommand`, `getNodeByQuery`): a key is in
     /// another slot than the first's (`CROSSSLOT`; the same key again is
     /// fine), the first key's slot is unassigned (`CLUSTERDOWN`), or another
@@ -282,24 +282,20 @@ impl Cluster {
     /// reclaimed here (as in Redis: the command may not run). A `write` to
     /// a slot paused, or any request to a slot landing (moving by snapshot,
     /// see the module docs), waits ([`Route::Wait`]).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn route(
+    pub(crate) fn route<'a>(
         &self,
-        args: &Args,
-        keys: (i32, i32, i32),
+        keys: impl Iterator<Item = &'a [u8]> + Clone,
         store: &RefCell<Store>,
         asking: bool,
         write: bool,
         replica_read: ReplicaRead,
         out: &mut Encoder,
     ) -> Route {
-        let (first, last, step) = keys;
-        let last = if last < 0 { args.len() as i32 + last } else { last };
         let state = self.state.borrow();
-        let first_key = &args[first as usize];
+        let first_key = keys.clone().next().expect("a request with keys");
         let slot = key_hash_slot(first_key);
         let Some(owner) = state.table.owner_index(slot) else {
-            let crosses = (first..=last).step_by(step as usize).any(|i| key_hash_slot(&args[i as usize]) != slot);
+            let crosses = keys.clone().any(|k| key_hash_slot(k) != slot);
             if crosses {
                 out.error(b"CROSSSLOT Keys in request don't hash to the same slot");
             } else {
@@ -316,10 +312,8 @@ impl Cluster {
         let migrating = migration.filter(|_| owner == state.me);
         let importing = migration.filter(|m| migrating.is_none() && m.to == state.me);
         let (mut missing, mut existing, mut several) = (0, 0, false);
-        let mut i = first;
-        while i <= last {
-            let key = &args[i as usize];
-            if i != first && key != first_key {
+        for (i, key) in keys.enumerate() {
+            if i != 0 && key != first_key {
                 if key_hash_slot(key) != slot {
                     out.error(b"CROSSSLOT Keys in request don't hash to the same slot");
                     return Route::Refused;
@@ -333,7 +327,6 @@ impl Cluster {
                     missing += 1;
                 }
             }
-            i += step;
         }
         if let Some(m) = migrating.filter(|_| missing > 0) {
             if existing > 0 {

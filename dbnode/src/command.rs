@@ -9,6 +9,7 @@
 
 use crate::admin;
 use crate::client::Client;
+use crate::multi;
 use crate::cluster_mode::{self, ReplicaRead, Route};
 
 mod hash;
@@ -151,6 +152,11 @@ pub(crate) const COMMANDS: &[Command] = &[
     data("quit", -1, NO_KEYS, quit),
     conn("hello", -1, admin::hello),
     conn("auth", -2, admin::auth),
+    conn("multi", 1, multi::multi),
+    conn("exec", 1, multi::exec),
+    conn("discard", 1, multi::discard),
+    Command { keys: ALL_KEYS, ..conn("watch", -2, multi::watch) },
+    conn("unwatch", 1, multi::unwatch),
     container("client", -2, admin::unreachable, admin::CLIENT),
     container("command", -1, admin::command, admin::COMMAND),
     container("config", -2, admin::unreachable, admin::CONFIG),
@@ -218,12 +224,26 @@ pub(crate) const COMMANDS: &[Command] = &[
 ];
 
 /// Runs the request `args` (not empty) of `client` and appends its reply to
-/// `out`.
+/// `out`; after `MULTI`, queues it instead (see [`multi`]).
 pub(crate) fn execute(args: &Args, node: &Node, client: &Client, out: &mut Encoder) -> Flow {
-    // `ASKING` holds for the next command only, whatever it is.
-    let asking = client.asking.take();
+    // `ASKING` holds for the next command only, or, after `MULTI`, until
+    // the transaction ends, as Redis keeps its flag in a transaction.
+    let asking = client.asking.get();
+    let flow = check_and_run(args, node, client, out, asking);
+    if asking && client.last_cmd.get() != "asking" && client.multi.borrow().is_none() {
+        client.asking.set(false);
+    }
+    multi::touched(node);
+    flow
+}
+
+/// [`execute`]'s checks, in Redis 8's order (`processCommand`); a command
+/// refused flags the transaction, if any. `EXEC` after `MULTI` is checked
+/// as the whole transaction.
+fn check_and_run(args: &Args, node: &Node, client: &Client, out: &mut Encoder, asking: bool) -> Flow {
     let Some(mut cmd) = find(COMMANDS, &args[0]) else {
         client.last_cmd.set("NULL");
+        multi::flag(client);
         unknown_command(args, out);
         return Flow::Continue;
     };
@@ -232,6 +252,7 @@ pub(crate) fn execute(args: &Args, node: &Node, client: &Client, out: &mut Encod
             Some(sub) => cmd = sub,
             None => {
                 client.last_cmd.set("NULL");
+                multi::flag(client);
                 unknown_subcommand(cmd.name, &args[1], out);
                 return Flow::Continue;
             }
@@ -241,58 +262,78 @@ pub(crate) fn execute(args: &Args, node: &Node, client: &Client, out: &mut Encod
     let argc = args.len() as i64;
     let arity = i64::from(cmd.arity);
     if (arity > 0 && argc != arity) || argc < -arity {
+        multi::flag(client);
         arity_error(cmd.name, out);
         return Flow::Continue;
     }
     // Then the password, as in Redis: before the client has logged in,
     // only AUTH, HELLO and QUIT (see `auth`).
     if !client.authenticated.get() && !crate::auth::allowed_before_auth(cmd.name) {
+        multi::flag(client);
         out.error(crate::auth::NOAUTH);
         return Flow::Continue;
     }
+    let tx = cmd.name == "exec" && client.multi.borrow().is_some();
+    let (write, denyoom, keyless_write) = if tx { multi::flags(client) } else { (cmd.write, cmd.denyoom, cmd.write && cmd.key_range(args).is_none()) };
     // In cluster mode, only keys in this node's slots (after the arity
     // check, as in Redis). A refused command doesn't count as processed.
     // One touching keys on their way to another node waits until they've
     // landed (then it's redirected).
-    if let Some((cluster, keys)) = node.cluster.as_ref().zip(cmd.key_range(args)) {
-        let mut waited = 0;
-        let replica_read = match () {
-            _ if !client.readonly.get() || cmd.write => ReplicaRead::No,
-            _ if node.repl.link.loading() => ReplicaRead::Loading,
-            _ => ReplicaRead::Serve,
-        };
-        loop {
-            match cluster.route(args, keys, &node.store, asking, cmd.write, replica_read, out) {
-                Route::Serve => {
-                    cluster.served.set(cluster.served.get() + 1);
-                    break;
-                }
-                Route::Refused => return Flow::Continue,
-                Route::Wait => cluster_mode::wait(&mut waited),
+    if let Some(cluster) = &node.cluster {
+        if tx {
+            if !multi::routed(cluster, node, client, asking, write, out) {
+                return Flow::Continue;
+            }
+        } else if let Some(keys) = keys_in(cmd, *args) {
+            if !routed(cluster, node, client, keys, asking, write, out) {
+                multi::flag(client);
+                return Flow::Continue;
+            }
+        }
+        // A write without keys (`FLUSHALL`) waits while slots' writes do
+        // (they move by snapshot: see `cluster_mode`).
+        if keyless_write {
+            let mut waited = 0;
+            while cluster.write_paused(None) {
+                cluster_mode::wait(&mut waited);
             }
         }
     }
-    // A write without keys (`FLUSHALL`) waits while slots' writes do (they
-    // move by snapshot: see `cluster_mode`).
-    if let Some(cluster) = node.cluster.as_ref().filter(|_| cmd.write && cmd.key_range(args).is_none()) {
-        let mut waited = 0;
-        while cluster.write_paused(None) {
-            cluster_mode::wait(&mut waited);
-        }
-    }
     // Then memory, as in Redis: nothing is evicted (`noeviction`).
-    if cmd.denyoom && node.out_of_memory() {
+    if denyoom && node.out_of_memory() {
         node.commands_refused_oom.set(node.commands_refused_oom.get() + 1);
-        out.error(OOM);
-        return Flow::Continue;
+        return refuse(tx, node, client, OOM, out);
     }
     // Then the lease (phase 8), as Redis's `min-replicas-to-write`: a
     // primary whose replica stopped acknowledging takes no writes.
-    if cmd.write && node.repl.lease_lapsed() {
-        out.error(b"NOREPLICAS Not enough good replicas to write.");
+    if write && node.repl.lease_lapsed() {
+        return refuse(tx, node, client, b"NOREPLICAS Not enough good replicas to write.", out);
+    }
+    if !multi::runs_in_transaction(cmd) && client.multi.borrow().is_some() {
+        multi::queue(cmd, args, client, out);
         return Flow::Continue;
     }
+    run(cmd, args, node, client, out)
+}
+
+/// A command refused for `why` (an error without its `-`); `EXEC` (`tx`)
+/// is aborted with it.
+fn refuse(tx: bool, node: &Node, client: &Client, why: &[u8], out: &mut Encoder) -> Flow {
+    if tx {
+        multi::abort(node, client, why, out);
+    } else {
+        multi::flag(client);
+        out.error(why);
+    }
+    Flow::Continue
+}
+
+/// Runs `cmd`, checked, and feeds the replication stream with what it did.
+/// Also each command of a transaction, from `EXEC`.
+pub(crate) fn run(cmd: &Command, args: &Args, node: &Node, client: &Client, out: &mut Encoder) -> Flow {
     node.commands_processed.set(node.commands_processed.get() + 1);
+    let flush = matches!(cmd.name, "flushall" | "flushdb");
+    let watched = if flush { multi::present_watched(node, None) } else { Vec::new() };
     let reply_at = out.len();
     let flow = match cmd.run {
         Run::Data(run) => run(args, &mut node.store.borrow_mut(), out),
@@ -306,11 +347,55 @@ pub(crate) fn execute(args: &Args, node: &Node, client: &Client, out: &mut Encod
             client.woff.set(node.repl.offset());
         }
     }
-    // Slots being copied here lost their keys too: copied again.
-    if matches!(cmd.name, "flushall" | "flushdb") {
+    if flush {
+        // Slots being copied here lost their keys too: copied again.
         crate::repl::slots::flushed(node);
+        if out.as_bytes().get(reply_at) != Some(&b'-') {
+            multi::deleted(node, watched);
+        }
     }
     flow
+}
+
+/// The slot check of keys (see [`cluster_mode::Cluster::route`]), waiting
+/// while they're on their way: false if refused, the reply written.
+pub(crate) fn routed<'a>(
+    cluster: &cluster_mode::Cluster,
+    node: &Node,
+    client: &Client,
+    keys: impl Iterator<Item = &'a [u8]> + Clone,
+    asking: bool,
+    write: bool,
+    out: &mut Encoder,
+) -> bool {
+    let replica_read = match () {
+        _ if !client.readonly.get() || write => ReplicaRead::No,
+        _ if node.repl.link.loading() => ReplicaRead::Loading,
+        _ => ReplicaRead::Serve,
+    };
+    let mut waited = 0;
+    loop {
+        match cluster.route(keys.clone(), &node.store, asking, write, replica_read, out) {
+            Route::Serve => {
+                cluster.served.set(cluster.served.get() + 1);
+                return true;
+            }
+            Route::Refused => return false,
+            Route::Wait => cluster_mode::wait(&mut waited),
+        }
+    }
+}
+
+/// `cmd`'s keys in `args`; `None` without any.
+fn keys_in<'a>(cmd: &Command, args: Args<'a>) -> Option<impl Iterator<Item = &'a [u8]> + Clone> {
+    let (first, last, step) = cmd.key_range(&args)?;
+    let last = if last < 0 { args.len() as i32 + last } else { last };
+    Some((first..=last).step_by(step as usize).map(move |i| args.get(i as usize).expect("in range")))
+}
+
+/// `cmd`'s keys in `args`, none if it has none.
+pub(crate) fn keys_of<'a>(cmd: &Command, args: Args<'a>) -> impl Iterator<Item = &'a [u8]> {
+    keys_in(cmd, args).into_iter().flatten()
 }
 
 /// Runs a command from this node's primary ([`crate::repl::replica`]):

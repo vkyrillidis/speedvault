@@ -78,7 +78,9 @@ impl Store {
                 End::Right => l.push_back(e),
             }
         }
-        Ok(l.len())
+        let len = l.len();
+        self.touch(key);
+        Ok(len)
     }
 
     /// `LPOP`, `RPOP` with a count (`None`: one): up to `count` elements.
@@ -92,6 +94,9 @@ impl Store {
         };
         l.shrink();
         self.drop_if_empty(key);
+        if !popped.is_empty() {
+            self.touch(key);
+        }
         Ok(Some(popped))
     }
 
@@ -115,6 +120,7 @@ impl Store {
         let i = l.resolve(index).ok_or(Error::IndexOutOfRange)?;
         l.set(i, value);
         l.shrink();
+        self.touch(key);
         Ok(())
     }
 
@@ -126,7 +132,9 @@ impl Store {
         l.grow([element]);
         let Some(i) = l.iter().position(|e| e == pivot) else { return Ok(-1) };
         l.insert_by(i, after, element);
-        Ok(l.len() as i64)
+        let len = l.len() as i64;
+        self.touch(key);
+        Ok(len)
     }
 
     /// `LREM key count element`: how many were removed; `count` > 0 the
@@ -139,6 +147,9 @@ impl Store {
             l.shrink();
         }
         self.drop_if_empty(key);
+        if removed > 0 {
+            self.touch(key);
+        }
         Ok(removed)
     }
 
@@ -151,6 +162,7 @@ impl Store {
         }
         l.shrink();
         self.drop_if_empty(key);
+        self.touch(key);
         Ok(())
     }
 
@@ -205,6 +217,7 @@ impl Store {
                 End::Right => l.push_back(&e),
             }
             l.shrink();
+            self.touch(src);
             return Ok(Some(copy));
         }
         let mut popped = self.pop(src, from, 1)?.expect("checked above");
@@ -253,7 +266,9 @@ impl Store {
         if src != dst {
             self.list_mut(src)?.expect("still there").shrink();
             self.drop_if_empty(src);
+            self.touch(src);
         }
+        self.touch(dst);
         Ok(Some(moved))
     }
 }

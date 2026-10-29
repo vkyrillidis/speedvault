@@ -1018,5 +1018,162 @@ steps("auth_wrongpass_counted", *on(0, ("AUTH", "wrong"), ("HELLO", "2", "AUTH",
       tags=AUTH, doc="acl_access_denied_auth counts the wrong passwords, not the syntax errors")
 
 
+# --- MULTI / EXEC / DISCARD / WATCH ------------------------------------------
+TX = {"tx"}
+seq("tx_basic", ("MULTI",), ("SET", "a", "1"), ("INCR", "a"), ("GET", "a"), ("HSET", "h", "f", "v"), ("EXEC",), ("GET", "a"),
+    tags=TX)
+seq("tx_empty", ("MULTI",), ("EXEC",), tags=TX)
+seq("tx_errors_outside", ("EXEC",), ("DISCARD",), ("UNWATCH",), ("MULTI",), ("MULTI",), ("SET", "a", "1"), ("EXEC",),
+    ("GET", "a"), tags=TX, doc="a nested MULTI is an error that doesn't abort the transaction")
+seq("tx_discard", ("MULTI",), ("SET", "a", "1"), ("DISCARD",), ("GET", "a"), ("EXEC",), tags=TX)
+seq("tx_queue_unknown", ("MULTI",), ("SET", "a", "1"), ("FOO", "x"), ("GET", "a"), ("EXEC",), ("GET", "a"), tags=TX)
+seq("tx_queue_arity", ("MULTI",), ("SET", "a", "1"), ("GET",), ("EXEC",), ("GET", "a"), tags=TX)
+seq("tx_queue_bad_subcommand", ("MULTI",), ("CLIENT", "BOGUS"), ("EXEC",), tags=TX)
+seq("tx_runtime_errors", ("MULTI",), ("SET", "a", "x"), ("INCR", "a"), ("SET", "b", "2"), ("LPUSH", "a", "y"), ("EXEC",),
+    ("MGET", "a", "b"), tags=TX, doc="errors while running don't stop the others")
+seq("tx_watch_inside", ("MULTI",), ("WATCH", "a"), ("SET", "a", "1"), ("EXEC",), tags=TX)
+seq("tx_syntax_errors_queue", ("MULTI",), ("SET", "a", "1", "NX", "XX"), ("SET", "a", "2"), ("EXEC",), tags=TX,
+    doc="a syntax error found while running is a reply, not an abort")
+seq("tx_conn_commands", ("MULTI",), ("CLIENT", "SETNAME", "tx"), ("CLIENT", "GETNAME"), ("SELECT", "0"), ("PING",),
+    ("ECHO", "e"), ("DBSIZE",), ("WAIT", "0", "0"), ("AUTH", "x"), ("CONFIG", "GET", "maxmemory"), ("EXEC",), tags=TX)
+seq("tx_wait", ("MULTI",), ("WAIT", "1", "0"), ("EXEC",), tags=TX, doc="no blocking in a transaction")
+seq("tx_info_clients", ("WATCH", "a", "b"), ("INFO", "clients"), ("UNWATCH",), ("INFO", "clients"),
+    norm=[lambda i, b: b"<" + b",".join(l for l in b.split(b"\r\n") if l.startswith((b"watching_clients", b"total_watched_keys"))) + b">"
+          if b"# Clients" in b else b], tags=TX)
+seq("tx_resp3", ("HELLO", "3"), ("MULTI",), ("HSET", "h", "f", "v"), ("HGETALL", "h"), ("SMEMBERS", "nos"), ("GET", "no"),
+    ("INCRBYFLOAT", "f", "1.5"), ("EXEC",), norm=[at(0, mask_hello)], tags=TX)
+pipe("tx_pipelined", [("MULTI",), ("SET", "a", "1"), ("INCR", "a"), ("EXEC",), ("GET", "a")], tags=TX)
+pipe("tx_pipelined_abort", [("MULTI",), ("SET", "a", "1"), ("NOPE",), ("EXEC",), ("GET", "a")], tags=TX)
+pipe("tx_many", [("MULTI",)] + [("RPUSH", "l", str(i)) for i in range(500)] + [("EXEC",), ("LLEN", "l")], tags=TX)
+steps("tx_quit_inside", Send(cmd("MULTI")), Read(), Send(cmd("SET", "a", "1")), Read(), Send(cmd("QUIT")), UntilClose(),
+      Send(cmd("GET", "a"), conn=1), Read(conn=1), tags=TX)
+steps("tx_atomic_for_others", *on(0, ("MULTI",), ("SET", "a", "1")), *on(1, ("GET", "a")), *on(0, ("SET", "b", "2"), ("EXEC",)),
+      *on(1, ("MGET", "a", "b")), tags=TX)
+seq("tx_oom_at_queue", ("CONFIG", "SET", "maxmemory", "1"), ("MULTI",), ("SET", "a", "1"), ("GET", "a"), ("EXEC",),
+    ("CONFIG", "SET", "maxmemory", "0"), ("GET", "a"), tags=TX)
+seq("tx_oom_at_exec", ("MULTI",), ("SET", "a", "1"), ("CONFIG", "SET", "maxmemory", "1"), ("EXEC",),
+    ("CONFIG", "SET", "maxmemory", "0"), ("GET", "a"), tags=TX, doc="the CONFIG SET queued: runs in EXEC")
+steps("tx_oom_at_exec_other", *on(0, ("MULTI",), ("SET", "a", "1")), *on(1, ("CONFIG", "SET", "maxmemory", "1")),
+      *on(0, ("EXEC",)), *on(1, ("CONFIG", "SET", "maxmemory", "0")), *on(0, ("GET", "a")), tags=TX)
+steps("tx_oom_reads_pass", *on(1, ("SET", "a", "1"), ("CONFIG", "SET", "maxmemory", "1")), *on(0, ("MULTI",), ("GET", "a"),
+      ("DEL", "a"), ("EXEC",)), *on(1, ("CONFIG", "SET", "maxmemory", "0")), tags=TX)
+
+# WATCH: conn 1 runs `cmd` between conn 0's WATCH and EXEC; EXEC is nil if
+# Redis took the key as modified (signalModifiedKey), else runs.
+WATCHES = [
+    # (name, setup, command on conn 1)
+    ("set", [], ("SET", "k", "v")),
+    ("set_same", [("SET", "k", "v")], ("SET", "k", "v")),
+    ("set_nx_fails", [("SET", "k", "v")], ("SET", "k", "w", "NX")),
+    ("set_xx_fails", [], ("SET", "k", "w", "XX")),
+    ("set_ifeq_fails", [("SET", "k", "v")], ("SET", "k", "w", "IFEQ", "x")),
+    ("set_get", [("SET", "k", "v")], ("SET", "k", "w", "GET")),
+    ("setnx_fails", [("SET", "k", "v")], ("SETNX", "k", "w")),
+    ("setnx", [], ("SETNX", "k", "w")),
+    ("mset", [], ("MSET", "x", "1", "k", "2")),
+    ("msetex_nx_fails", [("SET", "k", "v")], ("MSETEX", "2", "k", "1", "z", "2", "NX")),
+    ("msetex", [], ("MSETEX", "1", "k", "1", "PX", "100000")),
+    ("del", [("SET", "k", "v")], ("DEL", "k")),
+    ("del_missing", [], ("DEL", "k")),
+    ("del_other", [("SET", "x", "v")], ("DEL", "x")),
+    ("delex_fails", [("SET", "k", "v")], ("DELEX", "k", "IFEQ", "x")),
+    ("delex", [("SET", "k", "v")], ("DELEX", "k", "IFEQ", "v")),
+    ("incr", [], ("INCR", "k")),
+    ("incrby_0", [("SET", "k", "1")], ("INCRBY", "k", "0")),
+    ("incr_fails", [("SET", "k", "x")], ("INCR", "k")),
+    ("incrbyfloat", [], ("INCRBYFLOAT", "k", "1.5")),
+    ("increx", [], ("INCREX", "k", "BYINT", "2")),
+    ("append_empty", [("SET", "k", "v")], ("APPEND", "k", "")),
+    ("append", [], ("APPEND", "k", "x")),
+    ("getdel", [("SET", "k", "v")], ("GETDEL", "k")),
+    ("getdel_missing", [], ("GETDEL", "k")),
+    ("get", [("SET", "k", "v")], ("GET", "k")),
+    ("expire", [("SET", "k", "v")], ("EXPIRE", "k", "100")),
+    ("expire_missing", [], ("EXPIRE", "k", "100")),
+    ("expire_nx_fails", [("SET", "k", "v", "EX", "100")], ("EXPIRE", "k", "200", "NX")),
+    ("expire_past", [("SET", "k", "v")], ("PEXPIREAT", "k", "1")),
+    ("persist", [("SET", "k", "v", "EX", "100")], ("PERSIST", "k")),
+    ("persist_no_ttl", [("SET", "k", "v")], ("PERSIST", "k")),
+    ("flushall", [("SET", "k", "v")], ("FLUSHALL",)),
+    ("flushall_missing", [("SET", "x", "v")], ("FLUSHALL",)),
+    ("flushdb", [("SET", "k", "v")], ("FLUSHDB",)),
+    ("hset", [], ("HSET", "k", "f", "v")),
+    ("hset_same", [("HSET", "k", "f", "v")], ("HSET", "k", "f", "v")),
+    ("hsetnx_fails", [("HSET", "k", "f", "v")], ("HSETNX", "k", "f", "w")),
+    ("hdel", [("HSET", "k", "f", "v")], ("HDEL", "k", "f")),
+    ("hdel_missing", [("HSET", "k", "f", "v")], ("HDEL", "k", "g")),
+    ("hincrby", [], ("HINCRBY", "k", "f", "1")),
+    ("hincrbyfloat", [], ("HINCRBYFLOAT", "k", "f", "1.5")),
+    ("hget", [("HSET", "k", "f", "v")], ("HGET", "k", "f")),
+    ("sadd", [], ("SADD", "k", "a")),
+    ("sadd_existing", [("SADD", "k", "a")], ("SADD", "k", "a")),
+    ("srem", [("SADD", "k", "a", "b")], ("SREM", "k", "a")),
+    ("srem_missing", [("SADD", "k", "a")], ("SREM", "k", "z")),
+    ("spop", [("SADD", "k", "a")], ("SPOP", "k")),
+    ("spop_missing", [], ("SPOP", "k")),
+    ("smove_from", [("SADD", "k", "a")], ("SMOVE", "k", "d", "a")),
+    ("smove_to", [("SADD", "s", "a")], ("SMOVE", "s", "k", "a")),
+    ("smove_missing", [("SADD", "k", "a")], ("SMOVE", "k", "d", "z")),
+    ("sinterstore_empty", [], ("SINTERSTORE", "k", "nosuch")),
+    ("sinterstore_empty_existing", [("SET", "k", "v")], ("SINTERSTORE", "k", "nosuch")),
+    ("sunionstore", [("SADD", "s", "a")], ("SUNIONSTORE", "k", "s")),
+    ("lpush", [], ("LPUSH", "k", "a")),
+    ("lpushx_missing", [], ("LPUSHX", "k", "a")),
+    ("lpop", [("RPUSH", "k", "a")], ("LPOP", "k")),
+    ("lpop_missing", [], ("LPOP", "k")),
+    ("lset", [("RPUSH", "k", "a")], ("LSET", "k", "0", "a")),
+    ("linsert_missing_pivot", [("RPUSH", "k", "a")], ("LINSERT", "k", "BEFORE", "z", "x")),
+    ("lrem_none", [("RPUSH", "k", "a")], ("LREM", "k", "0", "z")),
+    ("lrem", [("RPUSH", "k", "a")], ("LREM", "k", "0", "a")),
+    ("ltrim_nothing", [("RPUSH", "k", "a", "b")], ("LTRIM", "k", "0", "-1")),
+    ("ltrim", [("RPUSH", "k", "a", "b")], ("LTRIM", "k", "0", "0")),
+    ("lmove_from", [("RPUSH", "k", "a")], ("LMOVE", "k", "d", "LEFT", "RIGHT")),
+    ("lmove_to", [("RPUSH", "s", "a")], ("LMOVE", "s", "k", "LEFT", "RIGHT")),
+    ("lmove_missing", [], ("LMOVE", "k", "d", "LEFT", "RIGHT")),
+    ("lmpop", [("RPUSH", "k", "a")], ("LMPOP", "1", "k", "LEFT")),
+    ("lmovem", [("RPUSH", "k", "a", "b")], ("LMOVEM", "k", "d", "LEFT", "RIGHT")),
+    ("rpoplpush_same", [("RPUSH", "k", "a")], ("RPOPLPUSH", "k", "k")),
+]
+for name, setup, command in WATCHES:
+    steps(f"tx_watch_{name}", *on(0, *setup, ("WATCH", "k")), *on(1, command), *on(0, ("MULTI",), ("PING",), ("EXEC",)),
+          tags=TX)
+steps("tx_watch_own_write", *on(0, ("WATCH", "k"), ("SET", "k", "v"), ("MULTI",), ("PING",), ("EXEC",)), tags=TX)
+steps("tx_watch_inside_tx", *on(0, ("WATCH", "k"), ("MULTI",), ("SET", "k", "v"), ("EXEC",), ("MULTI",), ("PING",), ("EXEC",)),
+      tags=TX, doc="the transaction's own writes don't count; EXEC unwatches")
+steps("tx_watch_other_tx", *on(0, ("WATCH", "k")), *on(1, ("MULTI",), ("SET", "k", "v"), ("EXEC",)),
+      *on(0, ("MULTI",), ("PING",), ("EXEC",)), tags=TX)
+steps("tx_watch_several", *on(0, ("WATCH", "a", "b"), ("WATCH", "c")), *on(1, ("SET", "c", "1")),
+      *on(0, ("MULTI",), ("PING",), ("EXEC",), ("MULTI",), ("PING",), ("EXEC",)), tags=TX)
+steps("tx_unwatch", *on(0, ("WATCH", "k")), *on(1, ("SET", "k", "1")), *on(0, ("UNWATCH",), ("MULTI",), ("PING",), ("EXEC",)),
+      tags=TX)
+steps("tx_discard_unwatches", *on(0, ("WATCH", "k"), ("MULTI",), ("DISCARD",)), *on(1, ("SET", "k", "1")),
+      *on(0, ("MULTI",), ("PING",), ("EXEC",)), tags=TX)
+steps("tx_watch_after_dirty", *on(0, ("WATCH", "k")), *on(1, ("SET", "k", "1")), *on(0, ("WATCH", "j"), ("MULTI",), ("PING",), ("EXEC",)),
+      tags=TX)
+steps("tx_watch_resp3", *on(0, ("HELLO", "3"), ("WATCH", "k")), *on(1, ("SET", "k", "1")), *on(0, ("MULTI",), ("PING",), ("EXEC",)),
+      norm=[at(0, mask_hello)], tags=TX)
+steps("tx_watch_dirty_queue_error", *on(0, ("WATCH", "k")), *on(1, ("SET", "k", "1")), *on(0, ("MULTI",), ("NOPE",), ("EXEC",)),
+      tags=TX, doc="a queueing error wins over the WATCH")
+steps("tx_watch_expires", *on(0, ("SET", "k", "v", "PX", "100"), ("WATCH", "k")), Sleep(0.25),
+      *on(0, ("MULTI",), ("PING",), ("EXEC",)), tags=TX, slow=True)
+steps("tx_watch_expires_just_now",
+      *on(0, ("MSETEX", "20000", *[x for i in range(20000) for x in (f"x{i}", "v")], "EX", "1000"),
+          ("SET", "k", "v", "PX", "20"), ("WATCH", "k")), Sleep(0.03),
+      *on(0, ("MULTI",), ("PING",), ("EXEC",)), tags=TX, slow=True,
+      doc="expired, not reclaimed yet (the active expiry has 20000 other keys to go through first): EXEC finds it expired")
+steps("tx_watch_expired_already", *on(0, ("SET", "k", "v", "PX", "20")), Sleep(0.1), *on(0, ("WATCH", "k"), ("MULTI",), ("PING",), ("EXEC",)),
+      tags=TX, slow=True)
+steps("tx_watch_expired_then_deleted", *on(0, ("SET", "k", "v", "PX", "20")), Sleep(0.1), *on(0, ("WATCH", "k")),
+      *on(1, ("DEL", "k")), *on(0, ("MULTI",), ("PING",), ("EXEC",)), tags=TX, slow=True)
+steps("tx_watch_expired_then_set", *on(0, ("SET", "k", "v", "PX", "20")), Sleep(0.1), *on(0, ("WATCH", "k")),
+      *on(1, ("SET", "k", "w")), *on(0, ("MULTI",), ("PING",), ("EXEC",)), tags=TX, slow=True)
+steps("tx_watch_expired_then_flushall", *on(0, ("SET", "k", "v", "PX", "20")), Sleep(0.1), *on(0, ("WATCH", "k")),
+      *on(1, ("FLUSHALL",)), *on(0, ("MULTI",), ("PING",), ("EXEC",)), tags=TX, slow=True)
+steps("tx_client_info", *on(0, ("WATCH", "a", "b"), ("CLIENT", "INFO"), ("MULTI",), ("SET", "a", "1"), ("CLIENT", "INFO"), ("EXEC",)),
+      *on(1, ("WATCH", "x")), *on(0, ("SET", "x", "1")), *on(1, ("CLIENT", "INFO")),
+      norm=[lambda i, b: b"<" + b" ".join(f for f in b.split() if f.startswith((b"flags=", b"multi=", b"watch=", b"cmd="))) + b">"
+            if b"id=" in b else b], tags=TX)
+
+
 def by_name():
     return {c.name: c for c in CASES}

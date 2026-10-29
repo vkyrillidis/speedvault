@@ -464,6 +464,78 @@ fn a_replica_syncs_follows_and_carries_on() {
     assert_eq!(p.info("db0"), r.info("db0"));
 }
 
+/// A transaction reaches a replica between `MULTI` and `EXEC`, and the
+/// replica applies it whole even when it arrives in pieces (the proxy
+/// passes 16 KiB at a time): a reader there never sees half of one. A
+/// replica's `WATCH` sees its primary's writes.
+#[test]
+fn a_transaction_reaches_a_replica_whole() {
+    let (p_addr, r_addr) = (start_cluster(), start_cluster());
+    let (mut p, mut r) = (Conn::new(p_addr), Conn::new(r_addr));
+    let (pid, rid) = (id_of(&mut p), id_of(&mut r));
+    let proxy = Proxy::new(p_addr);
+    assert_eq!(call_vec(&mut p, &settable(1, &pid, p_addr.port(), &rid, r_addr.port())), Reply::Simple("OK".into()));
+    assert_eq!(call_vec(&mut r, &settable(1, &pid, proxy.addr.port(), &rid, r_addr.port())), Reply::Simple("OK".into()));
+    p.call_str(&["SET", "{t}a", "0"]);
+    p.call_str(&["SET", "{t}b", "0"]);
+    caught_up(&mut p, &mut r);
+    proxy.slow.store(true, Ordering::SeqCst);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let stop = stop.clone();
+        thread::spawn(move || {
+            let mut c = Conn::new(r_addr);
+            assert_eq!(c.call_str(&["READONLY"]), Reply::Simple("OK".into()));
+            let mut reads = 0;
+            while !stop.load(Ordering::SeqCst) {
+                let Reply::Array(ab) = c.call_str(&["MGET", "{t}a", "{t}b"]) else { panic!() };
+                assert_eq!(ab[0], ab[1], "half a transaction at the replica");
+                reads += 1;
+            }
+            reads
+        })
+    };
+    // Each transaction is larger than what the proxy passes at once.
+    let pad = "p".repeat(40_000);
+    for i in 1..=20 {
+        let n = i.to_string();
+        let replies: Vec<Reply> = [&["MULTI"][..], &["SET", "{t}a", &n], &["SET", "{t}pad", &pad], &["SET", "{t}b", &n], &["EXEC"]]
+            .iter()
+            .map(|args| p.call_str(args))
+            .collect();
+        assert_eq!(replies[4], Reply::Array(vec![Reply::Simple("OK".into()); 3]));
+    }
+    // Every transaction reaches the replica in pieces meanwhile, and in
+    // the same stream: no sync from scratch.
+    caught_up(&mut p, &mut r);
+    proxy.slow.store(false, Ordering::SeqCst);
+    assert_eq!(p.info("sync_full"), "1");
+    stop.store(true, Ordering::SeqCst);
+    let reads = reader.join().unwrap();
+    assert!(reads > 100, "{reads} reads");
+    assert_eq!(r.call_str(&["READONLY"]), Reply::Simple("OK".into()));
+    assert_eq!(r.text(&["GET", "{t}b"]), "20");
+    assert_eq!(contents(&mut p), contents(&mut r));
+
+    // A transaction of reads only, at the replica; its WATCH sees the
+    // primary's writes.
+    assert_eq!(r.call_str(&["WATCH", "{t}a"]), Reply::Simple("OK".into()));
+    p.call_str(&["INCR", "{t}a"]);
+    caught_up(&mut p, &mut r);
+    r.call_str(&["MULTI"]);
+    assert_eq!(r.call_str(&["GET", "{t}a"]), Reply::Simple("QUEUED".into()));
+    // (A nil array reads as an empty one here: one command was queued.)
+    assert_eq!(r.call_str(&["EXEC"]), Reply::Array(vec![]), "touched by the primary");
+    r.call_str(&["MULTI"]);
+    r.call_str(&["GET", "{t}a"]);
+    assert_eq!(r.call_str(&["EXEC"]), Reply::Array(vec![Reply::Bulk(Some(b"21".to_vec()))]));
+    // A write in it is redirected, at queueing, and EXEC refused.
+    r.call_str(&["MULTI"]);
+    assert!(matches!(r.call_str(&["SET", "{t}a", "x"]), Reply::Error(e) if e.starts_with("MOVED ")));
+    assert_eq!(r.call_str(&["EXEC"]), Reply::Error("EXECABORT Transaction discarded because of previous errors.".into()));
+}
+
 #[test]
 fn only_its_replicas_may_sync() {
     let (p_addr, x_addr) = (start_cluster(), start_cluster());

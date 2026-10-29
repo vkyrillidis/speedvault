@@ -288,7 +288,24 @@ redis-cli -p 7000 SET k v
   values and shrinks back afterwards. A protocol error is answered, then the
   connection closed, as Redis does.
 - `command.rs`: the command table (with subcommands and key positions),
-  Redis's arity rules and error texts, and the data commands.
+  Redis's arity rules and error texts, and the data commands. `execute`
+  checks a request in Redis's order (the command, its arity, the password,
+  the slot, memory, the lease), then runs it (`run`), or queues it after
+  `MULTI`.
+- `multi.rs`: transactions, as Redis's `multi.c`. A command refused while
+  queued flags the transaction (`-EXECABORT` at `EXEC`); `EXEC` is checked
+  as one command of every queued key (one slot, served here: Redis's
+  `getNodeByQuery` takes it so), then runs the queue through `run`
+  without suspending: the slot check's waits happen before, `WAIT`
+  answers at once. The stream gets the transaction between `MULTI` and
+  `EXEC` (only once it writes); a replica's fiber waits for its `EXEC`
+  before applying any of it, all in one go, and a slot sync never gets the
+  markers. `WATCH`: who watches which key is in `client.rs`; the store
+  records the keys writes touch (its `Touch`es, where Redis calls
+  `signalModifiedKey`) only while some key is watched, and `touched`
+  drains them after each command, each expiry sweep and each piece of the
+  stream a replica applies. `FLUSHALL`, a slot trimmed and a full resync
+  touch the watched keys that were there.
 - `memory.rs`: the memory count. A global allocator wrapping the system
   one keeps the bytes allocated and not freed (`malloc_usable_size` of
   each block on Linux, so allocator rounding counts), as Redis's zmalloc
@@ -345,7 +362,8 @@ redis-cli -p 7000 SET k v
   most every millisecond for the stream, and every second. The lease
   runs 3 s from the sending of the newest ping a replica in it answered.
 - `migrate.rs`: the fiber that sends the keys of slots migrating away.
-- `client.rs`: the registry of connections behind `CLIENT LIST`.
+- `client.rs`: the registry of connections behind `CLIENT LIST`, and of
+  the keys they watch.
 - `log.rs`: the logger; `main.rs`: arguments and signals.
 - `lib.rs`: the accept loop, a panic handler that logs and keeps serving,
   and active expiry every 100 ms, which also gives the expiry index's room

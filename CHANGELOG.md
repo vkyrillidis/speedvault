@@ -32,6 +32,14 @@ The first public release.
   state on disk.
 - Live slot migration by snapshot plus the writes made meanwhile: no key
   frozen, no write lost, one `-MOVED` per slot.
+- Transactions, Redis 8.10.2's: `MULTI`, `EXEC`, `DISCARD`, `WATCH`,
+  `UNWATCH`; each command checked as queued, `EXEC` as one command of
+  their keys (`-EXECABORT`, `-CROSSSLOT`, `-MOVED`), run with nothing in
+  between, in the replication stream between `MULTI` and `EXEC` (a
+  replica applies it whole); `WATCH` touched as Redis touches it
+  (`signalModifiedKey`), expiry, `FLUSHALL` and a slot leaving included;
+  `CLIENT LIST`'s `multi`, `watch` and flags `x`, `d`, `r`; `INFO`'s
+  `watching_clients`, `total_watched_keys`.
 - A password (`--requirepass-file`, `--requirepass`), Redis 8.10.2's
   `requirepass`: `AUTH`, `HELLO ... AUTH`, `-NOAUTH`, `CONFIG GET/SET
   requirepass`, `acl_access_denied_auth` (and

@@ -69,6 +69,17 @@
 //! the stream, the replica sets the time to [`BEFORE_TIME`], before every
 //! expiry: the keys its primary hasn't deleted are there for its writes.
 //!
+//! # Touches
+//!
+//! For `WATCH`, what a key's writes are: while [`Store::record_touches`]
+//! has it on, every write that changed a key records it, as Redis's
+//! commands call `signalModifiedKey`: whenever the command did something,
+//! even the same value again (`SET`, `HSET`, `INCRBY 0`, `APPEND ""`,
+//! `LSET`, `LTRIM`), and not when it did nothing (`SADD` of a member there,
+//! a `SET NX` that found the key, `DEL` of a missing key, `LREM` without a
+//! match, `PERSIST` without an expiry). A key reclaimed as expired is
+//! recorded too, as expired ([`Touch::expired`]). Off, it costs a branch.
+//!
 //! # Memory
 //!
 //! A `Vec` never gives back the room it grew, so after many deletions
@@ -303,6 +314,9 @@ pub struct Store {
     /// While recording (see the module docs), the effects since they were
     /// last taken.
     effects: Option<Vec<Effect>>,
+    /// While recording (see the module docs), the keys touched since they
+    /// were last taken.
+    touched: Option<Vec<Touch>>,
     /// Whether expired keys are deleted (not at a replica).
     reclaim: bool,
     /// Slots whose expired keys are hidden but not deleted, as at a
@@ -340,6 +354,15 @@ pub enum IncrexReply {
     Floats(Vec<u8>, Vec<u8>),
 }
 
+/// A key a write changed, or reclaimed as expired; see the [module
+/// docs](self).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Touch {
+    pub key: Box<[u8]>,
+    /// It had expired and was deleted (by a lookup or `expire_cycle`).
+    pub expired: bool,
+}
+
 /// What a write did, when it isn't what the command says as sent, or a key
 /// reclaimed as expired; see the [module docs](self).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -365,6 +388,7 @@ impl Default for Store {
             max_string: DEFAULT_MAX_STRING,
             rng,
             effects: None,
+            touched: None,
             reclaim: true,
             held: Vec::new(),
         }
@@ -448,6 +472,34 @@ impl Store {
         }
     }
 
+    /// Records the keys writes touch from now on, or stops (and drops those
+    /// not taken). See the module docs.
+    pub fn record_touches(&mut self, on: bool) {
+        self.touched = on.then(Vec::new);
+    }
+
+    /// The keys touched since the last call, in order.
+    pub fn take_touched(&mut self) -> Vec<Touch> {
+        match &mut self.touched {
+            Some(touched) if !touched.is_empty() => mem::take(touched),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Records that a write changed `key`, if recording.
+    fn touch(&mut self, key: &[u8]) {
+        if let Some(touched) = &mut self.touched {
+            touched.push(Touch { key: key.into(), expired: false });
+        }
+    }
+
+    /// Records that `key` was reclaimed as expired, if recording.
+    fn touch_expired(&mut self, key: &[u8]) {
+        if let Some(touched) = &mut self.touched {
+            touched.push(Touch { key: key.into(), expired: true });
+        }
+    }
+
     /// Redis's `proto-max-bulk-len` as far as the store is concerned: the
     /// longest string `APPEND` may make (default 512 MiB). The dbnode
     /// enforces it on request sizes.
@@ -520,6 +572,7 @@ impl Store {
                 // no key behind.
                 if at.is_none_or(|at| at > now) {
                     self.insert(key, value, at);
+                    self.touch(key);
                 }
                 None
             }
@@ -538,6 +591,7 @@ impl Store {
                     (_, Some(at)) if has_ttl => e.set_expire_at(at),
                     (_, Some(at)) => self.set_ttl(key, Some(at)),
                 }
+                self.touch(key);
                 old
             }
         };
@@ -572,7 +626,9 @@ impl Store {
         if !value_matches(value, cond, matching)? {
             return Ok(false);
         }
-        Ok(self.remove(key).is_some())
+        self.remove(key);
+        self.touch(key);
+        Ok(true)
     }
 
     /// `MSETEX numkeys key value ... [NX|XX] [EX|PX|EXAT|PXAT n|KEEPTTL]`
@@ -756,6 +812,7 @@ impl Store {
             // The time has come: the key goes (if it was there).
             if found {
                 self.remove(key);
+                self.touch(key);
             }
             self.effect(|| if found { Effect::As(vec![b"DEL".to_vec(), key.to_vec()]) } else { Effect::Nothing });
             return Ok(reply);
@@ -776,6 +833,7 @@ impl Store {
         } else {
             effect.push(b"KEEPTTL".to_vec());
         }
+        self.touch(key);
         self.effect(|| Effect::As(effect));
         Ok(reply)
     }
@@ -812,7 +870,11 @@ impl Store {
     /// `DEL` of one key: true if it existed. `DEL k1 k2 ...` counts the trues.
     pub fn del(&mut self, key: &[u8]) -> bool {
         // An expired key is deleted either way, but doesn't count.
-        self.live(key).is_some() && self.remove(key).is_some()
+        let found = self.live(key).is_some() && self.remove(key).is_some();
+        if found {
+            self.touch(key);
+        }
+        found
     }
 
     /// `EXISTS` of one key. `EXISTS k1 k2 ...` counts the trues, repeats
@@ -826,6 +888,13 @@ impl Store {
     /// a migrating slot uses (the command may be redirected, not run).
     pub fn contains(&self, key: &[u8]) -> bool {
         self.keys.get(key).is_some_and(|e| self.now <= e.expire_at())
+    }
+
+    /// Whether `key` is in the keyspace, expired or not (Redis's `dbFind`):
+    /// whether a `FLUSHALL` touches it, and with [`contains`](Self::contains)
+    /// whether it has expired without being reclaimed.
+    pub fn present(&self, key: &[u8]) -> bool {
+        self.keys.get(key).is_some()
     }
 
     /// A live key's value and the milliseconds it has left (`None` without
@@ -847,6 +916,7 @@ impl Store {
                 e.as_str()?;
             }
         }
+        self.touch(key);
         match self.remove(key).map(Kv::into_value) {
             Some(Value::Str(s)) => Ok(Some(s)),
             _ => unreachable!("checked above"),
@@ -858,20 +928,22 @@ impl Store {
     /// by doubling: appending stays linear.
     pub fn append(&mut self, key: &[u8], value: &[u8]) -> Result<usize, Error> {
         let max = self.max_string;
-        match self.live(key) {
+        let len = match self.live(key) {
             Some(e) => {
                 if e.as_str()?.len() + value.len() > max {
                     return Err(Error::StringTooLong);
                 }
                 let s = e.str_buf()?;
                 s.extend_from_slice(value);
-                Ok(s.len())
+                s.len()
             }
             None => {
                 self.insert(key, value, None);
-                Ok(value.len())
+                value.len()
             }
-        }
+        };
+        self.touch(key);
+        Ok(len)
     }
 
     /// `STRLEN`: 0 for a missing key.
@@ -886,18 +958,20 @@ impl Store {
     /// 0; the TTL is kept.
     pub fn incr_by(&mut self, key: &[u8], by: i64) -> Result<i64, Error> {
         let mut buf = [0; 20];
-        match self.live(key) {
+        let new = match self.live(key) {
             Some(e) => {
                 let old = parse_i64(e.as_str()?).ok_or(Error::NotInteger)?;
                 let new = old.checked_add(by).ok_or(Error::Overflow)?;
                 e.set_str(format_i64(&mut buf, new));
-                Ok(new)
+                new
             }
             None => {
                 self.insert(key, format_i64(&mut buf, by), None);
-                Ok(by)
+                by
             }
-        }
+        };
+        self.touch(key);
+        Ok(new)
     }
 
     /// `INCRBYFLOAT`: the new value, as written. In Redis's order: the
@@ -917,6 +991,7 @@ impl Store {
             None => self.insert(key, &new, None),
         }
         self.live(key).expect("just written").mark_float();
+        self.touch(key);
         self.effect(|| Effect::As(vec![b"SET".to_vec(), key.to_vec(), new.clone(), b"KEEPTTL".to_vec()]));
         Ok(new)
     }
@@ -964,6 +1039,7 @@ impl Store {
             self.set_ttl(key, Some(at));
             self.effect(|| Effect::As(vec![b"PEXPIREAT".to_vec(), key.to_vec(), at.to_string().into()]));
         }
+        self.touch(key);
         Ok(true)
     }
 
@@ -1001,6 +1077,7 @@ impl Store {
         match self.live(key) {
             Some(e) if e.has_ttl() => {
                 self.set_ttl(key, None);
+                self.touch(key);
                 true
             }
             _ => false,
@@ -1114,6 +1191,7 @@ impl Store {
             if self.now > self.keys.at(loc).expire_at() && self.reclaims(loc.table) {
                 // The last key moves into this place: examine it next.
                 let kv = self.remove_at(loc);
+                self.touch_expired(kv.key());
                 self.effect(|| Effect::Expired(kv.key().to_vec()));
                 removed += 1;
             } else {
@@ -1163,6 +1241,7 @@ impl Store {
         if self.now > self.keys.at(loc).expire_at() {
             if self.reclaims(loc.table) {
                 self.remove_at(loc);
+                self.touch_expired(key);
                 self.effect(|| Effect::Expired(key.to_vec()));
             }
             return None;

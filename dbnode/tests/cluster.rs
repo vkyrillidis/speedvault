@@ -153,6 +153,51 @@ fn keys_are_routed_by_slot() {
     assert_eq!(processed(&after), processed(&before) + 1, "only the INFO counts");
 }
 
+/// A transaction in cluster mode, as Redis 8 takes it: each command is
+/// checked as it's queued (another node's key is redirected, and aborts the
+/// transaction), and `EXEC` as one command of all their keys (two slots:
+/// `CROSSSLOT`, nothing run, the transaction gone).
+#[test]
+fn transactions_are_routed_as_a_whole() {
+    const EXECABORT: &[u8] = b"-EXECABORT Transaction discarded because of previous errors.\r\n";
+    let (mut c, me) = node();
+    let port = c.0.peer_addr().unwrap().port();
+    split(&mut c, &me, port);
+    let other_slot = key_in(0..=100, "k");
+
+    c.call(&[b"MULTI"], OK);
+    c.call(&[b"SET", b"{bar}x", b"1"], b"+QUEUED\r\n");
+    c.call(&[b"GET", b"{bar}y"], b"+QUEUED\r\n");
+    c.call(&[b"PING"], b"+QUEUED\r\n");
+    c.call(&[b"EXEC"], b"*3\r\n+OK\r\n$-1\r\n+PONG\r\n");
+
+    c.call(&[b"MULTI"], OK);
+    c.call(&[b"SET", b"{bar}x", b"2"], b"+QUEUED\r\n");
+    c.call(&[b"SET", b"foo", b"2"], MOVED_FOO);
+    c.call(&[b"MGET", b"bar", &other_slot], CROSSSLOT);
+    c.call(&[b"EXEC"], EXECABORT);
+
+    c.call(&[b"MULTI"], OK);
+    c.call(&[b"SET", b"{bar}x", b"3"], b"+QUEUED\r\n");
+    c.call(&[b"SET", &other_slot, b"3"], b"+QUEUED\r\n");
+    c.call(&[b"EXEC"], CROSSSLOT);
+    c.call(&[b"EXEC"], b"-ERR EXEC without MULTI\r\n");
+    c.call(&[b"MGET", b"{bar}x", b"{bar}x"], b"*2\r\n$1\r\n1\r\n$1\r\n1\r\n");
+
+    // Without keys: served here.
+    c.call(&[b"MULTI"], OK);
+    c.call(&[b"PING"], b"+QUEUED\r\n");
+    c.call(&[b"EXEC"], b"*1\r\n+PONG\r\n");
+
+    // WATCH is checked as any command with keys.
+    c.call(&[b"WATCH", b"foo"], MOVED_FOO);
+    c.call(&[b"WATCH", b"bar", &other_slot], CROSSSLOT);
+    c.call(&[b"WATCH", b"bar", b"{bar}x"], OK);
+    c.call(&[b"MULTI"], OK);
+    c.call(&[b"INCR", b"{bar}x"], b"+QUEUED\r\n");
+    c.call(&[b"EXEC"], b"*1\r\n:2\r\n");
+}
+
 #[test]
 fn cluster_commands() {
     let (mut c, me) = node();
@@ -491,6 +536,23 @@ fn migrating_slot_at_the_target() {
     let mine = text.lines().find(|l| l.contains("myself")).unwrap();
     assert!(mine.ends_with(&format!(" connected 8192-16383 [5061-<-{B}]")), "{text}");
     c.call(&[b"CLUSTER", b"COUNTKEYSINSLOT", b"5061"], b":1\r\n");
+    // In a transaction, ASKING holds until EXEC, as Redis keeps its flag
+    // while in MULTI; then it's gone.
+    c.call(&[b"ASKING"], OK);
+    c.call(&[b"MULTI"], OK);
+    c.call(&[b"GET", b"bar"], b"+QUEUED\r\n");
+    c.call(&[b"INCR", b"bar"], b"+QUEUED\r\n");
+    c.call(&[b"EXEC"], b"*2\r\n$1\r\n1\r\n:2\r\n");
+    c.call(&[b"GET", b"bar"], MOVED);
+    c.call(&[b"MULTI"], OK);
+    c.call(&[b"GET", b"bar"], MOVED);
+    c.call(&[b"EXEC"], b"-EXECABORT Transaction discarded because of previous errors.\r\n");
+    // Several keys, one missing: as a request of them all.
+    c.call(&[b"ASKING"], OK);
+    c.call(&[b"MULTI"], OK);
+    c.call(&[b"GET", b"bar"], b"+QUEUED\r\n");
+    c.call(&[b"GET", b"{bar}x"], b"+QUEUED\r\n");
+    c.call(&[b"EXEC"], TRYAGAIN);
     // Standalone, ASKING is refused like the other cluster commands.
     let mut s = Client::connect(start());
     s.call(&[b"ASKING"], b"-ERR This instance has cluster support disabled\r\n");

@@ -143,7 +143,7 @@ fn info_memory_fields() {
     // In the default INFO, after Clients.
     c.cmd(&[b"INFO"]);
     let all = c.read_text();
-    assert!(all.contains("connected_clients:1\r\n\r\n# Memory\r\nused_memory:"), "{all}");
+    assert!(all.contains("connected_clients:1\r\n") && all.contains("total_watched_keys:0\r\n\r\n# Memory\r\nused_memory:"), "{all}");
 }
 
 /// The dbnode binary, killed when dropped.

@@ -52,6 +52,13 @@ mode `CONFIG SET requirepass` is refused: to change the password,
 restart every node and stuart with the new one (until they all have it,
 the old and the new can't reach each other).
 
+**Transactions** in a cluster are as in Redis Cluster: every key of a
+`MULTI` ... `EXEC` in one slot (give them a hash tag, `{user42}:a`,
+`{user42}:b`), sent to its owner; `EXEC` across slots is refused
+(`-CROSSSLOT`), and a slot that moved since gets `-MOVED` at `EXEC`, with
+nothing run. A transaction runs whole on the primary and reaches its
+replicas whole: a reader of a replica never sees half of one.
+
 Without `--create-when`, run `redis-cli -p 7600 STUART CREATE` once the
 nodes have joined. On several machines, each node gets `--announce` with
 the address clients reach it at, and `--stuart` with stuart's address

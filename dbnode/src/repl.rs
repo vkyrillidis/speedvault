@@ -132,6 +132,9 @@ pub(crate) struct Replication {
     /// replicas synced from scratch, carrying on, and asking to carry on
     /// when they couldn't.
     pub(crate) syncs: [Cell<u64>; 3],
+    /// While `EXEC` runs a transaction: whether its `MULTI` is in the
+    /// stream yet (written before its first command, if any).
+    transaction: Cell<Option<bool>>,
 }
 
 /// A replica attached: what it is sent.
@@ -532,6 +535,7 @@ impl Replication {
             slot_syncs: RefCell::new(Vec::new()),
             slots_wake: Notify::new(),
             syncs: Default::default(),
+            transaction: Cell::new(None),
         }
     }
 
@@ -642,8 +646,34 @@ impl Replication {
         }
     }
 
-    /// One command into the stream, and to the replicas.
+    /// A transaction starts (`EXEC`): what it writes goes into the stream
+    /// between `MULTI` and `EXEC`, which a replica applies at once (and a
+    /// slot sync never gets: its target serves nothing meanwhile).
+    pub(crate) fn begin_transaction(&self) {
+        self.transaction.set(Some(false));
+    }
+
+    /// The transaction ends: whether it wrote anything (then its `EXEC`
+    /// went into the stream too).
+    pub(crate) fn end_transaction(&self) -> bool {
+        let wrote = self.transaction.take() == Some(true);
+        if wrote {
+            self.push([&b"EXEC"[..]], Touches::Nothing);
+        }
+        wrote
+    }
+
+    /// One command into the stream, and to the replicas; in a transaction,
+    /// after its `MULTI`.
     fn append<'a>(&self, args: impl IntoIterator<Item = &'a [u8], IntoIter: ExactSizeIterator>, touches: Touches) {
+        if self.transaction.get() == Some(false) {
+            self.transaction.set(Some(true));
+            self.push([&b"MULTI"[..]], Touches::Nothing);
+        }
+        self.push(args, touches);
+    }
+
+    fn push<'a>(&self, args: impl IntoIterator<Item = &'a [u8], IntoIter: ExactSizeIterator>, touches: Touches) {
         let args = args.into_iter();
         let mut bytes = self.scratch.borrow_mut();
         bytes.clear();
@@ -804,7 +834,9 @@ pub(crate) fn wait(args: &Args, node: &crate::Node, client: &crate::client::Clie
     let repl = &node.repl;
     let woff = client.woff.get();
     let mut acked = repl.acked_by(woff);
-    if (acked as i64) < wanted {
+    // In a transaction, no waiting: the count as it is (Redis denies
+    // blocking in EXEC).
+    if (acked as i64) < wanted && !client.in_exec.get() {
         let deadline = (timeout > 0).then(|| Instant::now().checked_add(Duration::from_millis(timeout))).flatten();
         let me = Rc::new(Notify::new());
         let _entered = repl.acks.enter(me.clone());

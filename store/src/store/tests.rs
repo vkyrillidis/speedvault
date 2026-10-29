@@ -1403,3 +1403,33 @@ fn a_slot_given_up_goes_in_parts() {
     assert_eq!(s.drop_slot_part(u16::from(b'a'), 4), Vec::<Box<[u8]>>::new());
     check(&s);
 }
+
+#[test]
+fn touches_are_recorded_only_when_asked() {
+    let mut s = store();
+    s.set(b"a", b"1", SetOptions::default()).unwrap();
+    assert!(s.take_touched().is_empty(), "not recording");
+    s.record_touches(true);
+    let touched = |s: &mut Store| s.take_touched().into_iter().map(|t| (String::from_utf8(t.key.into()).unwrap(), t.expired)).collect::<Vec<_>>();
+    s.set(b"a", b"1", SetOptions::default()).unwrap();
+    s.set(b"a", b"2", SetOptions { cond: SetCond::Nx, ..SetOptions::default() }).unwrap();
+    s.sadd(b"s", &[b"m"]).unwrap();
+    s.sadd(b"s", &[b"m"]).unwrap();
+    assert!(!s.del(b"missing"));
+    s.incr_by(b"n", 0).unwrap();
+    s.push(b"l", End::Right, &[b"x", b"y"], false).unwrap();
+    s.lrem(b"l", 0, b"z").unwrap();
+    s.ltrim(b"l", 0, -1).unwrap();
+    assert_eq!(touched(&mut s), [("a", false), ("s", false), ("n", false), ("l", false), ("l", false)].map(|(k, e)| (k.to_string(), e)));
+    // Reclaimed as expired: by a lookup, and by the sweep.
+    s.set(b"e1", b"v", SetOptions { expiry: SetExpiry::Px(10), ..SetOptions::default() }).unwrap();
+    s.set(b"e2", b"v", SetOptions { expiry: SetExpiry::Px(10), ..SetOptions::default() }).unwrap();
+    s.take_touched();
+    s.set_now(s.now() + 20);
+    assert_eq!(s.get(b"e1"), Ok(None));
+    s.expire_cycle(10);
+    assert_eq!(touched(&mut s), [("e1", true), ("e2", true)].map(|(k, e)| (k.to_string(), e)));
+    s.record_touches(false);
+    s.set(b"a", b"3", SetOptions::default()).unwrap();
+    assert!(s.take_touched().is_empty());
+}

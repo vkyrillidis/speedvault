@@ -548,6 +548,49 @@ fn a_cluster_node_s_password_is_set_at_start() {
     c.call(&[b"CONFIG", b"GET", b"requirepass"], b"*2\r\n$11\r\nrequirepass\r\n$6\r\ns3cret\r\n");
 }
 
+/// A client that goes away watching keys, in a transaction, leaves
+/// nothing behind: its queued commands never run, others' WATCH goes on.
+#[test]
+fn a_client_leaving_mid_transaction() {
+    let addr = start();
+    let mut a = Client::connect(addr);
+    a.call(&[b"WATCH", b"k"], OK);
+    a.call(&[b"MULTI"], OK);
+    a.call(&[b"SET", b"k", b"1"], b"+QUEUED\r\n");
+    drop(a);
+    let mut b = Client::connect(addr);
+    b.call(&[b"WATCH", b"k", b"j"], OK);
+    // Until the server has seen a go.
+    let mut c = Client::connect(addr);
+    let gone = Instant::now();
+    loop {
+        c.cmd(&[b"CLIENT", b"LIST"]);
+        if c.read_text().lines().count() == 2 {
+            break;
+        }
+        assert!(gone.elapsed() < Duration::from_secs(5), "the client stays listed");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let watching = |c: &mut Client| {
+        c.cmd(&[b"INFO", b"clients"]);
+        let text = c.read_text();
+        let field = |name: &str| text.lines().find_map(|l| l.strip_prefix(name)).unwrap().to_string();
+        (field("watching_clients:"), field("total_watched_keys:"))
+    };
+    assert_eq!(watching(&mut c), ("1".into(), "2".into()), "a's watch gone with it");
+    c.call(&[b"SET", b"k", b"2"], OK);
+    assert_eq!(watching(&mut c), ("0".into(), "0".into()), "b's unwatched once touched");
+    b.call(&[b"MULTI"], OK);
+    b.call(&[b"PING"], b"+QUEUED\r\n");
+    b.call(&[b"EXEC"], b"*-1\r\n");
+    c.call(&[b"GET", b"k"], b"$1\r\n2\r\n");
+    // Nothing watched now: writes are recorded for nobody.
+    b.call(&[b"MULTI"], OK);
+    b.call(&[b"PING"], b"+QUEUED\r\n");
+    c.call(&[b"SET", b"j", b"1"], OK);
+    b.call(&[b"EXEC"], b"*1\r\n+PONG\r\n");
+}
+
 #[test]
 fn unknown_command() {
     let mut c = Client::connect(start());

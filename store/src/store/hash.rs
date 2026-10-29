@@ -41,7 +41,9 @@ impl Store {
         // before anything is set.
         h.note_lengths(pairs);
         let (pairs, _) = pairs.as_chunks::<2>();
-        Ok(pairs.iter().filter(|[f, v]| h.insert(f, v)).count())
+        let added = pairs.iter().filter(|[f, v]| h.insert(f, v)).count();
+        self.touch(key);
+        Ok(added)
     }
 
     /// `HSETNX`: true if the field was new and is now set.
@@ -52,7 +54,9 @@ impl Store {
             return Ok(false);
         }
         h.note_lengths(&[field, value]);
-        Ok(h.insert(field, value))
+        let added = h.insert(field, value);
+        self.touch(key);
+        Ok(added)
     }
 
     /// `HDEL`: how many of `fields` were there.
@@ -62,6 +66,9 @@ impl Store {
         let removed = fields.iter().filter(|f| h.remove(f)).count();
         if h.is_empty() {
             self.remove(key);
+        }
+        if removed > 0 {
+            self.touch(key);
         }
         Ok(removed)
     }
@@ -81,6 +88,7 @@ impl Store {
         let mut buf = Vec::with_capacity(20);
         write_i64(&mut buf, new);
         h.insert(field, &buf);
+        self.touch(key);
         Ok(new)
     }
 
@@ -103,6 +111,7 @@ impl Store {
         let mut new = Vec::new();
         old.add(incr).ok_or(Error::NotFinite)?.write(&mut new);
         h.insert(field, &new);
+        self.touch(key);
         self.effect(|| Effect::As(vec![b"HSET".to_vec(), key.to_vec(), field.to_vec(), new.clone()]));
         Ok(new)
     }

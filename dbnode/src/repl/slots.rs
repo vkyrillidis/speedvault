@@ -305,7 +305,9 @@ pub(crate) fn trim_loop(node: Rc<Node>) {
             }
             let mut deleted = 0;
             while given_up(slot) {
+                let watched = crate::multi::present_watched(&node, Some(slot));
                 let keys = node.store.borrow_mut().drop_slot_part(slot, TRIM_BATCH);
+                crate::multi::deleted(&node, watched);
                 for key in &keys {
                     node.repl.relay_del(key);
                 }
@@ -320,7 +322,9 @@ pub(crate) fn trim_loop(node: Rc<Node>) {
 /// `slots`' keys go, here and at the replicas.
 fn drop_slots(node: &Node, slots: &[u16]) {
     for &slot in slots {
+        let watched = crate::multi::present_watched(node, Some(slot));
         node.store.borrow_mut().drop_slot(slot);
+        crate::multi::deleted(node, watched);
         node.repl.relay_drop(slot);
     }
 }

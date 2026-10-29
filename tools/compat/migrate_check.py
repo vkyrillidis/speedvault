@@ -873,6 +873,87 @@ def check_collections(cluster: "Cluster", w: CollectionWriter, lossy: Set[int]) 
     return problems
 
 
+TX_PAIRS = 64
+# Errors that say EXEC ran nothing: the transaction was refused whole.
+REFUSED = ("MOVED", "ASK", "TRYAGAIN", "CLUSTERDOWN", "EXECABORT", "CROSSSLOT", "NOREPLICAS", "LOADING",
+           "Transaction discarded")
+
+
+def tx_keys(i: int) -> Tuple[str, str]:
+    return f"{{tx:{i}}}a", f"{{tx:{i}}}b"
+
+
+class TxWriter(Writer):
+    """Transactions through redis-py, each on a connection to the node its
+    slot map gives the pair's slot: MULTI, INCR {tx:<i>}a, INCR {tx:<i>}b,
+    EXEC. One refused (EXEC's -MOVED, -TRYAGAIN, -EXECABORT...: nothing
+    ran) makes it refresh its map and counts for nothing; one whose reply
+    was lost is in doubt. check_transactions: the two counters of a pair
+    always equal (never half a transaction, even in the slots of a node
+    killed), and within acknowledged and in doubt."""
+    name = "redis-py (transactions)"
+
+    def __init__(self, names: List[str], seed_port: int):
+        super().__init__(names, seed_port, [])
+        # Per pair: acknowledged, in doubt.
+        self.pairs = [[0, 0] for _ in range(TX_PAIRS)]
+        self.refused = 0
+
+    def run(self):
+        rc = wait_for("redis-py to connect", lambda: RedisCluster(password=PASSWORD, host=HOST, port=self.seed_port))
+        i = self.offset
+        while not self.stopping.is_set():
+            i = (i + 1) % TX_PAIRS
+            a, b = tx_keys(i)
+            try:
+                r = rc.get_redis_connection(rc.get_node_from_key(a))
+                p = r.pipeline(transaction=True)
+                p.incr(a)
+                p.incr(b)
+                p.execute()
+                self.pairs[i][0] += 1
+            except Exception as e:  # noqa: BLE001 - refused, or in doubt
+                ex = redis.exceptions
+                redirected = (ex.MovedError, ex.AskError, ex.TryAgainError, ex.ClusterDownError, ex.ExecAbortError)
+                if isinstance(e, redirected) or (isinstance(e, ex.ResponseError) and str(e).startswith(REFUSED)):
+                    self.refused += 1
+                else:
+                    self.pairs[i][1] += 1
+                    self.tx_failures += 1
+                    if len(self.errors) < 1000:
+                        self.errors.append(f"{a} {b}: {type(e).__name__}: {e}")
+                try:
+                    rc.nodes_manager.initialize()
+                except Exception:  # noqa: BLE001 - the next try again
+                    time.sleep(0.1)
+            self.ops += 1
+        rc.close()
+
+    tx_failures = 0
+
+
+def check_transactions(cluster: "Cluster", w: TxWriter, lossy: Set[int]) -> List[str]:
+    problems: List[str] = []
+    owners = cluster.owners()
+    for i, (acked, doubt) in enumerate(w.pairs):
+        a, b = tx_keys(i)
+        slot = key_slot(a.encode())
+        if slot not in owners:
+            continue  # the dead node's, not given to any yet
+        va, vb = cluster.node(owners[slot]).mget(a, b)
+        va, vb = int(va or 0), int(vb or 0)
+        if va != vb:
+            problems.append(f"{a} = {va} but {b} = {vb}: half a transaction")
+        elif slot in lossy:
+            if va > acked + RETRIES * doubt:
+                problems.append(f"{a} = {va}: more than its {acked} transactions acknowledged + {doubt} in doubt")
+        elif not acked <= va <= acked + RETRIES * doubt:
+            problems.append(f"{a} = {va}, {acked} transactions acknowledged, {doubt} in doubt")
+    print(f"  checked {TX_PAIRS} transaction pairs: {sum(a for a, _ in w.pairs)} transactions acknowledged, "
+          f"{w.tx_failures} in doubt, {w.refused} refused and retried")
+    return problems
+
+
 def make_writers(args, seed_port: int) -> List[Writer]:
     names = counter_names(args.keys)
     hot = [i for i, n in enumerate(names) if not n.startswith("k:")]
@@ -881,6 +962,7 @@ def make_writers(args, seed_port: int) -> List[Writer]:
     writers[-1].name = "redis-py (hot keys)"
     if COLLECTION:
         writers.append(CollectionWriter(names, seed_port))
+    writers.append(TxWriter(names, seed_port))
     # Lettuce wants a node as its seed (see LettuceWriter): the first one,
     # unless told another.
     for mode in args.lettuce_modes:
@@ -976,6 +1058,8 @@ def check(cluster: Cluster, writers: List[Writer], filler: int, lossy: Set[int],
     for w in writers:
         if isinstance(w, CollectionWriter):
             problems += check_collections(cluster, w, lossy)
+        if isinstance(w, TxWriter):
+            problems += check_transactions(cluster, w, lossy)
     print(f"  checked: {len(where)} keys on {len(cluster.node_ports())} nodes, {sum(map(len, where.values())) - len(where)} twice; "
           f"{len(names)} counters, {sum(sum(w.acked) for w in writers)} INCRs acknowledged, {sum(sum(w.doubt) for w in writers)} in doubt"
           + (f"; {len(lossy)} slots of the dead node: {lost} of its {lossy_keys} counters lost, "
@@ -987,6 +1071,7 @@ def report_writers(writers: List[Writer], may_fail: bool) -> List[str]:
     problems = []
     for w in writers:
         failed = sum(w.doubt) + (w.collection_failures if isinstance(w, CollectionWriter) else 0) - w.client_bugs
+        failed += w.tx_failures if isinstance(w, TxWriter) else 0
         print(f"  {w.name}: {w.ops} INCRs, {failed} failed" + (f", {w.redirects} redirects followed" if w.redirects else "")
               + (f", {w.client_bugs} failed on -ASK to a node it didn't know (the redis-py bug)" if w.client_bugs else ""))
         for e in [e for e in w.errors if "redis_connection" not in e][:3]:

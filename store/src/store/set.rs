@@ -30,19 +30,23 @@ impl Store {
 
     /// `SADD`: how many members are new.
     pub fn sadd(&mut self, key: &[u8], members: &[&[u8]]) -> Result<usize, Error> {
-        match self.live(key) {
+        let added = match self.live(key) {
             Some(e) => {
                 let s = e.as_set_mut()?;
                 s.expect(members.len());
-                Ok(members.iter().filter(|m| s.insert(m)).count())
+                members.iter().filter(|m| s.insert(m)).count()
             }
             None => {
                 let mut s = Set::with_hint(members[0], members.len());
                 let added = members.iter().filter(|m| s.insert(m)).count();
                 self.insert_value(key, Value::Set(Box::new(s)), None);
-                Ok(added)
+                added
             }
+        };
+        if added > 0 {
+            self.touch(key);
         }
+        Ok(added)
     }
 
     /// `SREM`: how many of `members` were there.
@@ -52,6 +56,9 @@ impl Store {
         let removed = members.iter().filter(|m| s.remove(m)).count();
         if s.is_empty() {
             self.remove(key);
+        }
+        if removed > 0 {
+            self.touch(key);
         }
         Ok(removed)
     }
@@ -71,6 +78,7 @@ impl Store {
         if s.is_empty() {
             self.remove(key);
         }
+        self.touch(key);
         self.effect(|| Effect::As(vec![b"SREM".to_vec(), key.to_vec(), member.to_vec()]));
         Ok(Some(member))
     }
@@ -99,6 +107,9 @@ impl Store {
             }
             popped
         };
+        if !popped.is_empty() {
+            self.touch(key);
+        }
         self.effect(|| match popped.is_empty() {
             true => Effect::Nothing,
             false => Effect::As([b"SREM".to_vec(), key.to_vec()].into_iter().chain(popped.iter().map(|m| m.to_vec())).collect()),
@@ -279,6 +290,7 @@ impl Store {
         self.del(dst);
         if len > 0 {
             self.insert_value(dst, Value::Set(Box::new(result)), None);
+            self.touch(dst);
         }
         Ok(len)
     }

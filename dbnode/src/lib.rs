@@ -27,6 +27,7 @@ mod leave;
 pub mod log;
 pub mod memory;
 mod metrics;
+mod multi;
 mod repl;
 
 use client::Clients;
@@ -330,6 +331,8 @@ fn expire_sweep(node: &Node) {
     if node.repl.active() {
         node.repl.feed(&mut store, None);
     }
+    drop(store);
+    multi::touched(node);
 }
 
 /// A new node id from 20 random bytes, as Redis makes one.

@@ -517,6 +517,10 @@ fn info_section(section: &str, node: &Node, text: &mut String) {
         "clients" => {
             text.push_str("# Clients\r\n");
             field(text, "connected_clients", node.clients.len());
+            // Of Redis 8's other fields, those of transactions.
+            let (clients, keys) = node.clients.watch_counts();
+            field(text, "watching_clients", clients);
+            field(text, "total_watched_keys", keys);
         }
         "memory" => {
             // Redis's fields, as far as the node keeps them (see `memory`).

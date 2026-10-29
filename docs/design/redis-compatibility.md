@@ -62,6 +62,24 @@ password keeps clients logged in. Deliberately different:
 - Redis 8.10.2 never answers a bad bulk length whose line ends in a later
   read (an unauthenticated one too); we reply its error, as 7.0.15 does.
 
+**Transactions** (`MULTI`/`EXEC`, after `AUTH`) copy Redis 8.10.2's: the
+checks while queueing (an unknown command, an arity error, a refused
+slot, `-OOM` flag the transaction, which `EXEC` then refuses with
+`-EXECABORT`), `EXEC` checked as one command of all the queued keys
+(`CROSSSLOT`, `MOVED`, `TRYAGAIN` discard it, `-OOM` and `-NOREPLICAS`
+abort it with `-EXECABORT ... because of: ...`), errors while running as
+replies in the array, `ASKING` holding until `EXEC`, `WAIT` not waiting.
+`WATCH` breaks exactly where Redis's `signalModifiedKey` is called: a
+write that did something, even the same value again (`SET`, `HSET`,
+`INCRBY 0`, `APPEND ""`, `LSET`, `LTRIM`), not one that did nothing
+(`SADD` of a member there, a `SET NX` that lost, `DEL` of a missing key,
+`LREM` without a match, `PERSIST` without a TTL); a key expiring, unless
+it had already expired when watched; `FLUSHALL` only for a key that was
+there. The difftest corpus has each of our write commands both ways
+against Redis. No `RESET` (not implemented), and Redis's queueing memory
+shortcut (an aborted transaction keeps nothing more) shows only in
+`CLIENT LIST`'s `multi`, as in Redis.
+
 Being faster than Redis comes in two steps: on one core, through cheaper I/O
 (fibers, edge-triggered epoll, batched writes; see
 [performance](../performance.md) for how the first run, 0.84–0.94× Redis
