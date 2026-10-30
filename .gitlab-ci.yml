@@ -137,12 +137,19 @@ docker-image:
     # The image as docker-compose.yml runs it: stuart and three nodes.
     - apk add --no-cache bash
     - SPEEDVAULT_IMAGE="$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" bash tools/compat/compose_smoke.sh
+    # Pushed from main as :latest, and from a tag vX.Y.Z as :X.Y.Z.
     - |
-      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ] || [ -n "$CI_COMMIT_TAG" ]; then
         echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
-        docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY_IMAGE:latest"
         docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+      fi
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+        docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY_IMAGE:latest"
         docker push "$CI_REGISTRY_IMAGE:latest"
+      fi
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY_IMAGE:${CI_COMMIT_TAG#v}"
+        docker push "$CI_REGISTRY_IMAGE:${CI_COMMIT_TAG#v}"
       fi
 
 # The Kubernetes manifests in kind (tools/k8s/kind_check.sh): the cluster

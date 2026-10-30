@@ -45,6 +45,7 @@ One node, as a Redis server on port 7000:
 ```sh
 cargo build --release
 target/release/speedvault-server 7000              # or: docker build -t speedvault . && docker run -p 7000:7000 speedvault
+# or the released image: docker run -p 7000:7000 registry.gitlab.com/speedvault/speedvault:0.1.0
 redis-cli -p 7000 SET greeting hello
 redis-cli -p 7000 GET greeting
 ```
