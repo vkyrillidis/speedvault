@@ -32,7 +32,10 @@ without letting it drain): their keys may be lost, and INCRs may fail.
 With replicas, only writes the replica hadn't got: no filler key may be
 lost, nor an INCR or a SET/DEL that WAIT said the replica had. `lossy-zone
 ZONE` notes the slots of every node in that zone (a Kubernetes node about
-to be stopped).
+to be stopped), and as refusing those of each primary outside it whose
+replica is in it: that primary answers -NOREPLICAS from when its lease
+lapses until stuart marks the replica failed (docs/design/replicas.md),
+so writes there may fail, with -NOREPLICAS only, and none may be lost.
 
 `pairs` lists the primaries and their replicas with their zones, and
 fails if a replica is in its primary's zone. `primary` prints the pod
@@ -188,6 +191,14 @@ def lossy_slots() -> Set[int]:
         return set()
 
 
+def refusing_slots() -> Set[int]:
+    try:
+        with open(ctl("refusing")) as f:
+            return {int(s) for s in f.read().split()}
+    except FileNotFoundError:
+        return set()
+
+
 def mem_keys() -> int:
     try:
         with open(ctl("mem")) as f:
@@ -238,6 +249,7 @@ def run(args) -> int:
         for w in writers:
             w.stop()
         lossy = lossy_slots()
+        refusing = refusing_slots()
         replicas = replica_hosts(cluster)
         mc.wait_for("the replicas to catch up", lambda: mc.caught_up(cluster, replicas), 60, 0.1)
         # The WAIT writers send to the node they think owns the key: a
@@ -245,10 +257,17 @@ def run(args) -> int:
         # drops the connection. Those fail (in doubt, refreshed), nothing
         # else.
         waits = [w for w in writers if isinstance(w, (mc.WaitWriter, mc.DelWriter))]
-        problems += mc.report_writers([w for w in writers if w not in waits], may_fail=bool(lossy))
+        problems += mc.report_writers([w for w in writers if w not in waits], may_fail=bool(lossy or refusing))
         problems += mc.report_writers([w for w in waits if w is not dels], may_fail=True)
+        # Refused, without a node gone: -NOREPLICAS only.
+        if refusing and not lossy:
+            for w in writers:
+                other = [e for e in w.errors if "NOREPLICAS" not in e and "redis_connection" not in e]
+                if w not in waits and other:
+                    problems.append(f"{w.name}: {len(other)} writes failed otherwise than refused: {other[:3]}")
+        gone = r"MOVED|Moved|Connection|connection|Timeout|timed out|Broken pipe" + ("|NOREPLICAS" if refusing else "")
         for w in waits:
-            other = [e for e in w.errors if not re.search(r"MOVED|Moved|Connection|connection|Timeout|timed out|Broken pipe", e)]
+            other = [e for e in w.errors if not re.search(gone, e)]
             if other and not lossy:
                 problems.append(f"{w.name}: {len(other)} writes failed otherwise than on a node gone: {other[:3]}")
         problems += mc.check(cluster, writers, args.filler, lossy, mem_keys(), replicas=set(replicas))
@@ -314,10 +333,18 @@ def lossy_zone(zone: str) -> int:
         slots |= mc.slots_of(cluster, i)
     with open(ctl("lossy"), "a") as f:
         f.write(" ".join(map(str, sorted(slots))) + "\n")
+    # The primaries elsewhere of the replicas here.
+    ids = {i for i, _ in nodes}
+    refusing: Set[int] = set()
+    for _, l in nodes:
+        if (p := field(l, "replica-of")) and p not in ids:
+            refusing |= mc.slots_of(cluster, p)
+    with open(ctl("refusing"), "a") as f:
+        f.write(" ".join(map(str, sorted(refusing))) + "\n")
     primaries = [field(l, "name") for _, l in nodes if "replica-of" not in l]
     replicas = [field(l, "name") for _, l in nodes if "replica-of" in l]
     say(f"{zone}: primaries {', '.join(primaries) or 'none'}, replicas {', '.join(replicas) or 'none'}; "
-        f"{len(slots)} slots noted as lossy")
+        f"{len(slots)} slots noted as lossy, {len(refusing)} as refusing")
     return 0
 
 
