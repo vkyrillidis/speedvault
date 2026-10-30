@@ -69,7 +69,10 @@ fn split(c: &mut Client, me: &str, port: u16) {
 fn before_a_table_nothing_is_served() {
     let (mut c, me) = node();
     let port = c.0.peer_addr().unwrap().port();
+    // At once: only a node joining stuart waits for its first table.
+    let asked = std::time::Instant::now();
     c.call(&[b"GET", b"foo"], CLUSTERDOWN);
+    assert!(asked.elapsed() < std::time::Duration::from_millis(500), "{:?}", asked.elapsed());
     c.call(&[b"SET", b"bar", b"1"], CLUSTERDOWN);
     c.call(&[b"PING"], b"+PONG\r\n");
     c.call(&[b"DBSIZE"], b":0\r\n");
@@ -635,6 +638,73 @@ fn joins_stuart_and_retries() {
     assert!(rx.recv_timeout(std::time::Duration::from_millis(2500)).is_err());
     // Joining changes nothing until stuart sends a table.
     c.call(&[b"GET", b"foo"], CLUSTERDOWN);
+}
+
+/// A fake stuart that takes every `STUART JOIN` and sends no table.
+fn silent_stuart() -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let fake = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let stuart = fake.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        for conn in fake.incoming() {
+            let mut conn = conn.unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut request = String::new();
+            for _ in 0..11 {
+                reader.read_line(&mut request).unwrap();
+            }
+            conn.write_all(b"+OK\r\n").unwrap();
+        }
+    });
+    stuart
+}
+
+/// A node joining stuart holds a command on a slot it doesn't know of until
+/// its first table: then the command is redirected (a client reconnecting
+/// to a node restarted at its address gets `MOVED`, as from a restarted
+/// Redis node, not `-CLUSTERDOWN`). `CROSSSLOT` doesn't wait, nor does a
+/// slot the first table leaves unassigned.
+#[test]
+fn before_its_first_table_a_joining_node_holds_commands() {
+    use std::time::Duration;
+    let addr = start_joining(Some(silent_stuart()));
+    let mut c = Client::connect(addr);
+    c.cmd(&[b"CLUSTER", b"MYID"]);
+    let me = c.read_text();
+    let asked = std::time::Instant::now();
+    c.call(&[b"MGET", b"foo", b"bar"], CROSSSLOT);
+    assert!(asked.elapsed() < Duration::from_millis(500), "{:?}", asked.elapsed());
+    let mut held = Client::connect(addr);
+    held.cmd(&[b"GET", b"foo"]);
+    held.0.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+    let mut byte = [0];
+    let early = std::io::Read::read(&mut held.0, &mut byte);
+    assert!(early.is_err(), "answered before the table: {early:?} {byte:?}");
+    held.0.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let p = addr.port().to_string();
+    let nodes = [(&me[..], "127.0.0.1", &p[..]), (B, "10.0.0.2", "7000")];
+    call_vec(&mut c, &settable("1", &nodes, &[("0", "16000", B), ("16001", "16383", "-")]), OK);
+    held.expect(MOVED_FOO);
+    let unassigned = key_in(16001..=16383, "k");
+    let asked = std::time::Instant::now();
+    c.call(&[b"GET", &unassigned], CLUSTERDOWN);
+    assert!(asked.elapsed() < Duration::from_millis(500), "{:?}", asked.elapsed());
+}
+
+/// Without a table FIRST_TABLE_WAIT (3 s) after it started, the node
+/// answers `-CLUSTERDOWN` again, at once from then on.
+#[test]
+fn a_joining_node_waits_for_its_first_table_three_seconds_at_most() {
+    use std::time::{Duration, Instant};
+    let started = Instant::now();
+    let addr = start_joining(Some(silent_stuart()));
+    let mut c = Client::connect(addr);
+    c.call(&[b"GET", b"foo"], CLUSTERDOWN);
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(2900) && waited < Duration::from_millis(4500), "{waited:?}");
+    let again = Instant::now();
+    c.call(&[b"GET", b"foo"], CLUSTERDOWN);
+    assert!(again.elapsed() < Duration::from_millis(200), "{:?}", again.elapsed());
 }
 
 /// `settable` with `REPLICAS` (and `MIGRATING` before it, if any).

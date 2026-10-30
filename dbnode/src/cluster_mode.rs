@@ -10,7 +10,12 @@
 //! The node starts with a table of its own: itself, owning no slots. stuart
 //! replaces it with `CLUSTER SETTABLE` (ours; Redis has none). A table is
 //! taken only if its epoch is newer than the current one, so a delayed or
-//! repeated push can't roll the layout back.
+//! repeated push can't roll the layout back. Until the first one arrives, a
+//! node joining stuart holds the commands it would answer `-CLUSTERDOWN`
+//! (for [`FIRST_TABLE_WAIT`] after it started at most): a client that
+//! reconnects to a node restarted at its address (a pod's rolling restart)
+//! gets the `MOVED` a restarted Redis node sends, its table loaded from
+//! `nodes.conf`, rather than an error.
 //!
 //! The table also says whether the node is a primary or a replica (phase
 //! 8). A replica owns no slots, so it redirects every key to its owner,
@@ -64,6 +69,9 @@ pub(crate) struct Cluster {
     /// Commands with keys served so far: a slot sync's copy pauses after a
     /// batch only if clients were served since the last one.
     pub(crate) served: Cell<u64>,
+    /// When the node started: it waits for its first table from stuart so
+    /// long at most (see the module docs).
+    started: Instant,
     /// Set once the node started leaving the cluster (SIGTERM, see
     /// `leave`), by the thread that handles the signal.
     pub(crate) leaving: Arc<AtomicBool>,
@@ -168,10 +176,15 @@ pub(crate) enum Route {
     Serve,
     /// The reply (a redirect or an error) is written.
     Refused,
-    /// A write to a slot paused, or a request to a slot landing (see the
-    /// module docs): try again a little later ([`wait`]).
+    /// A write to a slot paused, a request to a slot landing, or one before
+    /// the first table from stuart (see the module docs): try again a little
+    /// later ([`wait`]).
     Wait,
 }
+
+/// How long after it started a node joining stuart holds commands for its
+/// first table (see the module docs); then it answers `-CLUSTERDOWN`.
+pub(crate) const FIRST_TABLE_WAIT: Duration = Duration::from_secs(3);
 
 /// Waits a little for a [`Route::Wait`]: one turn of the reactor at first,
 /// a millisecond at a time once that has gone on for a while.
@@ -203,6 +216,7 @@ impl Cluster {
             state: RefCell::new(State { table, me: 0, lease: Vec::new() }),
             stats: MigrateStats::default(),
             served: Cell::new(0),
+            started: Instant::now(),
             leaving: Arc::default(),
             joined: Arc::default(),
             owned: Arc::default(),
@@ -281,7 +295,8 @@ impl Cluster {
     /// (`MOVED`). A key that has expired counts as missing, but isn't
     /// reclaimed here (as in Redis: the command may not run). A `write` to
     /// a slot paused, or any request to a slot landing (moving by snapshot,
-    /// see the module docs), waits ([`Route::Wait`]).
+    /// see the module docs), waits ([`Route::Wait`]), as does one that
+    /// would get `-CLUSTERDOWN` before the first table from stuart.
     pub(crate) fn route<'a>(
         &self,
         keys: impl Iterator<Item = &'a [u8]> + Clone,
@@ -298,6 +313,8 @@ impl Cluster {
             let crosses = keys.clone().any(|k| key_hash_slot(k) != slot);
             if crosses {
                 out.error(b"CROSSSLOT Keys in request don't hash to the same slot");
+            } else if self.stuart.is_some() && state.table.epoch() == 0 && self.started.elapsed() < FIRST_TABLE_WAIT {
+                return Route::Wait;
             } else {
                 out.error(b"CLUSTERDOWN Hash slot not served");
             }
