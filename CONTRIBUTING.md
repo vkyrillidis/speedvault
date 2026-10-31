@@ -1,7 +1,12 @@
 # Contributing
 
-Thanks for helping. Issues and pull requests are welcome; for anything
+Thanks for helping. Issues and merge requests are welcome; for anything
 large, open an issue first so we can agree on the approach.
+
+SpeedVault lives on GitLab: <https://gitlab.com/speedvault/speedvault>.
+The GitHub repository (<https://github.com/vkyrillidis/speedvault>) is a
+mirror that GitLab overwrites on every push, so nothing can be merged
+there: please open issues and merge requests on GitLab.
 
 ## Building and testing
 

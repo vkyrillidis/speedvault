@@ -1,8 +1,8 @@
 # Security
 
-Please report security issues privately, not in a public issue: use the
-repository host's private vulnerability reporting, or contact the
-maintainer directly. Include what you found, how to reproduce it, and the
+Please report security issues privately, not in a public issue: open a
+[confidential issue on GitLab](https://gitlab.com/speedvault/speedvault/-/issues/new)
+(tick "This issue is confidential"), or contact the maintainer directly. Include what you found, how to reproduce it, and the
 version (commit) affected. You'll get an answer within a week.
 
 SpeedVault has no TLS yet, and at most one password (`--requirepass-file`,

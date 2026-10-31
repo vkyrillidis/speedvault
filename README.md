@@ -195,7 +195,9 @@ compatibility suites need a Redis 8.10.2 `redis-server`
 Working and tested, not yet used in production. Phases 1–8 are done (see
 the [design notes](docs/design/)): replicas and failover included; stuart
 itself isn't replicated yet (while it's down, writes go on but the layout
-doesn't change). Issues and pull requests are welcome.
+doesn't change). Issues and merge requests are welcome on
+[GitLab](https://gitlab.com/speedvault/speedvault), the project's home;
+[GitHub](https://github.com/vkyrillidis/speedvault) is a read-only mirror.
 
 ## License
 
