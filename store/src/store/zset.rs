@@ -248,9 +248,9 @@ impl Store {
     /// are none. How many it holds.
     pub fn zstore(&mut self, dst: &[u8], members: &[(&[u8], f64)], hint: usize) -> usize {
         if members.is_empty() {
-            if self.remove(dst).is_some() {
-                self.touch(dst);
-            }
+            // `del`: an expired destination is reclaimed as one, and the
+            // replicas told.
+            self.del(dst);
             return 0;
         }
         let mut z = ZSet::with_hint(hint, 0);
@@ -258,7 +258,7 @@ impl Store {
             z.insert(m, s);
         }
         let n = z.len();
-        self.remove(dst);
+        self.del(dst);
         self.insert_value(dst, Value::ZSet(Box::new(z)), None);
         self.touch(dst);
         n
@@ -387,14 +387,14 @@ impl Store {
     /// packed if it fits, or `dst` deleted if it's empty. Its size.
     pub fn zstore_set(&mut self, dst: &[u8], mut z: ZSet) -> usize {
         if z.is_empty() {
-            if self.remove(dst).is_some() {
-                self.touch(dst);
-            }
+            // `del`: an expired destination is reclaimed as one, and the
+            // replicas told.
+            self.del(dst);
             return 0;
         }
         z.shrink_if_fits();
         let n = z.len();
-        self.remove(dst);
+        self.del(dst);
         self.insert_value(dst, Value::ZSet(Box::new(z)), None);
         self.touch(dst);
         n
@@ -807,6 +807,29 @@ mod tests {
         assert_eq!(s.zintercard(&[b"a", b"none"], 0), 0);
         s.set(b"str", b"v", Default::default()).unwrap();
         assert_eq!(s.zcheck(&[b"a", b"str"]), Err(Error::WrongType));
+    }
+
+    #[test]
+    fn a_packed_set_copies_in_parts() {
+        let mut a = store();
+        let mut b = store();
+        let pairs: Vec<(f64, String)> = (0..106).map(|i| (f64::from(i % 7), format!("m{i}"))).collect();
+        let refs: Vec<(f64, &str)> = pairs.iter().map(|(sc, m)| (*sc, m.as_str())).collect();
+        add(&mut a, b"z", Default::default(), &refs).unwrap();
+        assert_eq!(a.encoding(b"z"), Some("listpack"));
+        let mut staged: Option<Staged> = None;
+        loop {
+            let at = staged.as_ref().map_or(0, Staged::count);
+            let part = a.dump_part(b"z", at, 8, usize::MAX).unwrap();
+            let st = staged.get_or_insert_with(|| Staged::new(part.kind));
+            st.append(&part.payload);
+            if st.count() == part.total {
+                b.restore_staged(b"z", staged.take().unwrap(), part.ttl);
+                break;
+            }
+        }
+        assert_eq!(members(&mut b, b"z"), members(&mut a, b"z"));
+        assert_eq!(b.encoding(b"z"), Some("listpack"));
     }
 
     #[test]

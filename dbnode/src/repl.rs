@@ -597,13 +597,8 @@ impl Replication {
             }
         }
         if let Some((args, cmd)) = sent.filter(|_| !told) {
-            let keys: Vec<&[u8]> = match cmd.key_range(args) {
-                None => Vec::new(),
-                Some((first, last, step)) => {
-                    let last = if last < 0 { args.len() as i32 + last } else { last };
-                    (first..=last).step_by(step as usize).map(|i| &args[i as usize]).collect()
-                }
-            };
+            // Every key, a destination before a count (ZUNIONSTORE) too.
+            let keys: Vec<&[u8]> = crate::command::keys_of(cmd, *args).collect();
             self.append(args.iter(), if keys.is_empty() { Touches::All } else { Touches::Keys(&keys) });
         }
     }

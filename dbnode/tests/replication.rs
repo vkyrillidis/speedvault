@@ -251,6 +251,7 @@ fn contents(c: &mut Conn) -> Vec<(Vec<u8>, String, Reply, i64)> {
                 "hash" => c.call(&[b"HGETALL", &k]),
                 "set" => c.call(&[b"SMEMBERS", &k]),
                 "list" => c.call(&[b"LRANGE", &k, b"0", b"-1"]),
+                "zset" => c.call(&[b"ZRANGE", &k, b"0", b"-1", b"WITHSCORES"]),
                 other => panic!("type {other}"),
             };
             if let Reply::Array(items) = &mut value {
@@ -313,7 +314,7 @@ fn writer(addr: SocketAddr, seed: u64, stop: Arc<AtomicBool>) -> thread::JoinHan
             let i = rng.below(3000);
             let (s, h, z, l) = (format!("s{i}"), format!("h{}", i % 300), format!("z{}", i % 300), format!("l{}", i % 300));
             let v = rng.below(1_000_000).to_string();
-            let args: Vec<String> = match rng.below(16) {
+            let args: Vec<String> = match rng.below(20) {
                 0 => vec!["SET".into(), s, v],
                 1 => vec!["SET".into(), s, v, "PX".into(), (100_000 + rng.below(1000)).to_string()],
                 2 => vec!["DEL".into(), s],
@@ -329,6 +330,10 @@ fn writer(addr: SocketAddr, seed: u64, stop: Arc<AtomicBool>) -> thread::JoinHan
                 12 => vec!["HDEL".into(), "bighash".into(), format!("f{}", rng.below(20_000))],
                 13 => vec!["RPUSH".into(), "biglist".into(), v],
                 14 => vec!["INCRBYFLOAT".into(), format!("f{}", i % 50), "0.5".into()],
+                15 => vec!["ZADD".into(), format!("q{}", i % 300), (rng.below(100) as f64 / 4.0).to_string(), format!("m{}", rng.below(50))],
+                16 => vec!["ZINCRBY".into(), format!("q{}", i % 300), "0.1".into(), format!("m{}", rng.below(50))],
+                17 => vec!["ZPOPMIN".into(), format!("q{}", i % 300)],
+                18 => vec!["ZADD".into(), "bigzset".into(), rng.below(1000).to_string(), format!("m{}", rng.below(20_000))],
                 _ => vec!["SINTERSTORE".into(), format!("{{t}}d{}", i % 10), format!("{{t}}a{}", i % 10), format!("{{t}}b{}", i % 10)],
             };
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -351,6 +356,7 @@ fn load(c: &mut Conn) {
         c.call_str(&["HSET", &format!("h{i}"), "a", "1", "b", "2"]);
         c.call_str(&["SADD", &format!("z{i}"), "1", "2", "x"]);
         c.call_str(&["RPUSH", &format!("l{i}"), "1", "2", "3"]);
+        c.call_str(&["ZADD", &format!("q{i}"), "1", "a", "-0", "b", "2.5", "c"]);
     }
     for i in 0..10 {
         c.call_str(&["SADD", &format!("{{t}}a{i}"), "1", "2", "3"]);
@@ -359,10 +365,15 @@ fn load(c: &mut Conn) {
     for chunk in 0..20 {
         let mut args = vec!["HSET".to_string(), "bighash".into()];
         let mut list = vec!["RPUSH".to_string(), "biglist".into()];
+        let mut zset = vec!["ZADD".to_string(), "bigzset".into()];
         for f in 0..1000 {
             args.extend([format!("f{}", chunk * 1000 + f), "v".into()]);
             list.push(format!("e{}", chunk * 1000 + f));
+            // -0 among them: a large set keeps it, and so must its copy.
+            zset.extend([if f == 7 { "-0".into() } else { format!("{}.5", f % 97) }, format!("m{}", chunk * 1000 + f)]);
         }
+        let a: Vec<&str> = zset.iter().map(String::as_str).collect();
+        c.call_str(&a);
         let a: Vec<&str> = args.iter().map(String::as_str).collect();
         c.call_str(&a);
         let a: Vec<&str> = list.iter().map(String::as_str).collect();

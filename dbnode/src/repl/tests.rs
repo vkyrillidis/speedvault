@@ -242,7 +242,8 @@ impl Rng {
 /// sometimes many at once (so the encodings convert), and every expiry
 /// option, times in the past included.
 fn random_request(rng: &mut Rng, now: i64) -> Vec<Vec<u8>> {
-    let key = |rng: &mut Rng| format!("{}{}", rng.pick(&["k", "h", "s", "l"]), rng.below(4));
+    let key = |rng: &mut Rng| format!("{}{}", rng.pick(&["k", "h", "s", "l", "z"]), rng.below(4));
+    let score = |rng: &mut Rng| rng.pick(&["0", "1", "2.5", "-1", "inf", "-inf", "0.1", "1e300", "3"]).to_string();
     let value = |rng: &mut Rng| match rng.below(5) {
         0 => rng.below(1000).to_string(),
         1 => format!("{}.{}", rng.below(100), rng.below(100)),
@@ -251,7 +252,7 @@ fn random_request(rng: &mut Rng, now: i64) -> Vec<Vec<u8>> {
     };
     let many = |rng: &mut Rng| if rng.below(20) == 0 { 140 } else { 1 + rng.below(4) as usize };
     let k = key(rng);
-    let mut r: Vec<String> = match rng.below(46) {
+    let mut r: Vec<String> = match rng.below(56) {
         0..=3 => {
             let mut r = vec!["SET".into(), k, value(rng)];
             match rng.below(7) {
@@ -351,11 +352,56 @@ fn random_request(rng: &mut Rng, now: i64) -> Vec<Vec<u8>> {
         42 => vec!["LMPOP".into(), "2".into(), k, key(rng), rng.pick(&["LEFT", "RIGHT"]).into(), "COUNT".into(), (rng.below(3) + 1).to_string()],
         43 => vec![rng.pick(&["LRANGE", "LLEN"]).into(), k, "0".into(), "-1".into()],
         44 => vec!["OBJECT".into(), "ENCODING".into(), k],
+        // Sorted sets (phase 9): every write, some growing past the listpack.
+        45 | 46 => {
+            let mut r = vec!["ZADD".into(), k];
+            for opt in ["NX", "XX", "GT", "LT", "CH"] {
+                if rng.below(10) == 0 {
+                    r.push(opt.into());
+                }
+            }
+            for _ in 0..many(rng) {
+                r.extend([score(rng), format!("m{}", rng.below(300))]);
+            }
+            r
+        }
+        47 => vec!["ZINCRBY".into(), k, score(rng), format!("m{}", rng.below(300))],
+        48 => vec!["ZREM".into(), k, format!("m{}", rng.below(300)), format!("m{}", rng.below(300))],
+        49 => {
+            let cmd = rng.pick(&["ZREMRANGEBYRANK", "ZREMRANGEBYSCORE", "ZREMRANGEBYLEX"]);
+            let (lo, hi) = match cmd {
+                "ZREMRANGEBYRANK" => ((rng.below(5) as i64 - 2).to_string(), (rng.below(8) as i64 - 3).to_string()),
+                "ZREMRANGEBYSCORE" => (score(rng), score(rng)),
+                // A lex range only where it's defined whatever the encoding:
+                // over mixed scores, a packed copy and a skiplist answer
+                // differently (Redis's replicas too, as they pack a set
+                // they load).
+                _ => ("-".into(), "+".into()),
+            };
+            vec![cmd.into(), k, lo, hi]
+        }
+        50 => {
+            let mut r = vec![rng.pick(&["ZPOPMIN", "ZPOPMAX"]).into(), k];
+            if rng.below(2) == 0 {
+                r.push(rng.below(4).to_string());
+            }
+            r
+        }
+        51 => vec!["ZRANGESTORE".into(), k, key(rng), "0".into(), (rng.below(200) as i64 - 1).to_string()],
+        52 => {
+            let mut r = vec![rng.pick(&["ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE"]).into(), k, "2".into(), key(rng), key(rng)];
+            if r[0] != "ZDIFFSTORE" && rng.below(2) == 0 {
+                r.extend(["AGGREGATE".into(), rng.pick(&["SUM", "MIN", "MAX", "COUNT"]).into()]);
+            }
+            r
+        }
+        53 => vec!["ZMPOP".into(), "2".into(), k, key(rng), rng.pick(&["MIN", "MAX"]).into(), "COUNT".into(), (rng.below(3) + 1).to_string()],
+        54 => vec![rng.pick(&["ZCARD", "ZRANDMEMBER", "ZSCAN"]).into(), k, "0".into()],
         _ if rng.below(40) == 0 => vec!["FLUSHALL".into()],
         _ => vec!["DBSIZE".into()],
     };
-    // LLEN takes the key only.
-    if r[0] == "LLEN" {
+    // LLEN, ZCARD, ZRANDMEMBER take the key only.
+    if ["LLEN", "ZCARD", "ZRANDMEMBER"].contains(&r[0].as_str()) {
         r.truncate(2);
     }
     r.into_iter().map(String::into_bytes).collect()
@@ -482,11 +528,14 @@ fn tagged(rng: &mut Rng, now: i64, group: Option<u64>) -> Vec<Vec<u8>> {
     let mut parser = Parser::new(Limits::default());
     let Ok(Parsed::Complete { .. }) = parser.parse(&bytes) else { panic!() };
     let args = parser.args(&bytes);
-    let positions: Vec<usize> = match crate::command::find(COMMANDS, &req[0]).and_then(|c| c.key_range(&args)) {
+    let cmd = crate::command::find(COMMANDS, &req[0]);
+    let positions: Vec<usize> = match cmd.and_then(|c| c.key_range(&args)) {
         None => Vec::new(),
         Some((first, last, step)) => {
             let last = if last < 0 { args.len() as i32 + last } else { last };
-            (first..=last).step_by(step as usize).map(|i| i as usize).collect()
+            // A destination before the count (ZUNIONSTORE) is a key too.
+            let dest = cmd.is_some_and(|c| c.dest).then_some(1);
+            dest.into_iter().chain((first..=last).step_by(step as usize).map(|i| i as usize)).collect()
         }
     };
     for i in positions {
@@ -723,6 +772,28 @@ fn a_write_across_sent_and_unsent_keys_sends_both_again() {
         run(&a, &client(), &request(&[b"LMOVE", &sent[1], &unsent[1], b"LEFT", b"RIGHT"]));
     }
     assert_eq!(a.store.borrow().elements(&sent[1]), None);
+    finish(&a, &b, &feed, pending, &mut crate::repl::replica::Staging::new());
+    assert_eq!(views(&a, false), views(&b, false));
+}
+
+/// A STORE command's destination is one of its keys: a ZUNIONSTORE into
+/// a key sent from one not sent leaves both out, and sends both again
+/// (the destination, before the count, too).
+#[test]
+fn a_store_into_a_sent_key_sends_it_again() {
+    let (a, b) = copy_pair();
+    for i in 0..10 {
+        run(&a, &client(), &request(&[b"ZADD", format!("{{t}}z{i}").as_bytes(), b"1", b"a", b"2", format!("m{i}").as_bytes()]));
+    }
+    let (feed, pending) = attach(&a);
+    crate::repl::primary::fill(&a, &feed);
+    let (sent, unsent): (Vec<Vec<u8>>, Vec<Vec<u8>>) = {
+        let copy = feed.copy.borrow();
+        let c = copy.as_ref().unwrap();
+        (0..10).map(|i| format!("{{t}}z{i}").into_bytes()).partition(|k| c.sent.contains(k))
+    };
+    assert!(!sent.is_empty() && !unsent.is_empty(), "the slot half sent: {} sent", sent.len());
+    run(&a, &client(), &request(&[b"ZUNIONSTORE", &sent[0], b"1", &unsent[0], b"WEIGHTS", b"10"]));
     finish(&a, &b, &feed, pending, &mut crate::repl::replica::Staging::new());
     assert_eq!(views(&a, false), views(&b, false));
 }
