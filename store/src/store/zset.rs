@@ -3,9 +3,109 @@
 //! A sorted set emptied by a command loses its key, as in Redis. The reads
 //! work on [`Store::zset_at`]'s set; the writes are here.
 
-use super::{Store, Value};
+use super::{SetOp, Store, Value};
+use crate::collections::Set;
+use crate::kv::Val;
 use crate::zset::ZSet;
 use crate::Error;
+use std::collections::HashMap;
+
+/// How `ZUNION` and `ZINTER` combine a member's scores.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Aggregate {
+    #[default]
+    Sum,
+    Min,
+    Max,
+    /// Redis 8: each set's weight once per member, whatever its score.
+    Count,
+}
+
+impl Aggregate {
+    /// Redis's `zuiWeightedScore`.
+    fn weighted(self, score: f64, weight: f64) -> f64 {
+        if self == Aggregate::Count { weight } else { weight * score }
+    }
+
+    /// Redis's `zunionInterAggregate`: a NaN sum is 0; MIN and MAX keep
+    /// what they have on a tie (so the first of `0` and `-0` stays).
+    fn combine(self, target: f64, value: f64) -> f64 {
+        match self {
+            Aggregate::Sum | Aggregate::Count => {
+                let t = target + value;
+                if t.is_nan() { 0.0 } else { t }
+            }
+            Aggregate::Min => if value < target { value } else { target },
+            Aggregate::Max => if value > target { value } else { target },
+        }
+    }
+}
+
+/// An input of `ZUNION`, `ZINTER`, `ZDIFF`: a sorted set, or a set whose
+/// members score 1, or nothing.
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    Missing,
+    Set(&'a Set),
+    ZSet(&'a ZSet),
+}
+
+impl Source<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Source::Missing => 0,
+            Source::Set(s) => s.len(),
+            Source::ZSet(z) => z.len(),
+        }
+    }
+
+    /// The members and their scores in Redis's `zuiNext` order: a sorted set
+    /// from its end, a set as it iterates.
+    fn for_each(&self, mut f: impl FnMut(&[u8], f64) -> bool) {
+        match self {
+            Source::Missing => {}
+            Source::Set(s) => {
+                for m in s.iter() {
+                    if !f(m, 1.0) {
+                        break;
+                    }
+                }
+            }
+            Source::ZSet(z) => {
+                for (m, s) in z.iter(z.len().saturating_sub(1), usize::MAX, true) {
+                    if !f(m, s) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn score(&self, member: &[u8]) -> Option<f64> {
+        match self {
+            Source::Missing => None,
+            Source::Set(s) => s.contains(member).then_some(1.0),
+            Source::ZSet(z) => z.score(member),
+        }
+    }
+
+    /// The same key given twice.
+    fn same(&self, other: &Source) -> bool {
+        match (self, other) {
+            (Source::Set(a), Source::Set(b)) => std::ptr::eq(*a, *b),
+            (Source::ZSet(a), Source::ZSet(b)) => std::ptr::eq(*a, *b),
+            _ => false,
+        }
+    }
+}
+
+/// `ZUNION`'s and `ZINTER`'s options.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Combine {
+    /// One per key; empty: all 1.
+    pub weights: Vec<f64>,
+    pub aggregate: Aggregate,
+}
 
 /// `ZADD`'s options; `incr` for `ZINCRBY` too.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -164,6 +264,154 @@ impl Store {
         n
     }
 
+    /// Looks `keys` up in order, as `zunionInterDiffGenericCommand` does
+    /// before it reads its options: the first key of another type than a
+    /// set or a sorted set is an error.
+    pub fn zcheck(&mut self, keys: &[&[u8]]) -> Result<(), Error> {
+        for key in keys {
+            if let Some(e) = self.live(key) {
+                if !matches!(e.value(), Val::Set(_) | Val::ZSet(_)) {
+                    return Err(Error::WrongType);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The inputs, after [`zcheck`](Self::zcheck): live keys only (a
+    /// replica's expired ones aren't reclaimed, so `live` alone won't do).
+    fn sources(&self, keys: &[&[u8]]) -> Vec<Source<'_>> {
+        keys.iter()
+            .map(|key| match self.keys.get(key).filter(|e| self.now <= e.expire_at()).map(|e| e.value()) {
+                Some(Val::Set(s)) => Source::Set(s),
+                Some(Val::ZSet(z)) => Source::ZSet(z),
+                _ => Source::Missing,
+            })
+            .collect()
+    }
+
+    /// `ZUNION`, `ZINTER`, `ZDIFF` of `keys` (checked with [`zcheck`]):
+    /// the result, large whatever its size, as Redis builds it (a reply
+    /// keeps its `-0` scores; [`zstore_set`](Self::zstore_set) packs it if
+    /// it fits).
+    ///
+    /// [`zcheck`]: Self::zcheck
+    pub fn zcombine(&self, keys: &[&[u8]], op: SetOp, opts: &Combine) -> ZSet {
+        let mut out = ZSet::with_hint(usize::MAX, 0);
+        let mut src: Vec<(Source, f64)> =
+            self.sources(keys).into_iter().enumerate().map(|(i, s)| (s, opts.weights.get(i).copied().unwrap_or(1.0))).collect();
+        let agg = opts.aggregate;
+        match op {
+            SetOp::Inter => {
+                // Smallest first (a stable sort: ties keep their order, as
+                // glibc's qsort does for a few inputs), so the scores add up
+                // in Redis's order.
+                src.sort_by_key(|(s, _)| s.len());
+                if src[0].0.len() == 0 {
+                    return out;
+                }
+                let (first, w0) = src[0];
+                first.for_each(|m, score| {
+                    let mut total = agg.weighted(score, w0);
+                    if total.is_nan() {
+                        total = 0.0;
+                    }
+                    for (s, w) in &src[1..] {
+                        let found = if s.same(&first) { Some(score) } else { s.score(m) };
+                        let Some(value) = found else { return true };
+                        total = agg.combine(total, agg.weighted(value, *w));
+                    }
+                    out.insert(m, total);
+                    true
+                });
+            }
+            SetOp::Union => {
+                src.sort_by_key(|(s, _)| s.len());
+                let mut scores: HashMap<Vec<u8>, f64> = HashMap::new();
+                for (s, w) in &src {
+                    s.for_each(|m, score| {
+                        let mut value = agg.weighted(score, *w);
+                        if value.is_nan() {
+                            value = 0.0;
+                        }
+                        match scores.get_mut(m) {
+                            Some(total) => *total = agg.combine(*total, value),
+                            None => {
+                                scores.insert(m.to_vec(), value);
+                            }
+                        }
+                        true
+                    });
+                }
+                for (m, s) in scores {
+                    out.insert(&m, s);
+                }
+            }
+            SetOp::Diff => {
+                let first = src[0].0;
+                // A key given twice takes everything away.
+                if src[1..].iter().any(|(s, _)| s.same(&first)) {
+                    return out;
+                }
+                first.for_each(|m, score| {
+                    if src[1..].iter().all(|(s, _)| s.score(m).is_none()) {
+                        out.insert(m, score);
+                    }
+                    true
+                });
+            }
+        }
+        out
+    }
+
+    /// `ZINTERCARD`: how many members every one of `keys` (checked) holds,
+    /// counting no further than `limit` (0: no limit).
+    pub fn zintercard(&self, keys: &[&[u8]], limit: usize) -> usize {
+        let mut src = self.sources(keys);
+        src.sort_by_key(Source::len);
+        let first = src[0];
+        let mut n = 0;
+        first.for_each(|m, _| {
+            if src[1..].iter().all(|s| s.same(&first) || s.score(m).is_some()) {
+                n += 1;
+                if limit > 0 && n >= limit {
+                    return false;
+                }
+            }
+            true
+        });
+        n
+    }
+
+    /// A `ZUNIONSTORE`, `ZINTERSTORE`, `ZDIFFSTORE` result into `dst`:
+    /// packed if it fits, or `dst` deleted if it's empty. Its size.
+    pub fn zstore_set(&mut self, dst: &[u8], mut z: ZSet) -> usize {
+        if z.is_empty() {
+            if self.remove(dst).is_some() {
+                self.touch(dst);
+            }
+            return 0;
+        }
+        z.shrink_if_fits();
+        let n = z.len();
+        self.remove(dst);
+        self.insert_value(dst, Value::ZSet(Box::new(z)), None);
+        self.touch(dst);
+        n
+    }
+
+    /// `ZMPOP`: from the first of `keys` that exists (a key of another type
+    /// before it is an error), up to `count` members from one end; which key
+    /// it was and what came out, `None` if none exists.
+    pub fn zmpop(&mut self, keys: &[&[u8]], max: bool, count: usize) -> Result<Option<(usize, Vec<Scored>)>, Error> {
+        for (i, key) in keys.iter().enumerate() {
+            if self.zset_at(key)?.is_some() {
+                return Ok(self.zpop(key, max, count)?.map(|popped| (i, popped)));
+            }
+        }
+        Ok(None)
+    }
+
     /// `ZRANDMEMBER key`: a random member.
     pub fn zrandmember(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         let len = match self.live(key) {
@@ -220,7 +468,7 @@ impl Store {
 mod tests {
     use super::super::tests::{check, store};
     use super::super::{Kind, Staged};
-    use super::Store;
+    use super::{SetOp, Store};
     use crate::{End, Error, ExpireCmd};
 
     /// A sorted set's dump payload: members and their scores.
@@ -493,5 +741,97 @@ mod tests {
             seen.insert(s.zrandmember(b"z").unwrap().unwrap());
         }
         assert_eq!(seen.len(), 4);
+    }
+
+    fn combined(s: &Store, keys: &[&str], op: SetOp, weights: &[f64], aggregate: super::Aggregate) -> Vec<(String, u64)> {
+        let keys: Vec<&[u8]> = keys.iter().map(|k| k.as_bytes()).collect();
+        let opts = super::Combine { weights: weights.to_vec(), aggregate };
+        let z = s.zcombine(&keys, op, &opts);
+        assert_eq!(z.encoding(), "skiplist", "built large, as Redis builds it");
+        z.iter(0, usize::MAX, false).map(|(m, sc)| (String::from_utf8_lossy(m).into(), sc.to_bits())).collect()
+    }
+
+    fn bits(pairs: &[(&str, f64)]) -> Vec<(String, u64)> {
+        pairs.iter().map(|&(m, sc)| (m.to_string(), sc.to_bits())).collect()
+    }
+
+    #[test]
+    fn union_inter_diff_as_redis() {
+        use super::Aggregate as A;
+        let mut s = store();
+        add(&mut s, b"a", Default::default(), &[(1.0, "x"), (2.0, "y"), (3.0, "z")]).unwrap();
+        add(&mut s, b"b", Default::default(), &[(4.0, "y"), (5.0, "w")]).unwrap();
+        s.sadd(b"s", &[b"y", b"q"]).unwrap();
+        s.zcheck(&[b"a", b"b", b"s", b"none"]).unwrap();
+        assert_eq!(combined(&s, &["a", "b"], SetOp::Union, &[], A::Sum), bits(&[("x", 1.0), ("z", 3.0), ("w", 5.0), ("y", 6.0)]));
+        assert_eq!(combined(&s, &["a", "s"], SetOp::Union, &[2.0, 10.0], A::Sum), bits(&[("x", 2.0), ("z", 6.0), ("q", 10.0), ("y", 14.0)]));
+        assert_eq!(combined(&s, &["a", "b"], SetOp::Union, &[], A::Min), bits(&[("x", 1.0), ("y", 2.0), ("z", 3.0), ("w", 5.0)]));
+        assert_eq!(combined(&s, &["a", "b"], SetOp::Union, &[], A::Max), bits(&[("x", 1.0), ("z", 3.0), ("y", 4.0), ("w", 5.0)]));
+        assert_eq!(combined(&s, &["a", "b", "s"], SetOp::Union, &[1.0, 2.0, 0.5], A::Count), bits(&[("q", 0.5), ("x", 1.0), ("z", 1.0), ("w", 2.0), ("y", 3.5)]));
+        assert_eq!(combined(&s, &["a", "b", "s"], SetOp::Inter, &[], A::Sum), bits(&[("y", 7.0)]));
+        assert_eq!(combined(&s, &["a", "none"], SetOp::Inter, &[], A::Sum), []);
+        assert_eq!(combined(&s, &["a", "a"], SetOp::Inter, &[1.0, -1.0], A::Max), bits(&[("x", 1.0), ("y", 2.0), ("z", 3.0)]));
+        assert_eq!(combined(&s, &["a", "b"], SetOp::Diff, &[], A::Sum), bits(&[("x", 1.0), ("z", 3.0)]));
+        assert_eq!(combined(&s, &["a", "a"], SetOp::Diff, &[], A::Sum), [], "a key twice takes everything");
+        assert_eq!(combined(&s, &["s", "a"], SetOp::Diff, &[], A::Sum), bits(&[("q", 1.0)]));
+        assert_eq!(combined(&s, &["none", "a"], SetOp::Diff, &[], A::Sum), []);
+        // NaN is 0: inf * 0, and inf + -inf.
+        add(&mut s, b"i", Default::default(), &[(f64::INFINITY, "m")]).unwrap();
+        assert_eq!(combined(&s, &["i"], SetOp::Union, &[0.0], A::Sum), bits(&[("m", 0.0)]));
+        assert_eq!(combined(&s, &["i", "i"], SetOp::Union, &[1.0, -1.0], A::Sum), bits(&[("m", 0.0)]));
+        assert_eq!(combined(&s, &["i", "i"], SetOp::Inter, &[1.0, -1.0], A::Sum), bits(&[("m", 0.0)]));
+        // -0 kept in a result; MIN and MAX keep the first of 0 and -0, the
+        // smallest input first, ties in the order given.
+        add(&mut s, b"m1", Default::default(), &[(0.0, "x")]).unwrap();
+        add(&mut s, b"m2", Default::default(), &[(0.0, "x")]).unwrap();
+        assert_eq!(combined(&s, &["m1"], SetOp::Union, &[-1.0], A::Sum), bits(&[("x", -0.0)]));
+        assert_eq!(combined(&s, &["m1", "m2"], SetOp::Union, &[-1.0, 1.0], A::Min), bits(&[("x", -0.0)]));
+        assert_eq!(combined(&s, &["m1", "m2"], SetOp::Union, &[1.0, -1.0], A::Min), bits(&[("x", 0.0)]));
+        assert_eq!(combined(&s, &["m1", "m2"], SetOp::Union, &[1.0, -1.0], A::Max), bits(&[("x", 0.0)]));
+        add(&mut s, b"m2", Default::default(), &[(1.0, "y")]).unwrap();
+        assert_eq!(combined(&s, &["m2", "m1"], SetOp::Inter, &[1.0, -1.0], A::Min), bits(&[("x", -0.0)]), "m1 the smaller, so first");
+        // Sums in that order: (0.1 + 0.2) + 0.3 isn't 0.1 + (0.2 + 0.3).
+        for (k, v) in [("f1", 0.1), ("f2", 0.2), ("f3", 0.3)] {
+            add(&mut s, k.as_bytes(), Default::default(), &[(v, "x")]).unwrap();
+        }
+        assert_eq!(combined(&s, &["f1", "f2", "f3"], SetOp::Union, &[], A::Sum), bits(&[("x", 0.1 + 0.2 + 0.3)]));
+        assert_eq!(combined(&s, &["f3", "f2", "f1"], SetOp::Union, &[], A::Sum), bits(&[("x", 0.3 + 0.2 + 0.1)]));
+        add(&mut s, b"f1", Default::default(), &[(1.0, "p"), (2.0, "q")]).unwrap();
+        assert_eq!(combined(&s, &["f1", "f2", "f3"], SetOp::Union, &[], A::Sum)[0], ("x".to_string(), (0.2 + 0.3 + 0.1f64).to_bits()));
+        assert_eq!(combined(&s, &["f1", "f2", "f3"], SetOp::Inter, &[], A::Sum), bits(&[("x", 0.2 + 0.3 + 0.1)]));
+        // ZINTERCARD, and its limit.
+        let keys = [&b"a"[..], b"b", b"s"];
+        assert_eq!(s.zintercard(&keys, 0), 1);
+        assert_eq!(s.zintercard(&[b"a"], 2), 2);
+        assert_eq!(s.zintercard(&[b"a", b"a"], 0), 3);
+        assert_eq!(s.zintercard(&[b"a", b"none"], 0), 0);
+        s.set(b"str", b"v", Default::default()).unwrap();
+        assert_eq!(s.zcheck(&[b"a", b"str"]), Err(Error::WrongType));
+    }
+
+    #[test]
+    fn stored_results_pack_or_delete() {
+        let mut s = store();
+        add(&mut s, b"a", Default::default(), &[(0.0, "x"), (2.0, "y")]).unwrap();
+        let z = s.zcombine(&[b"a"], SetOp::Union, &super::Combine { weights: vec![-1.0], aggregate: Default::default() });
+        assert_eq!(s.zstore_set(b"d", z), 2);
+        assert_eq!(s.encoding(b"d"), Some("listpack"));
+        assert_eq!(s.zset_at(b"d").unwrap().unwrap().score(b"x").map(f64::to_bits), Some(0f64.to_bits()), "-0 is 0 once packed");
+        let z = s.zcombine(&[b"none"], SetOp::Union, &Default::default());
+        assert_eq!(s.zstore_set(b"d", z), 0);
+        assert!(!s.exists(b"d"));
+        let many: Vec<(f64, String)> = (0..129).map(|i| (f64::from(i), format!("m{i}"))).collect();
+        let pairs: Vec<(f64, &str)> = many.iter().map(|(sc, m)| (*sc, m.as_str())).collect();
+        add(&mut s, b"big", Default::default(), &pairs).unwrap();
+        let z = s.zcombine(&[b"big"], SetOp::Union, &Default::default());
+        s.zstore_set(b"d", z);
+        assert_eq!(s.encoding(b"d"), Some("skiplist"));
+        // ZMPOP: the first key that exists.
+        assert_eq!(s.zmpop(&[b"none", b"a"], true, 5).unwrap(), Some((1, vec![(Box::from(&b"y"[..]), 2.0), (Box::from(&b"x"[..]), 0.0)])));
+        assert!(!s.exists(b"a"));
+        assert_eq!(s.zmpop(&[b"none", b"a"], false, 1).unwrap(), None);
+        s.set(b"str", b"v", Default::default()).unwrap();
+        assert_eq!(s.zmpop(&[b"str", b"big"], false, 1), Err(Error::WrongType));
+        check(&s);
     }
 }
