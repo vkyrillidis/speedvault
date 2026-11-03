@@ -63,7 +63,35 @@ python3 tools/bench/collections_memory.py redis-7.0.15=6393 speedvault=7000 valk
 
 It fills each shape, reads `used_memory` before and after, and prints a
 markdown table with what `OBJECT ENCODING` says. Results:
-`results/2026-10-22-types/`.
+`results/2026-10-22-types/`. Sorted sets are measured too (`zset`: scores
+added in order, `zset-random`: in a random order); `--kinds=zset,hash`
+picks some.
+
+## Sorted sets and geo
+
+```sh
+tools/bench/zset_bench.sh --also redis-8.10.2=$HOME/redis-8/bin/redis-server \
+                          --also valkey-9.1.2=$HOME/valkey-9/bin/valkey-server
+```
+
+Starts Redis 7.0.15 (6393), ours (7000) and each `--also` server (6394,
+...), all pinned to CPU 2 and loaded one at a time, as `full_run.sh`.
+Then:
+
+- `small.md`: redis-benchmark's own `zadd` and `zpopmin` (one small key,
+  `-r 100000`), `-P 1 16`.
+- `large.md`: a set of 1M members `m:%012d` with random scores and 1M
+  points `p:%012d` over the whole earth (`zset_fill.py`, the same on every
+  server), then `ZSCORE ZRANK`, `ZRANGEBYSCORE ... LIMIT 0 10`, `ZADD` and
+  `ZINCRBY` of random members, `GEOPOS`, `GEODIST` (`-r 1000000`, so
+  `__rand_int__` is a member's number), `-P 1 16`.
+- `geosearch.md`: `GEOSEARCH ... FROMMEMBER` a random point, `BYRADIUS 50
+  km` and `BYBOX 100 100 km` with `COUNT 10 ASC`, and `BYRADIUS 200 km`
+  (about 15 points in 50 km, 250 in 200 km), a tenth of `-n`.
+- `memory.md`: `collections_memory.py` on the four.
+
+`bench.sh --command "ARGS"` (repeatable) is what runs a command as a test
+of its own (`-t ""` for none of redis-benchmark's).
 
 ## Clusters
 

@@ -90,7 +90,7 @@ From code, use any Redis client: redis-py's `redis.Redis(port=7000)`, or
 | Strings, integers, floats | Yes; not yet `GETRANGE SETRANGE GETEX GETSET SETEX PSETEX MSETNX` |
 | Keys and expiry | Yes; not yet `RENAME UNLINK COPY TOUCH RANDOMKEY` |
 | Hashes, sets, lists | Yes, packed as Redis packs them; not yet blocking pops (`BLPOP`...), hash field expiry (`HEXPIRE`...) |
-| Sorted sets | Yes, packed as Redis packs them; not yet blocking pops (`BZPOPMIN BZPOPMAX BZMPOP`) |
+| Sorted sets | Yes, packed as Redis packs them, large ones in less memory than Redis 8 (see [performance](docs/performance.md)); not yet blocking pops (`BZPOPMIN BZPOPMAX BZMPOP`) |
 | Geo | Yes, the deprecated `GEORADIUS` forms too |
 | Streams, bitmaps, HyperLogLog | Not yet |
 | Transactions (`MULTI EXEC WATCH`) | Yes |

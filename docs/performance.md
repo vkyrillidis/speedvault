@@ -101,6 +101,56 @@ table doubles (median of 7 at 2^20 fields; 6 ms before step 4, when the
 hashes sat in the table's `Vec`): Redis rehashes incrementally, which
 would remove it (open).
 
+**Sorted sets and geo** (phase 9, 2026-11-03, `tools/bench/zset_bench.sh
+--also redis-8.10.2=... --also valkey-9.1.2=...`, results in
+`tools/bench/results/2026-11-03-9c92ec3-zset/`; the same setup as above,
+`-n 1000000`, `GEOSEARCH` a tenth of that; no run hit by a clock step).
+Requests/s of ours, and ours ÷ Redis 8.10.2 and ÷ Valkey 9.1.2 (÷ Redis
+7.0.15 in the results: 1.04–1.91×):
+
+| Test | ours `-P 1` | ÷ Redis 8 | ÷ Valkey | ours `-P 16` | ÷ Redis 8 | ÷ Valkey |
+|------|------:|------:|------:|------:|------:|------:|
+| ZADD (small set) | 383k | 1.07× | 1.08× | 1.18M | 1.17× | 1.27× |
+| ZPOPMIN (small set) | 382k | 1.26× | 1.28× | 3.95M | 1.26× | 1.37× |
+| ZSCORE (1M members) | 400k | 1.16× | 1.23× | 1.99M | 1.10× | 1.16× |
+| ZRANK | 389k | 1.33× | 1.27× | 1.26M | 1.35× | 1.40× |
+| ZRANGEBYSCORE ... LIMIT 0 10 | 270k | 1.32× | 1.44× | 700k | 1.21× | 1.44× |
+| ZADD (updating) | 293k | 1.44× | 1.47× | 808k | 1.46× | 1.58× |
+| ZINCRBY | 305k | 1.15× | 1.16× | 873k | 1.08× | 1.23× |
+| GEOPOS (1M points) | 381k | 1.11× | 1.09× | 1.56M | 1.09× | 2.01× |
+| GEODIST | 394k | 1.04× | 1.04× | 1.39M | 1.15× | 1.30× |
+| GEOSEARCH BYRADIUS 50 km COUNT 10 ASC | 65.4k | 1.06× | 1.11× | 93.5k | 1.20× | 1.22× |
+| GEOSEARCH BYBOX 100×100 km COUNT 10 ASC | 73.3k | 1.09× | 1.18× | 109k | 1.27× | 1.34× |
+| GEOSEARCH BYRADIUS 200 km (~250 points) | 6.15k | 1.38× | 1.45× | 6.23k | 1.40× | 1.51× |
+
+The rank and range commands gain most: a counted B+ tree finds a rank or
+a score with a few binary searches in 1 KiB leaves, where a skiplist
+follows a pointer per level; `GEOSEARCH` is mostly that range scan and
+the distance of each point. Replies are the same bytes as Redis 8.10.2's
+(phase 9's difftest and fuzz), unsorted search order included.
+
+Memory per member (`collections_memory.py`; members of 9 bytes, integer
+scores):
+
+| Sorted set | Redis 7.0.15 | ours | Redis 8.10.2 | Valkey 9.1.2 |
+|------------|------:|------:|------:|------:|
+| 10000 × 100 (packed) | 16.1 | 16.7 (was 23.1) | 15.8 | 15.7 |
+| 1 × 1M, scores added in order | 110 | 58.5 (was 108) | 67.4 | 70.8 |
+| 1 × 1M, scores in a random order | 110 | 65.5 | 67.4 | 70.8 |
+
+A large set is the member table of large hashes and sets (a block per
+member: its hash, the member, the score; 8 bytes of pointer and about 8
+of index) beside the tree, whose entries are a score and the block's
+address (16 bytes). Three fixes made it the smallest of the four: a full
+leaf split once it held 65, which doubled its vector to 128 places that
+both halves kept (a third of the tree was empty places); splitting before
+the 65th keeps every leaf in its 64 places (1 KiB). Splits in halves left
+every leaf half empty when scores only grow (timestamps): a full last
+leaf now keeps its entries and starts a new leaf, the same at the start
+(only at the two ends, so no choice of scores can make a leaf per entry).
+And the packed form keeps an integral score as an integer of 1 to 7 bytes,
+as a listpack does, instead of 8.
+
 How we got there. The first run was 0.84–0.94× Redis without
 pipelining. Per request our user time was equal or lower (MSET: half of
 Redis's), but we spent more time in the kernel sleeping and waking.

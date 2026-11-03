@@ -17,6 +17,12 @@
   forms; Redis's geohash code ported line by line, so searches find the
   same members in the same order (unsorted too) and distances match to the
   last decimal; `GEORADIUS ... STORE key` routed by that key in a cluster.
+- Sorted sets and geo benchmarked against Redis 7.0.15, Redis 8.10.2 and
+  Valkey 9.1.2 (`tools/bench/zset_bench.sh`): ahead of all three on every
+  test, 1.04–1.46× Redis 8.10.2; a set of 1M members in 58–66 bytes a
+  member (Redis 8.10.2: 67), after three memory fixes found on the way
+  (leaves that doubled past their size, leaves half empty for scores that
+  only grow, 8-byte scores where a listpack takes 1 or 2).
 - `HSCAN ... NOVALUES`.
 
 ## 0.1.0 (2026-10-31)
