@@ -97,7 +97,11 @@ members of mixed scores while packed, the encodings at their limits,
 `ZRANGESTORE` over other types and itself, RESP3 pairs, `ZUNION`/`ZINTER`/
 `ZDIFF` and their `STORE` forms with sets among the inputs, weights of
 `inf`, `0`, `-1`, every aggregate, sums that depend on their order, `MIN`
-of `0` and `-0`, `ZINTERCARD`, `ZMPOP`);
+of `0` and `-0`, `ZINTERCARD`, `ZMPOP`), geo (Redis's own examples,
+every option and error in its order, scores that were never geohashes,
+the latitude limits, the antimeridian, dense grids at high latitudes,
+zero and whole-earth areas, large sets in scan order, `COUNT` with ties,
+stored results with `-0`, RESP3);
 transactions (tag `tx`: `MULTI`/`EXEC`/`DISCARD` and their errors, the
 checks while queueing, `-OOM` at either end, RESP3, `CLIENT INFO` and
 `INFO` inside, and `WATCH` against each write command, once changing the

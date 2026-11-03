@@ -91,7 +91,8 @@ From code, use any Redis client: redis-py's `redis.Redis(port=7000)`, or
 | Keys and expiry | Yes; not yet `RENAME UNLINK COPY TOUCH RANDOMKEY` |
 | Hashes, sets, lists | Yes, packed as Redis packs them; not yet blocking pops (`BLPOP`...), hash field expiry (`HEXPIRE`...) |
 | Sorted sets | Yes, packed as Redis packs them; not yet blocking pops (`BZPOPMIN BZPOPMAX BZMPOP`) |
-| Streams, bitmaps, HyperLogLog, geo | Not yet (geo next) |
+| Geo | Yes, the deprecated `GEORADIUS` forms too |
+| Streams, bitmaps, HyperLogLog | Not yet |
 | Transactions (`MULTI EXEC WATCH`) | Yes |
 | Pub/sub, scripting (`EVAL`, functions) | Not yet |
 | `requirepass` and `AUTH` | Yes; ACL users not yet |
@@ -131,6 +132,12 @@ also lists the few deliberate differences.
   ZINTERSTORE ZDIFFSTORE` (`WEIGHTS`, `AGGREGATE SUM|MIN|MAX|COUNT`)
   `ZINTERCARD ZMPOP` (scores read and written as Redis 8 does, digit for
   digit, and summed in its order).
+- **Geo:** `GEOADD` (`NX XX CH`) `GEOPOS GEODIST GEOHASH GEOSEARCH
+  GEOSEARCHSTORE` (`FROMMEMBER FROMLONLAT BYRADIUS BYBOX ASC DESC COUNT ANY
+  WITHCOORD WITHDIST WITHHASH STOREDIST`), `GEORADIUS GEORADIUSBYMEMBER`
+  (`STORE STOREDIST`) and their `_RO` forms; units `m km mi ft` (geo keys
+  are sorted sets, as in Redis; results in Redis's order, distances to the
+  same 4 decimals).
 - **Connection and server:** `PING ECHO HELLO AUTH SELECT 0 QUIT CLIENT
   COMMAND INFO`, `CONFIG GET` and `SET`.
 - **Transactions:** `MULTI EXEC DISCARD WATCH UNWATCH`, as Redis's: the

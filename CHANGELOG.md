@@ -12,6 +12,11 @@
   `ZINTERCARD`, `ZMPOP`), routed by all their keys in a cluster; sorted
   sets move between nodes and reach the replicas like the other types,
   checked under load with sets of 200000 members.
+- Geo: `GEOADD GEOPOS GEODIST GEOHASH GEOSEARCH GEOSEARCHSTORE` with every
+  option, and the deprecated `GEORADIUS GEORADIUSBYMEMBER` and their `_RO`
+  forms; Redis's geohash code ported line by line, so searches find the
+  same members in the same order (unsorted too) and distances match to the
+  last decimal; `GEORADIUS ... STORE key` routed by that key in a cluster.
 - `HSCAN ... NOVALUES`.
 
 ## 0.1.0 (2026-10-31)
