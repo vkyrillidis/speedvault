@@ -7,7 +7,7 @@
 
 use super::{c_str, integer_reply, store_error, syntax_error, Flow};
 use resp::{Args, Encoder, Protocol};
-use store::{parse_i64, Bounds, LexBound, LexRange, ScoreRange, Store, ZSet, ZaddFlags};
+use store::{parse_i64, Aggregate, Bounds, Combine, LexBound, LexRange, ScoreRange, SetOp, Store, ZSet, ZaddFlags};
 
 /// Redis's `strcasecmp` of an argument with an option's name: a C string,
 /// so it ends at a NUL.
@@ -544,6 +544,172 @@ pub(super) fn zrandmember(args: &Args, store: &mut Store, out: &mut Encoder) -> 
                 member(out, &m, s, with_scores);
             }
         }
+        Err(e) => store_error(e, out),
+    }
+    Flow::Continue
+}
+
+/// `ZUNION`, `ZINTER`, `ZDIFF numkeys key ... [WEIGHTS w ...] [AGGREGATE
+/// SUM|MIN|MAX|COUNT] [WITHSCORES]`, and their `STORE` forms (`dst`: the
+/// command's name, `args[1]` the destination), as
+/// `zunionInterDiffGenericCommand`: the count, the keys' types, then the
+/// options.
+pub(super) fn combine(args: &Args, store: &mut Store, out: &mut Encoder, op: SetOp, dst: Option<&str>) -> Flow {
+    let name = match (dst, op) {
+        (Some(name), _) => name,
+        (None, SetOp::Union) => "zunion",
+        (None, SetOp::Inter) => "zinter",
+        (None, SetOp::Diff) => "zdiff",
+    };
+    let Some(keys) = numkeys(args, if dst.is_some() { 2 } else { 1 }, name, store, out) else { return Flow::Continue };
+    let mut opts = Combine::default();
+    let mut with_scores = false;
+    let mut j = keys.len() + if dst.is_some() { 3 } else { 2 };
+    while j < args.len() {
+        let left = args.len() - j;
+        if op != SetOp::Diff && left > keys.len() && is(&args[j], b"weights") {
+            opts.weights.clear();
+            for w in args.iter().skip(j + 1).take(keys.len()) {
+                match store::parse_double(w) {
+                    Some(w) => opts.weights.push(w),
+                    None => {
+                        out.error(b"ERR weight value is not a float");
+                        return Flow::Continue;
+                    }
+                }
+            }
+            j += 1 + keys.len();
+        } else if op != SetOp::Diff && left >= 2 && is(&args[j], b"aggregate") {
+            let a = &args[j + 1];
+            opts.aggregate = if is(a, b"sum") {
+                Aggregate::Sum
+            } else if is(a, b"min") {
+                Aggregate::Min
+            } else if is(a, b"max") {
+                Aggregate::Max
+            } else if is(a, b"count") {
+                Aggregate::Count
+            } else {
+                syntax_error(out);
+                return Flow::Continue;
+            };
+            j += 2;
+        } else if dst.is_none() && is(&args[j], b"withscores") {
+            with_scores = true;
+            j += 1;
+        } else {
+            syntax_error(out);
+            return Flow::Continue;
+        }
+    }
+    let z = store.zcombine(&keys, op, &opts);
+    match dst {
+        Some(_) => out.integer(store.zstore_set(&args[1], z) as i64),
+        None => {
+            members_header(out, z.len(), with_scores);
+            for (m, s) in z.iter(0, usize::MAX, false) {
+                member(out, m, s, with_scores);
+            }
+        }
+    }
+    Flow::Continue
+}
+
+/// The keys after a count at `args[at]`, read as Redis reads them (an
+/// integer of at least 1, no more than there are arguments), and checked
+/// for their types; `None` once the error is replied.
+fn numkeys<'a>(args: &Args<'a>, at: usize, name: &str, store: &mut Store, out: &mut Encoder) -> Option<Vec<&'a [u8]>> {
+    let n = long(&args[at], out)?;
+    if n < 1 {
+        out.error(format!("ERR at least 1 input key is needed for '{name}' command").as_bytes());
+        return None;
+    }
+    if n as u64 > (args.len() - at - 1) as u64 {
+        syntax_error(out);
+        return None;
+    }
+    let keys: Vec<&[u8]> = args.iter().skip(at + 1).take(n as usize).collect();
+    if let Err(e) = store.zcheck(&keys) {
+        store_error(e, out);
+        return None;
+    }
+    Some(keys)
+}
+
+/// `ZINTERCARD numkeys key ... [LIMIT limit]`.
+pub(super) fn zintercard(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {
+    let Some(keys) = numkeys(args, 1, "zintercard", store, out) else { return Flow::Continue };
+    let mut limit = 0;
+    let mut j = keys.len() + 2;
+    while j < args.len() {
+        if args.len() - j >= 2 && is(&args[j], b"limit") {
+            match parse_i64(&args[j + 1]) {
+                Some(n) if n >= 0 => limit = n as usize,
+                _ => {
+                    out.error(b"ERR LIMIT can't be negative");
+                    return Flow::Continue;
+                }
+            }
+            j += 2;
+        } else {
+            syntax_error(out);
+            return Flow::Continue;
+        }
+    }
+    out.integer(store.zintercard(&keys, limit) as i64);
+    Flow::Continue
+}
+
+/// `ZMPOP numkeys key ... MIN|MAX [COUNT count]`.
+pub(super) fn zmpop(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {
+    let numkeys = match parse_i64(&args[1]) {
+        Some(n) if n >= 1 => n as u64,
+        _ => {
+            out.error(b"ERR numkeys should be greater than 0");
+            return Flow::Continue;
+        }
+    };
+    let at = numkeys.saturating_add(2);
+    let end = (at < args.len() as u64).then(|| &args[at as usize]);
+    let max = match end {
+        Some(e) if is(e, b"min") => false,
+        Some(e) if is(e, b"max") => true,
+        _ => {
+            syntax_error(out);
+            return Flow::Continue;
+        }
+    };
+    let mut count = None;
+    let mut i = at as usize + 1;
+    while i < args.len() {
+        if count.is_none() && is(&args[i], b"count") && i + 1 < args.len() {
+            i += 1;
+            match parse_i64(&args[i]) {
+                Some(n) if n >= 1 => count = Some(n as usize),
+                _ => {
+                    out.error(b"ERR count should be greater than 0");
+                    return Flow::Continue;
+                }
+            }
+        } else {
+            syntax_error(out);
+            return Flow::Continue;
+        }
+        i += 1;
+    }
+    let keys: Vec<&[u8]> = args.iter().skip(2).take(numkeys as usize).collect();
+    match store.zmpop(&keys, max, count.unwrap_or(1)) {
+        Ok(Some((key, popped))) => {
+            out.array(2);
+            out.bulk(keys[key]);
+            out.array(popped.len());
+            for (m, s) in popped {
+                out.array(2);
+                out.bulk(&m);
+                score(out, s);
+            }
+        }
+        Ok(None) => out.null_array(),
         Err(e) => store_error(e, out),
     }
     Flow::Continue

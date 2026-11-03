@@ -748,6 +748,74 @@ seq("zset_resp3", ("HELLO", "3"), ("ZADD", "z", "1.5", "a", "2", "b", "inf", "c"
     ("ZPOPMIN", "z"), ("ZPOPMIN", "z", "1"), ("ZPOPMAX", "z", "5"), ("ZPOPMIN", "z", "2"), ("ZPOPMIN", "nokey", "2"),
     ("ZADD", "y", "1", "a", "2", "b"), ("ZRANDMEMBER", "y", "2", "WITHSCORES"), ("ZRANDMEMBER", "y", "5"), ("ZSCAN", "y", "0"),
     ("ZRANGE", "y", "0", "0", "BYSCORE", "WITHSCORES"), norm=[at(0, mask_hello)])
+ZSRC = [("ZADD", "a", "1", "x", "2", "y", "3", "z"), ("ZADD", "b", "4", "y", "5", "w"), ("SADD", "s", "y", "q")]
+seq("zset_zunion", *ZSRC, ("ZUNION", "2", "a", "b"), ("ZUNION", "2", "a", "b", "WITHSCORES"),
+    ("ZUNION", "3", "a", "b", "s", "WITHSCORES"), ("ZUNION", "2", "a", "b", "WEIGHTS", "2", "3", "WITHSCORES"),
+    ("ZUNION", "2", "a", "b", "AGGREGATE", "MIN", "WITHSCORES"), ("ZUNION", "2", "a", "b", "aggregate", "max", "withscores"),
+    ("ZUNION", "3", "a", "b", "s", "AGGREGATE", "COUNT", "WITHSCORES"),
+    ("ZUNION", "3", "a", "b", "s", "WEIGHTS", "1", "2", "0.5", "AGGREGATE", "COUNT", "WITHSCORES"),
+    ("ZUNION", "1", "nokey"), ("ZUNION", "2", "a", "nokey", "WITHSCORES"), ("ZUNION", "2", "a", "a", "WITHSCORES"),
+    ("ZADD", "i", "1", "m"), ("ZADD", "j", "-1", "m"), ("ZUNION", "2", "i", "j", "WEIGHTS", "inf", "inf", "WITHSCORES"),
+    ("ZADD", "k", "inf", "m"), ("ZUNION", "1", "k", "WEIGHTS", "0", "WITHSCORES"), ("ZUNION", "2", "k", "k", "WEIGHTS", "1", "-1", "WITHSCORES"),
+    # -0 in a reply (a result is built large), 0 once stored packed.
+    ("ZADD", "zz", "0", "m"), ("ZUNION", "1", "zz", "WEIGHTS", "-1", "WITHSCORES"), ("ZUNIONSTORE", "d", "1", "zz", "WEIGHTS", "-1"),
+    ("ZSCORE", "d", "m"),
+    # MIN and MAX keep the first of 0 and -0: the inputs' order, smallest first.
+    ("ZADD", "m1", "0", "x"), ("ZADD", "m2", "0", "x"), ("ZUNION", "2", "m1", "m2", "WEIGHTS", "-1", "1", "AGGREGATE", "MIN", "WITHSCORES"),
+    ("ZUNION", "2", "m1", "m2", "WEIGHTS", "1", "-1", "AGGREGATE", "MIN", "WITHSCORES"),
+    ("ZUNION", "2", "m2", "m1", "WEIGHTS", "-1", "1", "AGGREGATE", "MAX", "WITHSCORES"),
+    # Sums depend on their order: 0.1 + 0.2 + 0.3, then with the sets sized
+    # so that the smallest goes first.
+    ("ZADD", "f1", "0.1", "x"), ("ZADD", "f2", "0.2", "x"), ("ZADD", "f3", "0.3", "x"), ("ZUNION", "3", "f1", "f2", "f3", "WITHSCORES"),
+    ("ZUNION", "3", "f3", "f2", "f1", "WITHSCORES"), ("ZADD", "f1", "1", "p", "2", "q"), ("ZADD", "f2", "1", "p"),
+    ("ZUNION", "3", "f1", "f2", "f3", "WITHSCORES"), ("ZINTER", "3", "f1", "f2", "f3", "WITHSCORES"))
+seq("zset_zinter", *ZSRC, ("ZINTER", "2", "a", "b"), ("ZINTER", "2", "a", "b", "WITHSCORES"), ("ZINTER", "3", "a", "b", "s", "WITHSCORES"),
+    ("ZINTER", "2", "a", "s", "WEIGHTS", "10", "100", "WITHSCORES"), ("ZINTER", "2", "a", "b", "AGGREGATE", "MAX", "WITHSCORES"),
+    ("ZINTER", "2", "a", "b", "AGGREGATE", "COUNT", "WITHSCORES"), ("ZINTER", "2", "a", "nokey"), ("ZINTER", "1", "a", "WITHSCORES"),
+    ("ZINTER", "2", "a", "a", "WITHSCORES"), ("ZINTER", "2", "a", "a", "WEIGHTS", "1", "-1", "AGGREGATE", "MIN", "WITHSCORES"),
+    ("ZINTER", "1", "s", "WITHSCORES"), ("ZINTER", "2", "s", "s", "WEIGHTS", "inf", "-inf", "WITHSCORES"),
+    ("ZADD", "k", "inf", "y"), ("ZINTER", "2", "k", "a", "WEIGHTS", "0", "1", "WITHSCORES"),
+    ("ZINTER", "2", "k", "a", "WEIGHTS", "0", "1", "AGGREGATE", "MIN", "WITHSCORES"),
+    ("ZINTER", "2", "a", "k", "WEIGHTS", "1", "0", "AGGREGATE", "MAX", "WITHSCORES"))
+seq("zset_zdiff", *ZSRC, ("ZDIFF", "2", "a", "b"), ("ZDIFF", "2", "a", "b", "WITHSCORES"), ("ZDIFF", "1", "a", "WITHSCORES"),
+    ("ZDIFF", "2", "a", "a"), ("ZDIFF", "2", "nokey", "a"), ("ZDIFF", "2", "a", "s", "WITHSCORES"), ("ZDIFF", "2", "a", "nokey", "WITHSCORES"),
+    ("ZDIFF", "3", "s", "a", "nokey", "WITHSCORES"), ("ZDIFF", "2", "a", "b", "WEIGHTS", "1", "2"), ("ZDIFF", "2", "a", "b", "AGGREGATE", "SUM"),
+    ("ZDIFF", "3", "a", "b", "a"), ("ZDIFF", "2", "b", "s", "WITHSCORES"))
+seq("zset_combine_errors", *ZSRC, ("ZUNION", "0", "a"), ("ZUNION", "x", "a"), ("ZUNION", "-1", "a"), ("ZUNION", "3", "a", "b"),
+    ("ZUNION", "2", "a", "b", "WEIGHTS", "1"), ("ZUNION", "2", "a", "b", "WEIGHTS", "1", "x"), ("ZUNION", "2", "a", "b", "WEIGHTS", "1", "nan"),
+    ("ZUNION", "2", "a", "b", "WEIGHTS", "1", " 2"), ("ZUNION", "2", "a", "b", "AGGREGATE"), ("ZUNION", "2", "a", "b", "AGGREGATE", "AVG"),
+    ("ZUNION", "2", "a", "b", "FOO"), ("SET", "str", "v"), ("ZUNION", "2", "a", "str"), ("ZUNION", "2", "a", "str", "WEIGHTS", "x"),
+    ("ZUNION", "2", "str", "nokey"), ("ZUNION", "2", "nokey", "str"), ("ZUNIONSTORE", "d", "0", "a"), ("ZINTERSTORE", "d", "x", "a"),
+    ("ZDIFFSTORE", "d", "-5", "a"), ("ZINTERSTORE", "d", "1", "a", "WITHSCORES"), ("ZDIFFSTORE", "d", "1", "a", "WEIGHTS", "1"),
+    ("ZUNION", "2", "a", "b", "WEIGHTS", "1", "2", "WEIGHTS", "3", "4", "WITHSCORES"), ("ZUNION", "2", "a", "b", "withscores", "withscores"),
+    ("ZUNION", "1", "a", "AGGREGATE", "sum", "aggregate", "max", "WITHSCORES"), ("ZINTER", "0", "a"), ("ZDIFF", "0", "a"),
+    ("ZINTER", "2", "a", "b", "LIMIT", "1"), ("ZUNION", "2", "a", "b", "WEIGHTS", "1", "2", "3"), ("ZUNION", "1", "a", b"withscores\x00"),
+    ("ZUNION", "9223372036854775807", "a"), ("ZUNIONSTORE", "d", "2", "a"), ("ZUNIONSTORE", "d", "1", "str"), ("TYPE", "d"))
+seq("zset_combine_store", *ZSRC, ("ZUNIONSTORE", "d", "2", "a", "b"), ("ZRANGE", "d", "0", "-1", "WITHSCORES"), ("OBJECT", "ENCODING", "d"),
+    ("ZINTERSTORE", "d", "2", "a", "b", "WEIGHTS", "2", "3"), ("ZRANGE", "d", "0", "-1", "WITHSCORES"), ("ZDIFFSTORE", "d", "2", "a", "b"),
+    ("ZRANGE", "d", "0", "-1", "WITHSCORES"), ("ZUNIONSTORE", "d", "1", "nokey"), ("EXISTS", "d"), ("ZINTERSTORE", "d", "2", "a", "nokey"),
+    ("SET", "str", "v"), ("ZUNIONSTORE", "str", "1", "a"), ("TYPE", "str"), ("EXPIRE", "str", "100"), ("ZINTERSTORE", "str", "1", "s"),
+    ("TTL", "str"), ("ZRANGE", "str", "0", "-1", "WITHSCORES"), ("ZUNIONSTORE", "a", "2", "a", "b"), ("ZRANGE", "a", "0", "-1", "WITHSCORES"),
+    ("ZADD", "big", *BIG), ("ZUNIONSTORE", "d", "1", "big"), ("OBJECT", "ENCODING", "d"), ("ZINTERSTORE", "d", "2", "big", "big"),
+    ("OBJECT", "ENCODING", "d"), ("ZRANGE", "d", "-2", "-1", "WITHSCORES"), ("ZDIFFSTORE", "d", "2", "big", "a"), ("ZCARD", "d"),
+    ("ZADD", "long", "1", "x" * 65), ("ZUNIONSTORE", "d", "2", "long", "b"), ("OBJECT", "ENCODING", "d"),
+    ("ZINTERSTORE", "d", "2", "long", "b"), ("EXISTS", "d"), ("ZDIFFSTORE", "e", "2", "big", "big"), ("EXISTS", "e"),
+    ("ZUNIONSTORE", "d", "2", "a", "s", "AGGREGATE", "COUNT"), ("ZRANGE", "d", "0", "-1", "WITHSCORES"))
+seq("zset_zintercard", *ZSRC, ("ZINTERCARD", "2", "a", "b"), ("ZINTERCARD", "3", "a", "b", "s"), ("ZINTERCARD", "1", "a", "LIMIT", "2"),
+    ("ZINTERCARD", "1", "a", "LIMIT", "0"), ("ZINTERCARD", "1", "a", "LIMIT", "-1"), ("ZINTERCARD", "1", "a", "LIMIT", "x"),
+    ("ZINTERCARD", "1", "a", "LIMIT", "1", "LIMIT", "5"), ("ZINTERCARD", "2", "a", "nokey"), ("ZINTERCARD", "0", "a"),
+    ("ZINTERCARD", "2", "a", "b", "WITHSCORES"), ("ZINTERCARD", "2", "a", "b", "LIMIT"), ("SET", "str", "v"),
+    ("ZINTERCARD", "2", "a", "str"), ("ZINTERCARD", "2", "a", "a"), ("ZINTERCARD", "2", "s", "s", "LIMIT", "1"),
+    ("ZINTERCARD", "3", "a", "b"), ("ZINTERCARD", "1", "a", "WEIGHTS", "1"), ("ZINTERCARD", "1", "nokey", "LIMIT", "x"))
+seq("zset_zmpop", *ZSRC, ("ZMPOP", "2", "nokey", "a", "MIN"), ("ZMPOP", "2", "a", "b", "MAX", "COUNT", "2"), ("ZMPOP", "1", "a", "min", "count", "10"),
+    ("EXISTS", "a"), ("ZMPOP", "1", "nokey", "MIN"), ("ZMPOP", "0", "b", "MIN"), ("ZMPOP", "1", "b"), ("ZMPOP", "1", "b", "UP"),
+    ("ZMPOP", "1", "b", "MIN", "COUNT", "0"), ("ZMPOP", "1", "b", "MIN", "COUNT", "x"), ("ZMPOP", "1", "b", "MIN", "COUNT", "1", "COUNT", "2"),
+    ("ZMPOP", "1", "b", "MIN", "COUNT"), ("ZMPOP", "1", "b", "MIN", "FOO"), ("SET", "str", "v"), ("ZMPOP", "2", "str", "b", "MIN"),
+    ("ZMPOP", "2", "nokey", "str", "MIN"), ("ZMPOP", "x", "b", "MIN"), ("ZMPOP", "2", "b", "MAX"), ("ZMPOP", "1", "s", "MIN"),
+    ("ZMPOP", "9223372036854775807", "b", "MIN"), ("ZMPOP", "1", "b", "MAX", "COUNT", "9223372036854775807"), ("EXISTS", "b"))
+seq("zset_multikey_resp3", ("HELLO", "3"), *ZSRC, ("ZUNION", "2", "a", "b", "WITHSCORES"), ("ZUNION", "2", "a", "b"),
+    ("ZINTER", "2", "a", "b", "WITHSCORES"), ("ZDIFF", "2", "a", "b", "WITHSCORES"), ("ZUNION", "1", "nokey", "WITHSCORES"),
+    ("ZMPOP", "1", "a", "MIN", "COUNT", "2"), ("ZMPOP", "1", "nokey", "MIN"), ("ZINTERCARD", "2", "a", "b"), norm=[at(0, mask_hello)])
 seq("zset_expiry_and_keys", ("ZADD", "z", "1", "a"), ("EXPIRE", "z", "100"), ("TTL", "z"), ("ZADD", "z", "2", "b"), ("TTL", "z"),
     ("ZREM", "z", "a", "b"), ("TTL", "z"), ("ZADD", "z", "1", "a"), ("TTL", "z"), ("PEXPIRE", "z", "-1"), ("EXISTS", "z"),
     ("ZADD", "z", "1", "a"), ("DEL", "z"), ("ZCARD", "z"), ("ZADD", "z", "1", "a"), ("ZPOPMIN", "z"), ("EXISTS", "z"))

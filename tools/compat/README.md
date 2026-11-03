@@ -6,7 +6,7 @@ standard library only.
 | File | What it is |
 |------|------------|
 | `resp.py` | Small RESP2/RESP3 client: raw sends (optionally split into chunks with delays), exact reply framing for every RESP3 type, close and timeout detection. Also a CLI: `python3 resp.py 127.0.0.1:6379 --resp3 MGET a b` |
-| `corpus.py` | The test cases (483), with their normalisers and expected-byte overrides |
+| `corpus.py` | The test cases (491), with their normalisers and expected-byte overrides |
 | `difftest.py` | Differential tester: runs the corpus against a reference and a target and compares replies byte for byte |
 | `allowlist.py` | Known, intended differences (case pattern → reason) |
 | `resp_proxy.py` | Logging TCP proxy: prints every request and reply going through it, including the ones `MONITOR` doesn't show (rejected commands) |
@@ -94,7 +94,10 @@ since phase 9 sorted sets (every `ZADD` option and combination, scores
 written and read past fast_float's limits, `-0` packed and not, ranges by
 rank, score and member with `REV`/`LIMIT`, `(`, `[`, `+`, `-` and NUL bytes,
 members of mixed scores while packed, the encodings at their limits,
-`ZRANGESTORE` over other types and itself, RESP3 pairs);
+`ZRANGESTORE` over other types and itself, RESP3 pairs, `ZUNION`/`ZINTER`/
+`ZDIFF` and their `STORE` forms with sets among the inputs, weights of
+`inf`, `0`, `-1`, every aggregate, sums that depend on their order, `MIN`
+of `0` and `-0`, `ZINTERCARD`, `ZMPOP`);
 transactions (tag `tx`: `MULTI`/`EXEC`/`DISCARD` and their errors, the
 checks while queueing, `-OOM` at either end, RESP3, `CLIENT INFO` and
 `INFO` inside, and `WATCH` against each write command, once changing the

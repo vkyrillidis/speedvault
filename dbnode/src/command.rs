@@ -40,10 +40,14 @@ pub(crate) struct Command {
     /// Where the keys are, for `COMMAND`: first, last (negative: counted from
     /// the end) and step; `(0, 0, 0)` for none, and for a `movable` command.
     pub(crate) keys: (i32, i32, i32),
-    /// Redis's `movablekeys`, the one kind there is so far (`SINTERCARD`,
-    /// `LMPOP`, `MSETEX`): `args[1]` is how many keys follow it, this many
-    /// arguments apart (2 for `MSETEX`'s key and value pairs); 0 if not.
+    /// Redis's `movablekeys` (`SINTERCARD`, `LMPOP`, `MSETEX`, `ZUNION`):
+    /// `args[1]` is how many keys follow it, this many arguments apart (2
+    /// for `MSETEX`'s key and value pairs); 0 if not.
     pub(crate) movable: i32,
+    /// With `movable`: `args[1]` is a destination key, and the count is
+    /// `args[2]` (`ZUNIONSTORE dst numkeys key ...`). `keys` is then
+    /// `(1, 1, 1)`, what `COMMAND` shows, as Redis.
+    pub(crate) dest: bool,
     run: Run,
     /// Redis's `denyoom` flag: refused while the node uses more than
     /// `maxmemory` (the commands that may add memory).
@@ -69,12 +73,17 @@ const KEY: (i32, i32, i32) = (1, 1, 1);
 const ALL_KEYS: (i32, i32, i32) = (1, -1, 1);
 
 const fn data(name: &'static str, arity: i32, keys: (i32, i32, i32), run: fn(&Args, &mut Store, &mut Encoder) -> Flow) -> Command {
-    Command { name, arity, keys, run: Run::Data(run), denyoom: false, write: false, movable: 0, subcommands: &[] }
+    Command { name, arity, keys, run: Run::Data(run), denyoom: false, write: false, movable: 0, dest: false, subcommands: &[] }
 }
 
 /// A data command whose keys follow a count at `args[1]`.
 const fn movable(name: &'static str, arity: i32, run: fn(&Args, &mut Store, &mut Encoder) -> Flow) -> Command {
     Command { movable: 1, ..data(name, arity, NO_KEYS, run) }
+}
+
+/// [`movable`] after a destination key (`ZUNIONSTORE dst numkeys key ...`).
+const fn movable_dest(name: &'static str, arity: i32, run: fn(&Args, &mut Store, &mut Encoder) -> Flow) -> Command {
+    Command { movable: 1, dest: true, ..data(name, arity, KEY, run) }
 }
 
 /// [`movable`], each key followed by a value.
@@ -97,7 +106,7 @@ pub(crate) const fn conn(
     arity: i32,
     run: fn(&Args, &Node, &Client, &mut Encoder) -> Flow,
 ) -> Command {
-    Command { name, arity, keys: NO_KEYS, run: Run::Conn(run), denyoom: false, write: false, movable: 0, subcommands: &[] }
+    Command { name, arity, keys: NO_KEYS, run: Run::Conn(run), denyoom: false, write: false, movable: 0, dest: false, subcommands: &[] }
 }
 
 /// A container command. `run` handles it without a subcommand, where its
@@ -108,7 +117,7 @@ const fn container(
     run: fn(&Args, &Node, &Client, &mut Encoder) -> Flow,
     subcommands: &'static [Command],
 ) -> Command {
-    Command { name, arity, keys: NO_KEYS, run: Run::Conn(run), denyoom: false, write: false, movable: 0, subcommands }
+    Command { name, arity, keys: NO_KEYS, run: Run::Conn(run), denyoom: false, write: false, movable: 0, dest: false, subcommands }
 }
 
 /// Looked up front to back: the hot commands first.
@@ -246,6 +255,14 @@ pub(crate) const COMMANDS: &[Command] = &[
     write(data("zpopmax", -2, KEY, |args, store, out| zset::zpop(args, store, out, true))),
     data("zrandmember", -2, KEY, zset::zrandmember),
     data("zscan", -3, KEY, scan::zscan),
+    movable("zunion", -3, |args, store, out| zset::combine(args, store, out, SetOp::Union, None)),
+    movable("zinter", -3, |args, store, out| zset::combine(args, store, out, SetOp::Inter, None)),
+    movable("zdiff", -3, |args, store, out| zset::combine(args, store, out, SetOp::Diff, None)),
+    denyoom(movable_dest("zunionstore", -4, |args, store, out| zset::combine(args, store, out, SetOp::Union, Some("zunionstore")))),
+    denyoom(movable_dest("zinterstore", -4, |args, store, out| zset::combine(args, store, out, SetOp::Inter, Some("zinterstore")))),
+    denyoom(movable_dest("zdiffstore", -4, |args, store, out| zset::combine(args, store, out, SetOp::Diff, Some("zdiffstore")))),
+    movable("zintercard", -3, zset::zintercard),
+    write(movable("zmpop", -4, zset::zmpop)),
 ];
 
 /// Runs the request `args` (not empty) of `client` and appends its reply to
@@ -411,11 +428,13 @@ pub(crate) fn routed<'a>(
     }
 }
 
-/// `cmd`'s keys in `args`; `None` without any.
+/// `cmd`'s keys in `args`; `None` without any. A destination comes first,
+/// as Redis's key specs list it (none either if the count isn't one).
 fn keys_in<'a>(cmd: &Command, args: Args<'a>) -> Option<impl Iterator<Item = &'a [u8]> + Clone> {
     let (first, last, step) = cmd.key_range(&args)?;
     let last = if last < 0 { args.len() as i32 + last } else { last };
-    Some((first..=last).step_by(step as usize).map(move |i| args.get(i as usize).expect("in range")))
+    let dest = cmd.dest.then_some(1);
+    Some(dest.into_iter().chain((first..=last).step_by(step as usize)).map(move |i| args.get(i as usize).expect("in range")))
 }
 
 /// `cmd`'s keys in `args`, none if it has none.
@@ -464,11 +483,14 @@ impl Command {
         if self.movable == 0 {
             return (self.keys != NO_KEYS).then_some(self.keys);
         }
-        let n = parse_i64(&args[1]).unwrap_or_else(|| i64::from(atoi(&args[1])));
+        let at = if self.dest { 2 } else { 1 };
+        let count = args.get(at)?;
+        let n = parse_i64(count).unwrap_or_else(|| i64::from(atoi(count)));
         let step = i64::from(self.movable);
+        let first = at as i64 + 1;
         // The last key must be an argument (Redis's keynum key spec).
-        let last = n.checked_sub(1).and_then(|k| k.checked_mul(step)).and_then(|k| k.checked_add(2));
-        last.filter(|&last| n >= 1 && last < args.len() as i64).map(|last| (2, last as i32, step as i32))
+        let last = n.checked_sub(1).and_then(|k| k.checked_mul(step)).and_then(|k| k.checked_add(first));
+        last.filter(|&last| n >= 1 && last < args.len() as i64).map(|last| (first as i32, last as i32, step as i32))
     }
 
     /// Whether `name` is this command's short name (after the `|` of a
@@ -998,13 +1020,19 @@ mod tests {
         check(COMMANDS, "");
     }
 
-    /// `cmd`'s keys in the request `words`.
-    fn key_range(cmd: &str, words: &[&str]) -> Option<(i32, i32, i32)> {
-        let mut parser = resp::Parser::new(resp::Limits::default());
+    /// The request `words` in RESP.
+    fn request_bytes(words: &[&str]) -> Vec<u8> {
         let mut buf = format!("*{}\r\n", words.len()).into_bytes();
         for w in words {
             buf.extend_from_slice(format!("${}\r\n{w}\r\n", w.len()).as_bytes());
         }
+        buf
+    }
+
+    /// `cmd`'s keys in the request `words`.
+    fn key_range(cmd: &str, words: &[&str]) -> Option<(i32, i32, i32)> {
+        let mut parser = resp::Parser::new(resp::Limits::default());
+        let buf = request_bytes(words);
         assert!(matches!(parser.parse(&buf), Ok(resp::Parsed::Complete { .. })));
         find(COMMANDS, cmd.as_bytes()).unwrap().key_range(&parser.args(&buf))
     }
@@ -1028,7 +1056,32 @@ mod tests {
         assert_eq!(key_range("lmpop", &["lmpop", "3", "a", "b", "LEFT"]), Some((2, 4, 1)));
         assert_eq!(find(COMMANDS, b"lmpop").unwrap().keys, NO_KEYS, "COMMAND shows 0 0 0, as Redis");
         assert_eq!(key_range("get", &["get", "k"]), Some(KEY));
+        // After a destination: the count at args[2], the keys from args[3].
+        let store = |words: &[&str]| key_range("zunionstore", words);
+        assert_eq!(store(&["zunionstore", "d", "2", "a", "b", "WEIGHTS", "1", "2"]), Some((3, 4, 1)));
+        assert_eq!(store(&["zunionstore", "d", "3", "a", "b"]), None, "more than there are");
+        assert_eq!(store(&["zunionstore", "d", "0", "a"]), None);
+        assert_eq!(store(&["zunionstore", "d", "2abc", "a", "b"]), Some((3, 4, 1)));
+        assert_eq!(find(COMMANDS, b"zunionstore").unwrap().keys, KEY, "COMMAND shows 1 1 1, as Redis");
+        assert_eq!(key_range("zunion", &["zunion", "2", "a", "b", "WITHSCORES"]), Some((2, 3, 1)));
+        assert_eq!(key_range("zmpop", &["zmpop", "1", "a", "MIN"]), Some((2, 2, 1)));
         assert_eq!(key_range("ping", &["ping"]), None);
+    }
+
+    /// `cmd`'s keys in the request `words`.
+    fn keys_of_words(cmd: &str, words: &[&str]) -> Vec<Vec<u8>> {
+        let mut parser = resp::Parser::new(resp::Limits::default());
+        let buf = request_bytes(words);
+        assert!(matches!(parser.parse(&buf), Ok(resp::Parsed::Complete { .. })));
+        keys_of(find(COMMANDS, cmd.as_bytes()).unwrap(), parser.args(&buf)).map(<[u8]>::to_vec).collect()
+    }
+
+    #[test]
+    fn a_destination_comes_first() {
+        let keys = keys_of_words("zinterstore", &["zinterstore", "d", "2", "a", "b", "AGGREGATE", "MAX"]);
+        assert_eq!(keys, [b"d".to_vec(), b"a".to_vec(), b"b".to_vec()], "as COMMAND GETKEYS lists them");
+        let keys = keys_of_words("zinterstore", &["zinterstore", "d", "x", "a"]);
+        assert!(keys.is_empty(), "no keys at all, the destination neither");
     }
 
     #[test]

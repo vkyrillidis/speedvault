@@ -165,7 +165,12 @@ def requests(keys: List[bytes]) -> List[Tuple]:
                    ("ZINCRBY", z, "0.1", "a"), ("ZSCORE", z, "a"), ("ZRANGESTORE", z2, z, "0", "1"),
                    ("ZRANGE", z2, "0", "-1"), ("ZRANGESTORE", other, z, "0", "-1"), ("ZRANGESTORE", z2, other, "0", "-1"),
                    ("ZPOPMIN", z2), ("ZRANK", z, "b", "WITHSCORE"), ("ZSCAN", z, "0"), ("TYPE", z),
-                   ("OBJECT", "ENCODING", z), ("ZREMRANGEBYSCORE", z, "-inf", "(0")]
+                   ("OBJECT", "ENCODING", z), ("ZREMRANGEBYSCORE", z, "-inf", "(0"),
+                   # A destination and keys after a count (phase 9 milestone 3).
+                   ("ZUNIONSTORE", z2, "2", z, z2), ("ZUNIONSTORE", z2, "2", z, other), ("ZUNIONSTORE", other, "1", z),
+                   ("ZINTERSTORE", z2, "1", z, "WEIGHTS", "2"), ("ZDIFFSTORE", z2, "x", z), ("ZDIFFSTORE", z2, "3", z, z2),
+                   ("ZUNION", "2", z, z2, "WITHSCORES"), ("ZINTER", "2", z, other), ("ZINTERCARD", "2", z, z2),
+                   ("ZMPOP", "2", z, z2, "MIN", "COUNT", "2"), ("ZMPOP", "2", z, other, "MAX"), ("ZDIFF", "0", z)]
     # Transactions: each command checked as queued (MOVED aborts it), EXEC
     # as one command of all their keys (CROSSSLOT, MOVED).
     for i, k in enumerate(keys[::2]):
