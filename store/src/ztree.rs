@@ -9,10 +9,17 @@
 //! to [`MAX`] children with their counts and their first entries (to choose
 //! a child without visiting it).
 //!
-//! Nodes stay between [`MIN`] and [`MAX`] wide (the root excepted): a node
-//! that grows past [`MAX`] splits in two, one that shrinks below [`MIN`]
+//! Nodes stay between [`MIN`] and [`MAX`] wide (the root excepted): a full
+//! leaf splits in two before it takes another entry, an inner node that
+//! grows past [`MAX`] splits after, one that shrinks below [`MIN`]
 //! merges with a neighbour, or takes entries from it if the two wouldn't
 //! fit one node. All leaves are at the same depth.
+//!
+//! No node's vectors ever double past what it can hold: a leaf has room
+//! for [`MAX`] entries (1 KiB) from its split on, an inner node for
+//! [`MAX`] + 1 children from its making. (Splitting a leaf once it held
+//! 65 doubled it to 128 places, which both halves kept: a third of the
+//! tree's memory was empty places, 45 bytes a member of a set of 1M.)
 
 use std::cmp::Ordering;
 
@@ -48,6 +55,14 @@ struct Inner<E> {
     firsts: Vec<E>,
 }
 
+impl<E> Inner<E> {
+    /// Empty, with room for the [`MAX`] + 1 children it holds before it
+    /// splits, so none of its vectors ever grows.
+    fn with_room() -> Inner<E> {
+        Inner { children: Vec::with_capacity(MAX + 1), counts: Vec::with_capacity(MAX + 1), firsts: Vec::with_capacity(MAX + 1) }
+    }
+}
+
 impl<E: Ranked> Node<E> {
     /// Entries in a leaf, children in an inner node.
     fn width(&self) -> usize {
@@ -78,12 +93,21 @@ impl<E: Ranked> Node<E> {
         match self {
             Node::Leaf(v) => {
                 let pos = v.partition_point(|x| cmp(x, e.score(), e.member()) == Ordering::Less);
-                v.insert(pos, e);
-                (v.len() > MAX).then(|| {
-                    let mut right = Vec::with_capacity(MAX);
-                    right.extend(v.drain(v.len() / 2..));
-                    Node::Leaf(right)
-                })
+                if v.len() < MAX {
+                    // A leaf grows by doubling from empty: to MAX at most.
+                    v.insert(pos, e);
+                    return None;
+                }
+                // Full: in two first, then the entry into its half.
+                let half = MAX / 2;
+                let mut right = Vec::with_capacity(MAX);
+                right.extend(v.drain(half..));
+                if pos <= half {
+                    v.insert(pos, e);
+                } else {
+                    right.insert(pos - half, e);
+                }
+                Some(Node::Leaf(right))
             }
             Node::Inner(n) => {
                 let i = n.child_for(e.score(), e.member()).unwrap_or(0);
@@ -98,11 +122,11 @@ impl<E: Ranked> Node<E> {
                 }
                 (n.children.len() > MAX).then(|| {
                     let half = n.children.len() / 2;
-                    Node::Inner(Box::new(Inner {
-                        children: n.children.drain(half..).collect(),
-                        counts: n.counts.drain(half..).collect(),
-                        firsts: n.firsts.drain(half..).collect(),
-                    }))
+                    let mut right = Inner::with_room();
+                    right.children.extend(n.children.drain(half..));
+                    right.counts.extend(n.counts.drain(half..));
+                    right.firsts.extend(n.firsts.drain(half..));
+                    Node::Inner(Box::new(right))
                 })
             }
         }
@@ -246,11 +270,11 @@ impl<E: Ranked> Tree<E> {
     pub(crate) fn insert(&mut self, e: E) {
         if let Some(right) = self.root.insert(e) {
             let left = std::mem::replace(&mut self.root, Node::Leaf(Vec::new()));
-            self.root = Node::Inner(Box::new(Inner {
-                counts: vec![left.count(), right.count()],
-                firsts: vec![left.first(), right.first()],
-                children: vec![left, right],
-            }));
+            let mut root = Inner::with_room();
+            root.counts.extend([left.count(), right.count()]);
+            root.firsts.extend([left.first(), right.first()]);
+            root.children.extend([left, right]);
+            self.root = Node::Inner(Box::new(root));
         }
         self.len += 1;
     }

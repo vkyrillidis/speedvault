@@ -1,7 +1,10 @@
 //! A sorted set: members ordered by score, then by their bytes.
 //!
 //! Small ones are packed (Redis's listpack encoding): each member followed
-//! by its score's 8 bytes, in order, found by a walk. Past
+//! by its score, in order, found by a walk. As a listpack, the packed form
+//! keeps an integral score as an integer: in 1 to 7 bytes (two's
+//! complement, little endian) below 2^53, the rest as its 8 bytes; an
+//! element's length tells which. Past
 //! [`ZSET_MAX_LISTPACK_ENTRIES`] members, or with a member longer than
 //! [`ZSET_MAX_LISTPACK_VALUE`] bytes, it converts, one way as in Redis, to
 //! a table of members and scores (to find a member's score) beside a
@@ -78,6 +81,32 @@ fn read_score(bytes: &[u8]) -> f64 {
     f64::from_bits(u64::from_le_bytes(bytes.try_into().expect("a score is 8 bytes")))
 }
 
+/// A packed score: an integer below 2^53 in as few bytes as it takes (1 to
+/// 7), anything else as its 8 bytes. `-0` is `0` (packed as Redis's
+/// listpack has it). How many of the bytes are the score.
+fn packed_score(score: f64) -> ([u8; 8], usize) {
+    const EXACT: f64 = 9007199254740992.0; // 2^53
+    if score.fract() == 0.0 && score.abs() < EXACT {
+        let i = score as i64;
+        let bytes = i.to_le_bytes();
+        // The fewest bytes that sign-extend back to i.
+        let len = (1..=7).find(|&n| (i << (64 - 8 * n)) >> (64 - 8 * n) == i).expect("below 2^53 fits 7 bytes");
+        return (bytes, len);
+    }
+    (score_bytes(score), 8)
+}
+
+/// [`packed_score`] read back.
+fn read_packed_score(bytes: &[u8]) -> f64 {
+    if bytes.len() == 8 {
+        return read_score(bytes);
+    }
+    let mut buf = [0u8; 8];
+    buf[..bytes.len()].copy_from_slice(bytes);
+    let shift = 64 - 8 * bytes.len() as u32;
+    ((i64::from_le_bytes(buf) << shift) >> shift) as f64
+}
+
 impl Default for ZSet {
     fn default() -> ZSet {
         ZSet { repr: Repr::Packed(Packed::default()) }
@@ -97,7 +126,7 @@ impl<'a> Iterator for PairIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let (at, member) = self.0.next()?;
         let (_, score) = self.0.next().expect("members and scores in turn");
-        Some((at, member, read_score(score)))
+        Some((at, member, read_packed_score(score)))
     }
 }
 
@@ -105,7 +134,7 @@ impl DoubleEndedIterator for PairIter<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         let (_, score) = self.0.next_back()?;
         let (at, member) = self.0.next_back().expect("members and scores in turn");
-        Some((at, member, read_score(score)))
+        Some((at, member, read_packed_score(score)))
     }
 }
 
@@ -158,7 +187,8 @@ impl ZSet {
         let mut p = Packed::default();
         for (m, s) in self.iter(0, usize::MAX, false) {
             p.push(m);
-            p.push(&score_bytes(if s == 0.0 { 0.0 } else { s }));
+            let (bytes, len) = packed_score(s);
+            p.push(&bytes[..len]);
         }
         self.repr = Repr::Packed(p);
     }
@@ -253,7 +283,8 @@ impl ZSet {
         let at = at.unwrap_or(p.bytes());
         p.insert_at(at, member);
         let after = p.at(at).whole().end;
-        p.insert_at(after, &score_bytes(score));
+        let (bytes, len) = packed_score(score);
+        p.insert_at(after, &bytes[..len]);
     }
 
     /// Removes `member`; its score if it was there.
@@ -607,6 +638,40 @@ mod tests {
         }
         assert_eq!(z.score(b"missing"), None);
         assert_eq!(z.rank(b"missing"), None);
+    }
+
+    #[test]
+    fn packed_scores_round_trip() {
+        let two53 = 9007199254740992.0;
+        for (s, len) in [
+            (0.0, 1),
+            (1.0, 1),
+            (-1.0, 1),
+            (127.0, 1),
+            (128.0, 2),
+            (-128.0, 1),
+            (-129.0, 2),
+            (32767.0, 2),
+            (32768.0, 3),
+            (1e6, 3),
+            (two53 - 1.0, 7),
+            (-(two53 - 1.0), 7),
+            (two53, 8),
+            (-two53, 8),
+            (0.5, 8),
+            (-2.5, 8),
+            (1e300, 8),
+            (f64::INFINITY, 8),
+            (f64::NEG_INFINITY, 8),
+            (f64::MIN_POSITIVE, 8),
+        ] {
+            let (bytes, n) = packed_score(s);
+            assert_eq!(n, len, "{s}");
+            assert_eq!(read_packed_score(&bytes[..n]).to_bits(), s.to_bits(), "{s}");
+        }
+        // -0 is 0 packed, as in a listpack.
+        let (bytes, n) = packed_score(-0.0);
+        assert_eq!((n, read_packed_score(&bytes[..n]).to_bits()), (1, 0));
     }
 
     /// Random adds, updates and removals against a `HashMap`, packed and
