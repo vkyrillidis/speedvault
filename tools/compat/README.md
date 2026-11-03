@@ -6,7 +6,7 @@ standard library only.
 | File | What it is |
 |------|------------|
 | `resp.py` | Small RESP2/RESP3 client: raw sends (optionally split into chunks with delays), exact reply framing for every RESP3 type, close and timeout detection. Also a CLI: `python3 resp.py 127.0.0.1:6379 --resp3 MGET a b` |
-| `corpus.py` | The test cases (334), with their normalisers and expected-byte overrides |
+| `corpus.py` | The test cases (483), with their normalisers and expected-byte overrides |
 | `difftest.py` | Differential tester: runs the corpus against a reference and a target and compares replies byte for byte |
 | `allowlist.py` | Known, intended differences (case pattern → reason) |
 | `resp_proxy.py` | Logging TCP proxy: prints every request and reply going through it, including the ones `MONITOR` doesn't show (rejected commands) |
@@ -90,6 +90,11 @@ SELECT in the middle), a SET split at every byte boundary (32 cases), a
 pipeline and an inline command dripped one byte at a time, splits inside
 CRLF and across requests, 64 KiB chunks, 1 MiB and 10 MiB values, a 100 KB
 key, DEL with 10000 keys; since phase 7 hashes, sets, lists and `SCAN`;
+since phase 9 sorted sets (every `ZADD` option and combination, scores
+written and read past fast_float's limits, `-0` packed and not, ranges by
+rank, score and member with `REV`/`LIMIT`, `(`, `[`, `+`, `-` and NUL bytes,
+members of mixed scores while packed, the encodings at their limits,
+`ZRANGESTORE` over other types and itself, RESP3 pairs);
 transactions (tag `tx`: `MULTI`/`EXEC`/`DISCARD` and their errors, the
 checks while queueing, `-OOM` at either end, RESP3, `CLIENT INFO` and
 `INFO` inside, and `WATCH` against each write command, once changing the

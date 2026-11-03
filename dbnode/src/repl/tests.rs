@@ -210,7 +210,8 @@ fn write_flags_are_redis_s() {
     let redis = "set del incr mset decr incrby decrby incrbyfloat setnx getdel append expire pexpire expireat pexpireat \
                  persist flushall flushdb hset hdel hmset hincrby hsetnx hincrbyfloat sadd srem spop smove sunionstore \
                  sinterstore sdiffstore lpush rpush lpop rpop lset linsert lrem ltrim lpushx rpushx lmove rpoplpush lmpop \
-                 delex increx lmovem msetex";
+                 delex increx lmovem msetex zadd zincrby zrem zrangestore zremrangebyrank zremrangebyscore \
+                 zremrangebylex zpopmin zpopmax";
     let ours: BTreeSet<&str> = COMMANDS.iter().filter(|c| c.write).map(|c| c.name).collect();
     assert_eq!(ours, redis.split_whitespace().collect());
     assert!(COMMANDS.iter().all(|c| c.subcommands.iter().all(|s| !s.write)));

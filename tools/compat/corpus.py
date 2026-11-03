@@ -561,6 +561,196 @@ seq("list_wrongtype", ("SET", "str", "v"), ("LPUSH", "str", "a"), ("RPUSH", "str
     ("LINSERT", "str", "NOPE", "a", "b"), ("LREM", "str", "0", "a"), ("LTRIM", "str", "0", "1"), ("LPOS", "str", "a"),
     ("LPOS", "str", "a", "RANK", "0"), ("RPUSH", "l", "a"), ("GET", "l"), ("SADD", "l", "a"), ("HSET", "l", "a", "b"),
     ("TYPE", "l"))
+# --- sorted sets -------------------------------------------------------
+# Every order a sorted set replies in is Redis's own (score, then member
+# bytes), so most cases compare as they are. A step written (fn, command)
+# has its reply normalised by fn: random picks, and the order of a large
+# set's ZSCAN (its dict's).
+
+
+def zseq(name, *commands, **kw) -> Case:
+    plain, norms = [], kw.pop("norm", [])
+    for i, c in enumerate(commands):
+        if isinstance(c, tuple) and c and callable(c[0]):
+            norms = norms + [at(i, c[0])]
+            c = c[1]
+        plain.append(c)
+    return seq(name, *plain, norm=norms, **kw)
+
+
+BIG = [s for i in range(200) for s in (str(i / 10), f"m{i}")]
+seq("zset_zadd_basic", ("ZADD", "z", "1", "a", "2", "b", "3", "c"), ("ZADD", "z", "1", "a"), ("ZADD", "z", "CH", "5", "a"),
+    ("ZADD", "z", "NX", "9", "a", "10", "d"), ("ZADD", "z", "XX", "7", "b", "8", "e"), ("ZADD", "z", "xx", "ch", "7", "b", "9", "c"),
+    ("ZRANGE", "z", "0", "-1", "WITHSCORES"), ("ZCARD", "z"), ("TYPE", "z"), ("OBJECT", "ENCODING", "z"),
+    ("ZADD", "z", "ch", "nx", "1", "q", "2", "a"), ("ZADD", "z", "XX", "1", "nope"), ("EXISTS", "nope"),
+    ("ZADD", "nokey", "XX", "1", "a"), ("EXISTS", "nokey"), ("ZADD", "z", "1", "a", "1", "a", "2", "a"),
+    ("ZSCORE", "z", "a"), ("ZADD", "z", "1", ""), ("ZRANGE", "z", "0", "-1"))
+seq("zset_zadd_errors", ("ZADD", "z"), ("ZADD", "z", "1"), ("ZADD", "z", "1", "a", "2"), ("ZADD", "z", "NX", "XX", "1", "a"),
+    ("ZADD", "z", "GT", "LT", "1", "a"), ("ZADD", "z", "GT", "NX", "1", "a"), ("ZADD", "z", "LT", "NX", "1", "a"),
+    ("ZADD", "z", "INCR", "1", "a", "2", "b"), ("ZADD", "z", "x", "a"), ("ZADD", "z", "1", "a", "x", "b"), ("EXISTS", "z"),
+    ("ZADD", "z", "nan", "a"), ("ZADD", "z", "NX"), ("ZADD", "z", "nx", "xx"), ("ZADD", "z", "1", "a", "CH", "2"),
+    ("ZADD", "z", "NX", "XX", "1"), ("ZADD", "z", "INCR", "NX", "XX", "1", "a"), ("ZADD", "z", " 1", "a"),
+    ("ZADD", "z", "1 ", "a"), ("ZADD", "z", "1e400", "a"), ("ZADD", "z", "", "a"), ("ZADD", "z", b"1\x00", "a"),
+    ("ZADD", "z", "--1", "a"), ("EXISTS", "z"), ("ZINCRBY", "z", "nx", "m"), ("ZINCRBY", "z", "x", "m"),
+    ("ZINCRBY", "z", "1"), ("ZINCRBY", "z", "1", "m", "n"))
+seq("zset_zadd_gt_lt", ("ZADD", "z", "5", "a"), ("ZADD", "z", "GT", "3", "a"), ("ZADD", "z", "GT", "CH", "7", "a"),
+    ("ZADD", "z", "LT", "9", "a"), ("ZADD", "z", "LT", "CH", "1", "a"), ("ZADD", "z", "GT", "100", "new"),
+    ("ZADD", "z", "XX", "GT", "50", "a"), ("ZADD", "z", "XX", "LT", "CH", "40", "a", "1", "new"),
+    ("ZRANGE", "z", "0", "-1", "WITHSCORES"), ("ZADD", "z", "GT", "INCR", "-1", "a"), ("ZADD", "z", "LT", "INCR", "-1", "a"),
+    ("ZADD", "z", "GT", "CH", "40", "a"), ("ZSCORE", "z", "a"))
+seq("zset_zadd_incr", ("ZADD", "z", "INCR", "1.5", "m"), ("ZADD", "z", "INCR", "1.5", "m"), ("ZINCRBY", "z", "2", "m"),
+    ("ZINCRBY", "z", "-1e3", "m"), ("ZINCRBY", "z", "abc", "m"), ("ZADD", "z", "INCR", "inf", "m"),
+    ("ZADD", "z", "INCR", "-inf", "m"), ("ZSCORE", "z", "m"), ("ZINCRBY", "z", "-inf", "m"), ("ZADD", "z", "XX", "INCR", "1", "nope"),
+    ("ZADD", "z", "NX", "INCR", "1", "m"), ("ZINCRBY", "nokey", "5", "m"), ("ZSCORE", "nokey", "m"),
+    ("ZINCRBY", "z", "0.1", "f"), ("ZINCRBY", "z", "0.2", "f"), ("ZADD", "z", "CH", "INCR", "0", "f"),
+    ("ZINCRBY", "z", "9e308", "big"), ("ZINCRBY", "z", "9e308", "big"))
+seq("zset_scores_written", ("ZADD", "z", "0.1", "a", "1e-7", "b", "1.5e300", "c", "-0", "d", "inf", "e", "-inf", "f",
+                            "4611686018427387904", "g", "9223372036854775808", "h", "1e21", "i", "123456789.123456789", "j",
+                            "0x1p3", "k", "9e308", "l", "1e-340", "m", ".5", "n", "5.", "o", "+1", "p", "0.30000000000000004", "q",
+                            "-1.25e-300", "r", "4611686018427387903", "s", "1e-310", "t", "100", "u", "-7", "v"),
+    ("ZRANGE", "z", "0", "-1", "WITHSCORES"), ("ZSCORE", "z", "d"), ("ZSCORE", "z", "h"), ("ZMSCORE", "z", "a", "x", "q"),
+    ("ZSCAN", "z", "0"), ("OBJECT", "ENCODING", "z"))
+zseq("zset_scores_written_large", ("ZADD", "z", *BIG), ("ZADD", "z", "-0", "negzero", "0.1", "tenth", "1e21", "huge", "1e-7", "tiny"),
+     ("OBJECT", "ENCODING", "z"), ("ZSCORE", "z", "negzero"), ("ZSCORE", "z", "tenth"),
+     ("ZRANGEBYSCORE", "z", "-1", "0.3", "WITHSCORES"), ("ZRANGE", "z", "-3", "-1", "WITHSCORES"),
+     (scan_sorted(pairs=True), ("ZSCAN", "z", "0", "COUNT", "1000")),
+     (scan_sorted(pairs=True), ("ZSCAN", "z", "0", "MATCH", "m1?", "COUNT", "1000")))
+seq("zset_negative_zero", ("ZADD", "z", "-0", "a"), ("ZSCORE", "z", "a"), ("ZADD", "z", "0", "a"), ("ZADD", "z", "CH", "-0", "b"),
+    ("ZRANGE", "z", "0", "-1", "WITHSCORES"), ("ZADD", "z", "INCR", "-0", "a"), ("ZINCRBY", "y", "-0", "a"),
+    ("ZSCORE", "y", "a"), ("ZADD", "w", "1", "x" * 65, "-0", "a"), ("ZSCORE", "w", "a"), ("ZADD", "w", "0", "a"),
+    ("ZSCORE", "w", "a"), ("ZRANGE", "w", "0", "0", "WITHSCORES"))
+seq("zset_zrange_rank", ("ZADD", "z", "1", "a", "2", "b", "3", "c", "4", "d", "5", "e"), ("ZRANGE", "z", "0", "-1"),
+    ("ZRANGE", "z", "-2", "-1"), ("ZRANGE", "z", "1", "100"), ("ZRANGE", "z", "3", "1"), ("ZRANGE", "z", "5", "6"),
+    ("ZRANGE", "z", "-100", "0"), ("ZRANGE", "z", "0", "-1", "REV"), ("ZRANGE", "z", "0", "1", "rev", "withscores"),
+    ("ZREVRANGE", "z", "0", "1"), ("ZREVRANGE", "z", "0", "-1", "WITHSCORES"), ("ZRANGE", "z", "x", "1"),
+    ("ZRANGE", "z", "0", "1.5"), ("ZRANGE", "z", "0", "1", "LIMIT", "0", "1"), ("ZRANGE", "z", "0", "-1", "LIMIT", "0", "-1"),
+    ("ZRANGE", "z", "0", "1", "FOO"), ("ZRANGE", "z", "0", "1", "WITHSCORES", "WITHSCORES"), ("ZRANGE", "z", "0", "1", "REV", "REV"),
+    ("ZREVRANGE", "z", "0", "1", "REV"), ("ZREVRANGE", "z", "0", "1", "LIMIT", "0", "1"), ("ZRANGE", "nokey", "0", "-1"),
+    ("ZRANGE", "z", "-9223372036854775808", "9223372036854775807"), ("ZRANGE", "z", "0", "1", "LIMIT", "0"),
+    ("ZRANGE", "z", "0", "1", "LIMIT", "x", "1"), ("ZRANGE", "z", "0"), ("ZREVRANGE", "z", "-1", "-1"),
+    ("ZRANGE", "z", "0", "-1", "BYSCORE", "BYLEX"), ("ZRANGE", "z", "-1", "0", b"withscores\x00x"))
+seq("zset_zrange_score", ("ZADD", "z", "1", "a", "2", "b", "2", "c", "3", "d", "5", "e"), ("ZRANGE", "z", "2", "3", "BYSCORE"),
+    ("ZRANGE", "z", "(2", "3", "BYSCORE"), ("ZRANGE", "z", "2", "(3", "BYSCORE"), ("ZRANGE", "z", "-inf", "+inf", "BYSCORE", "WITHSCORES"),
+    ("ZRANGE", "z", "3", "2", "BYSCORE"), ("ZRANGE", "z", "(2", "(2", "BYSCORE"), ("ZRANGE", "z", "2", "2", "BYSCORE"),
+    ("ZRANGE", "z", "5", "1", "BYSCORE", "REV"), ("ZRANGE", "z", "1", "5", "BYSCORE", "REV"),
+    ("ZRANGE", "z", "-inf", "inf", "BYSCORE", "LIMIT", "1", "2"), ("ZRANGE", "z", "-inf", "inf", "BYSCORE", "LIMIT", "1", "-1"),
+    ("ZRANGE", "z", "-inf", "inf", "BYSCORE", "LIMIT", "0", "0"), ("ZRANGE", "z", "-inf", "inf", "BYSCORE", "LIMIT", "-1", "2"),
+    ("ZRANGE", "z", "-inf", "inf", "BYSCORE", "LIMIT", "5", "1"), ("ZRANGE", "z", "-inf", "inf", "BYSCORE", "LIMIT", "4", "10"),
+    ("ZRANGE", "z", "+inf", "-inf", "BYSCORE", "REV", "LIMIT", "1", "2"), ("ZRANGE", "z", "3", "1", "BYSCORE", "REV", "LIMIT", "2", "5"),
+    ("ZRANGE", "z", "(5", "2", "BYSCORE", "REV", "LIMIT", "3", "1"),
+    # Backwards, an offset past the first member yet below the length: nothing.
+    ("ZRANGE", "z", "2", "-inf", "BYSCORE", "REV", "LIMIT", "3", "1"), ("ZREVRANGEBYSCORE", "z", "(2", "-inf", "LIMIT", "1", "1"),
+    ("ZRANGEBYSCORE", "z", "2", "3"),
+    ("ZRANGEBYSCORE", "z", "2", "3", "WITHSCORES", "LIMIT", "0", "1"), ("ZREVRANGEBYSCORE", "z", "3", "2"),
+    ("ZREVRANGEBYSCORE", "z", "+inf", "-inf", "LIMIT", "1", "1", "WITHSCORES"), ("ZRANGEBYSCORE", "z", "x", "1"),
+    ("ZRANGEBYSCORE", "z", "(", "("), ("ZRANGEBYSCORE", "z", "", "2"), ("ZRANGEBYSCORE", "z", " 1", "2"),
+    ("ZRANGEBYSCORE", "z", b"1\x00x", "2"), ("ZRANGEBYSCORE", "z", "1e400", "inf"), ("ZRANGEBYSCORE", "z", "nan", "1"),
+    ("ZRANGEBYSCORE", "z", "1", "2", "BYSCORE"), ("ZRANGEBYSCORE", "z", "1", "2", "REV"), ("ZRANGEBYSCORE", "z", "-1e400", "(2"),
+    ("ZRANGEBYSCORE", "z", "0x1p1", "0X1.8P1"), ("ZRANGEBYSCORE", "z", "1 ", "2"), ("ZRANGEBYSCORE", "z", "\t1", "2"),
+    ("ZCOUNT", "z", "2", "3"), ("ZCOUNT", "z", "(2", "3"), ("ZCOUNT", "z", "-inf", "+inf"), ("ZCOUNT", "z", "3", "2"),
+    ("ZCOUNT", "z", "x", "1"), ("ZCOUNT", "nokey", "0", "1"), ("ZCOUNT", "z", "6", "7"), ("ZCOUNT", "z", "-7", "0"),
+    ("ZRANGEBYSCORE", "nokey", "0", "1"), ("ZRANGE", "z", "1", "2", "BYSCORE", "LIMIT", "0", "1", "LIMIT", "1", "1"),
+    ("ZRANGEBYSCORE", "z", "1", "5", "LIMIT", "0", "9223372036854775807"))
+seq("zset_zrange_lex", ("ZADD", "z", "0", "a", "0", "b", "0", "c", "0", "d", "0", "e"), ("ZRANGE", "z", "[b", "[d", "BYLEX"),
+    ("ZRANGE", "z", "(b", "(d", "BYLEX"), ("ZRANGE", "z", "-", "+", "BYLEX"), ("ZRANGE", "z", "+", "-", "BYLEX", "REV"),
+    ("ZRANGE", "z", "[d", "[b", "BYLEX", "REV"), ("ZRANGE", "z", "-", "[c", "BYLEX", "LIMIT", "1", "1"),
+    ("ZRANGE", "z", "-", "+", "BYLEX", "WITHSCORES"), ("ZRANGEBYLEX", "z", "[a", "(c"), ("ZREVRANGEBYLEX", "z", "+", "-"),
+    ("ZREVRANGEBYLEX", "z", "+", "-", "LIMIT", "1", "2"), ("ZRANGEBYLEX", "z", "a", "c"), ("ZRANGEBYLEX", "z", "+x", "+"),
+    ("ZRANGEBYLEX", "z", "-", "-"), ("ZRANGEBYLEX", "z", "+", "+"), ("ZRANGEBYLEX", "z", "[", "+"), ("ZRANGEBYLEX", "z", "(", "+"),
+    ("ZRANGEBYLEX", "z", "-", b"+\x00x"), ("ZRANGEBYLEX", "z", b"-\x00", "(c"), ("ZRANGEBYLEX", "z", "[c", "[c"),
+    ("ZRANGEBYLEX", "z", "(c", "[c"), ("ZRANGEBYLEX", "z", "+", "-"), ("ZRANGEBYLEX", "z", "-", "+", "WITHSCORES"),
+    ("ZLEXCOUNT", "z", "-", "+"), ("ZLEXCOUNT", "z", "[b", "[d"), ("ZLEXCOUNT", "z", "x", "y"), ("ZLEXCOUNT", "nokey", "-", "+"),
+    ("ZLEXCOUNT", "z", "(e", "+"), ("ZRANGEBYLEX", "z", "", "+"), ("ZRANGEBYLEX", "nokey", "-", "+"),
+    # Members of different scores while packed: Redis walks the listpack.
+    ("ZADD", "m", "1", "c", "2", "a", "3", "b", "4", "d"), ("ZRANGEBYLEX", "m", "[a", "[b"), ("ZRANGEBYLEX", "m", "[b", "+"),
+    ("ZLEXCOUNT", "m", "-", "[b"), ("ZLEXCOUNT", "m", "[a", "+"), ("ZREVRANGEBYLEX", "m", "[b", "[a"),
+    ("ZREVRANGEBYLEX", "m", "+", "[b"), ("ZRANGE", "m", "[b", "+", "BYLEX", "LIMIT", "1", "5"), ("ZREMRANGEBYLEX", "m", "[b", "+"),
+    ("ZRANGE", "m", "0", "-1"),
+    # The pre-check: nothing in range when the last member is below the
+    # minimum or the first above the maximum, whatever comes between.
+    ("ZADD", "n", "1", "z", "2", "a"), ("ZRANGEBYLEX", "n", "[b", "+"), ("ZLEXCOUNT", "n", "[b", "+"),
+    ("ZREVRANGEBYLEX", "n", "(y", "-"), ("ZREMRANGEBYLEX", "n", "[b", "+"), ("ZRANGE", "n", "0", "-1"))
+seq("zset_rank", ("ZADD", "z", "1", "a", "2", "b", "3", "c"), ("ZRANK", "z", "a"), ("ZRANK", "z", "c"), ("ZREVRANK", "z", "a"),
+    ("ZRANK", "z", "nope"), ("ZRANK", "nokey", "a"), ("ZRANK", "z", "b", "WITHSCORE"), ("ZREVRANK", "z", "b", "withscore"),
+    ("ZRANK", "z", "nope", "WITHSCORE"), ("ZRANK", "nokey", "a", "WITHSCORE"), ("ZRANK", "z", "a", "FOO"),
+    ("ZRANK", "z", "a", "WITHSCORE", "x"), ("ZRANK", "z"), ("ZREVRANK", "z", "a", "b", "c"), ("ZRANK", "z", "a", "WITHSCORES"),
+    ("ZREVRANK", "z", "nope", "WITHSCORE"), ("ZREVRANK", "nokey", "a"))
+seq("zset_zrem_zremrange", ("ZADD", "z", "1", "a", "2", "b", "3", "c", "4", "d", "5", "e", "6", "f"), ("ZREM", "z", "a", "nope"),
+    ("ZREM", "z", "nope"), ("ZREM", "nokey", "a"), ("ZREMRANGEBYRANK", "z", "0", "0"), ("ZRANGE", "z", "0", "-1"),
+    ("ZREMRANGEBYRANK", "z", "-1", "-1"), ("ZREMRANGEBYRANK", "z", "5", "10"), ("ZREMRANGEBYRANK", "z", "x", "1"),
+    ("ZREMRANGEBYRANK", "z", "2", "1"), ("ZREMRANGEBYSCORE", "z", "(3", "4"), ("ZREMRANGEBYSCORE", "z", "x", "1"),
+    ("ZREMRANGEBYSCORE", "z", "9", "10"), ("ZRANGE", "z", "0", "-1"), ("ZREM", "z", "c", "e", "x"), ("EXISTS", "z"),
+    ("ZADD", "l", "0", "a", "0", "b", "0", "c"), ("ZREMRANGEBYLEX", "l", "[a", "(c"), ("ZREMRANGEBYLEX", "l", "x", "y"),
+    ("ZREMRANGEBYLEX", "l", "-", "+"), ("EXISTS", "l"), ("ZREMRANGEBYRANK", "nokey", "0", "1"),
+    ("ZREMRANGEBYSCORE", "nokey", "x", "1"), ("ZREMRANGEBYLEX", "nokey", "-", "+"), ("ZADD", "q", "1", "a", "2", "b"),
+    ("ZREMRANGEBYRANK", "q", "-100", "100"), ("EXISTS", "q"), ("ZREM", "q"))
+seq("zset_pop", ("ZADD", "z", "1", "a", "2", "b", "3", "c", "4", "d"), ("ZPOPMIN", "z"), ("ZPOPMAX", "z"), ("ZPOPMIN", "z", "0"),
+    ("ZPOPMIN", "z", "5"), ("EXISTS", "z"), ("ZPOPMIN", "nokey"), ("ZPOPMIN", "nokey", "0"), ("ZPOPMIN", "z", "-1"),
+    ("ZPOPMIN", "z", "x"), ("ZPOPMIN", "z", "1", "2"), ("ZPOPMAX", "nokey", "2"), ("SET", "str", "v"), ("ZPOPMIN", "str", "0"),
+    ("ZADD", "y", "1", "a", "2", "b"), ("ZPOPMAX", "y", "1"), ("ZPOPMAX", "y", "9223372036854775807"), ("ZPOPMIN", "y"))
+seq("zset_zrangestore", ("ZADD", "src", "1", "a", "2", "b", "3", "c"), ("ZRANGESTORE", "dst", "src", "0", "-1"),
+    ("ZRANGE", "dst", "0", "-1", "WITHSCORES"), ("ZRANGESTORE", "dst", "src", "2", "1", "BYSCORE", "REV", "LIMIT", "0", "1"),
+    ("ZRANGE", "dst", "0", "-1", "WITHSCORES"), ("ZRANGESTORE", "dst", "src", "[a", "[b", "BYLEX"), ("ZRANGE", "dst", "0", "-1"),
+    ("ZRANGESTORE", "dst", "src", "5", "6"), ("EXISTS", "dst"), ("ZRANGESTORE", "dst", "nokey", "0", "-1"),
+    ("ZRANGESTORE", "dst", "src", "0", "-1", "WITHSCORES"), ("SET", "str", "v"), ("ZRANGESTORE", "str", "src", "0", "0"),
+    ("TYPE", "str"), ("ZRANGESTORE", "dst", "str", "0", "-1"), ("ZRANGESTORE", "dst", "src", "0", "1"), ("EXPIRE", "dst", "100"),
+    ("ZRANGESTORE", "dst", "src", "0", "0"), ("TTL", "dst"), ("ZRANGESTORE", "src", "src", "1", "1"), ("ZRANGE", "src", "0", "-1"),
+    ("ZRANGESTORE", "dst", "src", "x", "1"), ("ZRANGESTORE", "dst", "src", "0"), ("SET", "s2", "v"),
+    ("ZRANGESTORE", "s2", "nokey", "0", "1"), ("EXISTS", "s2"), ("ZRANGESTORE", "dst", "src", "0", "1", "LIMIT", "0", "1"))
+seq("zset_encoding", ("ZADD", "z", "1", "x" * 64), ("OBJECT", "ENCODING", "z"), ("ZADD", "z", "1", "y" * 65),
+    ("OBJECT", "ENCODING", "z"), ("ZADD", "a", *[s for i in range(128) for s in (str(i), f"m{i}")]), ("OBJECT", "ENCODING", "a"),
+    ("ZADD", "a", "1", "m1"), ("OBJECT", "ENCODING", "a"), ("ZADD", "a", "1", "one-more"), ("OBJECT", "ENCODING", "a"),
+    ("ZADD", "b", *[s for i in range(129) for s in ("1", "same")]), ("OBJECT", "ENCODING", "b"), ("ZCARD", "b"),
+    ("ZADD", "c", "1", "x" * 65), ("OBJECT", "ENCODING", "c"), ("ZREMRANGEBYRANK", "a", "0", "125"), ("OBJECT", "ENCODING", "a"),
+    ("ZRANGESTORE", "d", "a", "0", "-1"), ("OBJECT", "ENCODING", "d"), ("ZADD", "e", *BIG), ("ZRANGESTORE", "f", "e", "0", "128"),
+    ("OBJECT", "ENCODING", "f"), ("ZRANGESTORE", "g", "e", "0", "127"), ("OBJECT", "ENCODING", "g"),
+    ("ZRANGESTORE", "h", "e", "-inf", "+inf", "BYSCORE"), ("OBJECT", "ENCODING", "h"),
+    ("ZRANGESTORE", "i", "e", "0", "5", "BYSCORE"), ("OBJECT", "ENCODING", "i"), ("ZADD", "j", "1", "a"),
+    ("ZADD", "j", *[s for i in range(129) for s in ("1", "a")]), ("OBJECT", "ENCODING", "j"))
+seq("zset_large", ("ZADD", "z", *BIG), ("ZCARD", "z"), ("ZRANGE", "z", "100", "105", "WITHSCORES"),
+    ("ZRANGE", "z", "-3", "-1"), ("ZREVRANGE", "z", "0", "2", "WITHSCORES"), ("ZRANK", "z", "m150"), ("ZREVRANK", "z", "m150", "WITHSCORE"),
+    ("ZRANGEBYSCORE", "z", "(5", "6", "WITHSCORES"), ("ZRANGEBYSCORE", "z", "5", "+inf", "LIMIT", "10", "3"),
+    ("ZREVRANGEBYSCORE", "z", "(5", "-inf", "LIMIT", "10", "3"), ("ZCOUNT", "z", "1", "(2"), ("ZCOUNT", "z", "-inf", "+inf"),
+    ("ZREM", "z", "m0", "m199", "nope"), ("ZPOPMIN", "z", "2"), ("ZPOPMAX", "z", "2"), ("ZREMRANGEBYRANK", "z", "10", "19"),
+    ("ZREMRANGEBYSCORE", "z", "(10", "12"), ("ZCARD", "z"), ("ZRANGE", "z", "5", "15", "WITHSCORES"), ("ZSCORE", "z", "m55"),
+    ("ZADD", "z", "XX", "CH", "-5", "m55", "100", "m56"), ("ZRANGE", "z", "0", "0", "WITHSCORES"), ("ZRANGE", "z", "-1", "-1", "WITHSCORES"),
+    ("ZINCRBY", "z", "1e3", "m57"), ("ZRANGE", "z", "-2", "-1", "WITHSCORES"), ("ZADD", "lex", *[s for i in range(150) for s in ("0", f"k{i:03}")]),
+    ("ZRANGEBYLEX", "lex", "[k010", "(k015"), ("ZREVRANGEBYLEX", "lex", "(k015", "[k010", "LIMIT", "1", "2"), ("ZLEXCOUNT", "lex", "[k100", "+"),
+    ("ZREMRANGEBYLEX", "lex", "-", "(k140"), ("ZRANGE", "lex", "0", "-1"), ("OBJECT", "ENCODING", "lex"))
+seq("zset_wrongtype", ("SET", "str", "v"), ("ZADD", "str", "1", "a"), ("ZADD", "str", "x", "a"), ("ZINCRBY", "str", "1", "a"),
+    ("ZREM", "str", "a"), ("ZCARD", "str"), ("ZSCORE", "str", "a"), ("ZMSCORE", "str", "a"), ("ZRANK", "str", "a"),
+    ("ZRANK", "str", "a", "BAD"), ("ZREVRANK", "str", "a"), ("ZRANGE", "str", "0", "-1"), ("ZRANGE", "str", "x", "y"),
+    ("ZRANGEBYSCORE", "str", "1", "2"), ("ZRANGEBYLEX", "str", "-", "+"), ("ZCOUNT", "str", "x", "1"), ("ZCOUNT", "str", "0", "1"),
+    ("ZLEXCOUNT", "str", "-", "+"), ("ZREMRANGEBYRANK", "str", "0", "1"), ("ZREMRANGEBYSCORE", "str", "0", "1"),
+    ("ZREMRANGEBYLEX", "str", "-", "+"), ("ZPOPMIN", "str"), ("ZPOPMAX", "str", "2"), ("ZRANDMEMBER", "str"),
+    ("ZRANDMEMBER", "str", "2"), ("ZSCAN", "str", "0"), ("ZSCAN", "str", "x"), ("ZRANGESTORE", "d", "str", "0", "1"),
+    ("ZADD", "z", "1", "a"), ("GET", "z"), ("SADD", "z", "x"), ("HSET", "z", "a", "1"), ("LPUSH", "z", "x"), ("INCR", "z"),
+    ("SMEMBERS", "z"), ("TYPE", "z"), ("ZADD", "z", "XX", "1", "a"), ("SCAN", "0", "TYPE", "zset"))
+zseq("zset_zrandmember", ("ZADD", "z", "1", "a", "2", "b", "3", "c"), ("ZRANDMEMBER", "nokey"), ("ZRANDMEMBER", "nokey", "2"),
+     ("ZRANDMEMBER", "z", "3"), ("ZRANDMEMBER", "z", "5", "WITHSCORES"), (length_only, ("ZRANDMEMBER", "z", "2")),
+     (length_only, ("ZRANDMEMBER", "z", "-5")), (length_only, ("ZRANDMEMBER", "z", "-5", "WITHSCORES")), ("ZRANDMEMBER", "z", "0"),
+     ("ZRANDMEMBER", "z", "x"), ("ZRANDMEMBER", "z", "-9223372036854775808"), ("ZRANDMEMBER", "z", "1", "2"),
+     ("ZRANDMEMBER", "z", "4611686018427387904", "WITHSCORES"), ("ZRANDMEMBER", "z", "-4611686018427387904", "WITHSCORES"),
+     ("ZRANDMEMBER", "z", "4611686018427387903", "WITHSCORES"), (kind_only, ("ZRANDMEMBER", "z")),
+     ("ZRANDMEMBER", "z", "1", "WITHSCORE"), ("ZADD", "big", *BIG), (length_only, ("ZRANDMEMBER", "big", "5", "WITHSCORES")),
+     ("ZRANDMEMBER", "big", "0"), (length_only, ("ZRANDMEMBER", "big", "-3")),
+     ("ZRANDMEMBER", "big", "300"), ("ZRANDMEMBER", "nokey", "-2", "WITHSCORES"))
+seq("zset_zscan", ("ZADD", "z", "1.5", "a", "2", "b", "0.1", "c", "-0", "d", "inf", "e"), ("ZSCAN", "z", "0"),
+    ("ZSCAN", "z", "0", "MATCH", "a*"), ("ZSCAN", "z", "0", "COUNT", "1"), ("ZSCAN", "z", "0", "NOVALUES"), ("ZSCAN", "nokey", "0"),
+    ("ZSCAN", "z", "x"), ("ZSCAN", "z", "0", "TYPE", "string"), ("ZSCAN", "z", "0", "MATCH"), ("ZSCAN", "z"),
+    ("ZSCAN", "nokey", "0", "COUNT", "0"), ("ZSCAN", "z", "0", "COUNT", "0"), ("HSET", "h", "f", "v", "g", "w"),
+    ("HSCAN", "h", "0", "NOVALUES"), ("HSCAN", "h", "0", "novalues", "MATCH", "g"), ("HSCAN", "h", "0", "MATCH", "novalues"),
+    ("SSCAN", "h", "0", "NOVALUES"), ("SCAN", "0", "NOVALUES"), ("SADD", "s", "1"), ("SSCAN", "s", "0", "NOVALUES"))
+seq("zset_resp3", ("HELLO", "3"), ("ZADD", "z", "1.5", "a", "2", "b", "inf", "c"), ("ZSCORE", "z", "a"), ("ZSCORE", "z", "c"),
+    ("ZSCORE", "z", "nope"), ("ZMSCORE", "z", "a", "nope"), ("ZRANGE", "z", "0", "-1", "WITHSCORES"), ("ZRANGE", "z", "0", "-1"),
+    ("ZRANGEBYSCORE", "z", "-inf", "+inf", "WITHSCORES"), ("ZRANGE", "nokey", "0", "-1", "WITHSCORES"), ("ZRANK", "z", "b", "WITHSCORE"),
+    ("ZRANK", "z", "nope", "WITHSCORE"), ("ZRANK", "z", "nope"), ("ZINCRBY", "z", "1", "a"), ("ZADD", "z", "XX", "INCR", "1", "nope"),
+    ("ZPOPMIN", "z"), ("ZPOPMIN", "z", "1"), ("ZPOPMAX", "z", "5"), ("ZPOPMIN", "z", "2"), ("ZPOPMIN", "nokey", "2"),
+    ("ZADD", "y", "1", "a", "2", "b"), ("ZRANDMEMBER", "y", "2", "WITHSCORES"), ("ZRANDMEMBER", "y", "5"), ("ZSCAN", "y", "0"),
+    ("ZRANGE", "y", "0", "0", "BYSCORE", "WITHSCORES"), norm=[at(0, mask_hello)])
+seq("zset_expiry_and_keys", ("ZADD", "z", "1", "a"), ("EXPIRE", "z", "100"), ("TTL", "z"), ("ZADD", "z", "2", "b"), ("TTL", "z"),
+    ("ZREM", "z", "a", "b"), ("TTL", "z"), ("ZADD", "z", "1", "a"), ("TTL", "z"), ("PEXPIRE", "z", "-1"), ("EXISTS", "z"),
+    ("ZADD", "z", "1", "a"), ("DEL", "z"), ("ZCARD", "z"), ("ZADD", "z", "1", "a"), ("ZPOPMIN", "z"), ("EXISTS", "z"))
 # --- SCAN, KEYS --------------------------------------------------------
 # Small keyspaces come whole with a large COUNT; their order is the dict's:
 # compared sorted. Compact hashes and intsets come whole, in their order.

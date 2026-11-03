@@ -39,14 +39,35 @@ struct Options<'a> {
     count: usize,
     pattern: Option<&'a [u8]>,
     kind: Option<&'a [u8]>,
+    /// `HSCAN ... NOVALUES`: the fields only.
+    no_values: bool,
 }
 
-/// The options from `args[from..]`; `TYPE` only if `with_type` (`SCAN`).
+/// Which command reads the options: `SCAN` takes `TYPE`, `HSCAN` `NOVALUES`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scanning {
+    Keys,
+    Hash,
+    Other,
+}
+
+/// The options from `args[from..]`, as `scanGenericCommand` reads them.
 /// `None` once the error is replied.
-fn options<'a>(args: &Args<'a>, from: usize, with_type: bool, out: &mut Encoder) -> Option<Options<'a>> {
-    let mut opts = Options { count: 10, pattern: None, kind: None };
+fn options<'a>(args: &Args<'a>, from: usize, scanning: Scanning, out: &mut Encoder) -> Option<Options<'a>> {
+    let with_type = scanning == Scanning::Keys;
+    let mut opts = Options { count: 10, pattern: None, kind: None, no_values: false };
     let mut i = from;
     while i < args.len() {
+        // NOVALUES stands alone, and may come last.
+        if args[i].eq_ignore_ascii_case(b"novalues") {
+            if scanning != Scanning::Hash {
+                out.error(b"ERR NOVALUES option can only be used in HSCAN");
+                return None;
+            }
+            opts.no_values = true;
+            i += 1;
+            continue;
+        }
         let (opt, value) = (args.get(i)?, args.get(i + 1));
         match value {
             Some(v) if opt.eq_ignore_ascii_case(b"count") => match parse_i64(v) {
@@ -89,7 +110,7 @@ fn reply<'e>(next: u64, len: usize, elements: impl Iterator<Item = &'e [u8]>, ou
 
 pub(super) fn scan(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {
     let Some(c) = cursor(&args[1]) else { return invalid_cursor(out) };
-    let Some(opts) = options(args, 2, true, out) else { return Flow::Continue };
+    let Some(opts) = options(args, 2, Scanning::Keys, out) else { return Flow::Continue };
     let (next, keys) = store.scan(c, opts.count, opts.pattern, opts.kind);
     reply(next, keys.len(), keys.iter().map(|k| &k[..]), out);
     Flow::Continue
@@ -113,9 +134,36 @@ pub(super) fn hscan(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {
         Ok(None) => return empty_scan(out),
         Ok(Some(_)) => {}
     }
-    let Some(opts) = options(args, 3, false, out) else { return Flow::Continue };
+    let Some(opts) = options(args, 3, Scanning::Hash, out) else { return Flow::Continue };
     match store.hscan(&args[1], c, opts.count, opts.pattern) {
+        Ok((next, pairs)) if opts.no_values => reply(next, pairs.len(), pairs.iter().map(|(f, _)| &f[..]), out),
         Ok((next, pairs)) => reply(next, 2 * pairs.len(), pairs.iter().flat_map(|(f, v)| [&f[..], &v[..]]), out),
+        Err(e) => store_error(e, out),
+    }
+    Flow::Continue
+}
+
+/// `ZSCAN`, as `HSCAN`: each member with its score, written as Redis
+/// writes it: as packed (`d2string`) while the set is, `%.17Lg` once large.
+pub(super) fn zscan(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {
+    let Some(c) = cursor(&args[2]) else { return invalid_cursor(out) };
+    match store.zset_at(&args[1]) {
+        Err(e) => {
+            store_error(e, out);
+            return Flow::Continue;
+        }
+        Ok(None) => return empty_scan(out),
+        Ok(Some(_)) => {}
+    }
+    let Some(opts) = options(args, 3, Scanning::Other, out) else { return Flow::Continue };
+    match store.zscan(&args[1], c, opts.count, opts.pattern) {
+        Ok((next, members, big)) => {
+            let scores: Vec<Vec<u8>> = members
+                .iter()
+                .map(|&(_, s)| if big { resp::format_double(s, &mut [0; 32]).to_vec() } else { store::double_to_bytes(s) })
+                .collect();
+            reply(next, 2 * members.len(), members.iter().zip(&scores).flat_map(|((m, _), s)| [&m[..], &s[..]]), out);
+        }
         Err(e) => store_error(e, out),
     }
     Flow::Continue
@@ -132,7 +180,7 @@ pub(super) fn sscan(args: &Args, store: &mut Store, out: &mut Encoder) -> Flow {
         Ok(None) => return empty_scan(out),
         Ok(Some(_)) => {}
     }
-    let Some(opts) = options(args, 3, false, out) else { return Flow::Continue };
+    let Some(opts) = options(args, 3, Scanning::Other, out) else { return Flow::Continue };
     match store.sscan(&args[1], c, opts.count, opts.pattern) {
         Ok((next, members)) => reply(next, members.len(), members.iter().map(|m| &m[..]), out),
         Err(e) => store_error(e, out),

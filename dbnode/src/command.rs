@@ -16,6 +16,7 @@ mod hash;
 mod list;
 mod scan;
 mod set;
+mod zset;
 use crate::Node;
 use resp::{Args, Encoder};
 use store::{parse_i64, End, SetOp, ExpireCmd, ExpireFlags, SetCond, SetExpiry, SetOptions, SetReply, Store};
@@ -221,6 +222,30 @@ pub(crate) const COMMANDS: &[Command] = &[
     data("hscan", -3, KEY, scan::hscan),
     data("sscan", -3, KEY, scan::sscan),
     data("keys", 2, NO_KEYS, scan::keys),
+    denyoom(data("zadd", -4, KEY, |args, store, out| zset::zadd(args, store, out, false))),
+    denyoom(data("zincrby", 4, KEY, |args, store, out| zset::zadd(args, store, out, true))),
+    write(data("zrem", -3, KEY, zset::zrem)),
+    data("zcard", 2, KEY, zset::zcard),
+    data("zscore", 3, KEY, zset::zscore),
+    data("zmscore", -3, KEY, zset::zmscore),
+    data("zrank", -3, KEY, |args, store, out| zset::zrank(args, store, out, false)),
+    data("zrevrank", -3, KEY, |args, store, out| zset::zrank(args, store, out, true)),
+    data("zrange", -4, KEY, zset::zrange),
+    denyoom(data("zrangestore", -5, (1, 2, 1), zset::zrangestore)),
+    data("zrevrange", -4, KEY, zset::zrevrange),
+    data("zrangebyscore", -4, KEY, |args, store, out| zset::zrangebyscore(args, store, out, false)),
+    data("zrevrangebyscore", -4, KEY, |args, store, out| zset::zrangebyscore(args, store, out, true)),
+    data("zrangebylex", -4, KEY, |args, store, out| zset::zrangebylex(args, store, out, false)),
+    data("zrevrangebylex", -4, KEY, |args, store, out| zset::zrangebylex(args, store, out, true)),
+    data("zcount", 4, KEY, zset::zcount),
+    data("zlexcount", 4, KEY, zset::zlexcount),
+    write(data("zremrangebyrank", 4, KEY, zset::zremrangebyrank)),
+    write(data("zremrangebyscore", 4, KEY, zset::zremrangebyscore)),
+    write(data("zremrangebylex", 4, KEY, zset::zremrangebylex)),
+    write(data("zpopmin", -2, KEY, |args, store, out| zset::zpop(args, store, out, false))),
+    write(data("zpopmax", -2, KEY, |args, store, out| zset::zpop(args, store, out, true))),
+    data("zrandmember", -2, KEY, zset::zrandmember),
+    data("zscan", -3, KEY, scan::zscan),
 ];
 
 /// Runs the request `args` (not empty) of `client` and appends its reply to

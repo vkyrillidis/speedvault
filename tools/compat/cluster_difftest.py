@@ -157,6 +157,15 @@ def requests(keys: List[bytes]) -> List[Tuple]:
                    ("SINTERCARD", "2abc", st, st), ("SINTERCARD", " 2", st, other),
                    ("LMPOP", "2", l, l2, "LEFT"), ("LMPOP", "1", l2, "RIGHT", "COUNT", "2"), ("LMPOP", "2", l, other, "LEFT"),
                    ("LMPOP", "3", l, "LEFT"), ("LMPOP", "0", l, "LEFT"), ("LMPOP", "2", l, "LEFT")]
+    # Sorted sets (phase 9): ZRANGESTORE's two keys CROSSSLOT across slots.
+    for i, k in enumerate(keys):
+        other = keys[(i + len(keys) // 3) % len(keys)]
+        z, z2 = b"{" + k + b"}:z", b"{" + k + b"}:z2"
+        probes += [("ZADD", z, "1", "a", "2.5", "b", "-inf", "c"), ("ZRANGE", z, "0", "-1", "WITHSCORES"),
+                   ("ZINCRBY", z, "0.1", "a"), ("ZSCORE", z, "a"), ("ZRANGESTORE", z2, z, "0", "1"),
+                   ("ZRANGE", z2, "0", "-1"), ("ZRANGESTORE", other, z, "0", "-1"), ("ZRANGESTORE", z2, other, "0", "-1"),
+                   ("ZPOPMIN", z2), ("ZRANK", z, "b", "WITHSCORE"), ("ZSCAN", z, "0"), ("TYPE", z),
+                   ("OBJECT", "ENCODING", z), ("ZREMRANGEBYSCORE", z, "-inf", "(0")]
     # Transactions: each command checked as queued (MOVED aborts it), EXEC
     # as one command of all their keys (CROSSSLOT, MOVED).
     for i, k in enumerate(keys[::2]):
