@@ -4,7 +4,9 @@ for 10000 small collections of 100 elements (within Redis's listpack
 limits; sets of non-integers, which Redis 7.2+ also packs, and of
 integers, an intset while small) and for one of 1M. Elements: 8-byte
 strings (a hash: field and value of 8 bytes each; integers up to 7 digits;
-a sorted set: a member of 9 bytes, `m` and 8 digits, scored by its number).
+a sorted set: a member of 9 bytes, `m` and 8 digits, scored by its number,
+so added in order; `zset-random`: the same members with random integer
+scores, added in a random order of scores).
 Each server must be running on 127.0.0.1 at its port; it's flushed.
 
     python3 tools/bench/collections_memory.py [--kinds=zset,hash] NAME=PORT ...
@@ -16,6 +18,7 @@ sys.path.insert(0, os.path.expanduser("~/venvs/redis-py/site"))
 import redis
 
 SHAPES = [("small", 10000, 100), ("big", 1, 1000000)]
+RNG = __import__("random").Random(1)
 
 
 def fill(r, kind, keys, n):
@@ -33,6 +36,8 @@ def fill(r, kind, keys, n):
                 p.sadd(key, *[str(int(i)) for i in items])
             elif kind == "zset":
                 p.zadd(key, {f"m{i}": int(i) for i in items})
+            elif kind == "zset-random":
+                p.zadd(key, {f"m{i}": RNG.randrange(n) for i in items})
             else:
                 p.rpush(key, *items)
             queued += len(items)
@@ -55,7 +60,7 @@ def flush(r):
     time.sleep(0.2)
 
 
-KINDS = ["hash", "set", "intset", "list", "zset"]
+KINDS = ["hash", "set", "intset", "list", "zset", "zset-random"]
 for a in sys.argv[1:]:
     if a.startswith("--kinds="):
         KINDS = a.split("=", 1)[1].split(",")

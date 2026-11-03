@@ -9,7 +9,8 @@
 //! to [`MAX`] children with their counts and their first entries (to choose
 //! a child without visiting it).
 //!
-//! Nodes stay between [`MIN`] and [`MAX`] wide (the root excepted): a full
+//! Nodes stay between [`MIN`] and [`MAX`] wide (the root, the first leaf
+//! and the last excepted): a full
 //! leaf splits in two before it takes another entry, an inner node that
 //! grows past [`MAX`] splits after, one that shrinks below [`MIN`]
 //! merges with a neighbour, or takes entries from it if the two wouldn't
@@ -20,6 +21,13 @@
 //! [`MAX`] + 1 children from its making. (Splitting a leaf once it held
 //! 65 doubled it to 128 places, which both halves kept: a third of the
 //! tree's memory was empty places, 45 bytes a member of a set of 1M.)
+//!
+//! A full last leaf taking an entry past its end keeps its entries and
+//! the new one starts a leaf of its own, and the same at the start of the
+//! first leaf: scores that only grow (timestamps) or only shrink fill the
+//! leaves, where halves would leave every one of them half empty for good.
+//! Only there: anywhere else, scores chosen to land at the end of full
+//! leaves could make a leaf of one entry each.
 
 use std::cmp::Ordering;
 
@@ -88,8 +96,9 @@ impl<E: Ranked> Node<E> {
     }
 
     /// Adds `e` (not there yet); a node split off on the right if it grew
-    /// too wide.
-    fn insert(&mut self, e: E) -> Option<Node<E>> {
+    /// too wide. `first`, `last`: whether the node is on the tree's first
+    /// or last path.
+    fn insert(&mut self, e: E, first: bool, last: bool) -> Option<Node<E>> {
         match self {
             Node::Leaf(v) => {
                 let pos = v.partition_point(|x| cmp(x, e.score(), e.member()) == Ordering::Less);
@@ -98,9 +107,20 @@ impl<E: Ranked> Node<E> {
                     v.insert(pos, e);
                     return None;
                 }
+                let mut right = Vec::with_capacity(MAX);
+                if last && pos == MAX {
+                    // Past the end of the last leaf: it stays full.
+                    right.push(e);
+                    return Some(Node::Leaf(right));
+                }
+                if first && pos == 0 {
+                    // Before the start of the first one: the same.
+                    right.append(v);
+                    v.push(e);
+                    return Some(Node::Leaf(right));
+                }
                 // Full: in two first, then the entry into its half.
                 let half = MAX / 2;
-                let mut right = Vec::with_capacity(MAX);
                 right.extend(v.drain(half..));
                 if pos <= half {
                     v.insert(pos, e);
@@ -111,7 +131,8 @@ impl<E: Ranked> Node<E> {
             }
             Node::Inner(n) => {
                 let i = n.child_for(e.score(), e.member()).unwrap_or(0);
-                let split = n.children[i].insert(e);
+                let (first, last) = (first && i == 0, last && i + 1 == n.children.len());
+                let split = n.children[i].insert(e, first, last);
                 n.counts[i] += 1;
                 n.firsts[i] = n.children[i].first();
                 if let Some(right) = split {
@@ -268,7 +289,7 @@ impl<E: Ranked> Tree<E> {
 
     /// Adds `e`, which isn't there.
     pub(crate) fn insert(&mut self, e: E) {
-        if let Some(right) = self.root.insert(e) {
+        if let Some(right) = self.root.insert(e, true, true) {
             let left = std::mem::replace(&mut self.root, Node::Leaf(Vec::new()));
             let mut root = Inner::with_room();
             root.counts.extend([left.count(), right.count()]);
@@ -387,10 +408,13 @@ impl<E: Ranked> Tree<E> {
     /// The invariants: order, counts, first entries, widths, depth.
     #[cfg(test)]
     pub(crate) fn check(&self) {
-        fn walk<E: Ranked>(node: &Node<E>, root: bool, depth: usize, leaves: &mut Vec<usize>, out: &mut Vec<E>) {
-            if !root {
+        fn walk<E: Ranked>(node: &Node<E>, root: bool, edge: (bool, bool), depth: usize, leaves: &mut Vec<usize>, out: &mut Vec<E>) {
+            // The first leaf and the last may be narrower (not empty).
+            let outer_leaf = (edge.0 || edge.1) && matches!(node, Node::Leaf(_));
+            if !root && !outer_leaf {
                 assert!(node.width() >= MIN, "a node too narrow: {}", node.width());
             }
+            assert!(root || node.width() >= 1, "an empty node");
             assert!(node.width() <= MAX);
             match node {
                 Node::Leaf(v) => {
@@ -405,13 +429,13 @@ impl<E: Ranked> Tree<E> {
                         assert_eq!(c.count(), n.counts[i]);
                         let f = c.first();
                         assert_eq!(cmp(&n.firsts[i], f.score(), f.member()), Ordering::Equal);
-                        walk(c, false, depth + 1, leaves, out);
+                        walk(c, false, (edge.0 && i == 0, edge.1 && i + 1 == n.children.len()), depth + 1, leaves, out);
                     }
                 }
             }
         }
         let (mut leaves, mut out) = (Vec::new(), Vec::new());
-        walk(&self.root, true, 0, &mut leaves, &mut out);
+        walk(&self.root, true, (true, true), 0, &mut leaves, &mut out);
         assert!(leaves.windows(2).all(|w| w[0] == w[1]), "leaves at one depth");
         assert_eq!(out.len(), self.len);
         for w in out.windows(2) {
@@ -527,6 +551,65 @@ mod tests {
             self.0 ^= self.0 >> 7;
             self.0 ^= self.0 << 17;
             self.0 % n
+        }
+    }
+
+    /// Entries, the places of the leaves, and the bytes of the inner nodes'
+    /// vectors (their capacities).
+    fn room<E>(n: &Node<E>) -> (usize, usize, usize) {
+        match n {
+            Node::Leaf(v) => (v.len(), v.capacity(), 0),
+            Node::Inner(i) => {
+                let own = i.children.capacity() * std::mem::size_of::<Node<E>>()
+                    + i.counts.capacity() * 8
+                    + i.firsts.capacity() * std::mem::size_of::<E>();
+                i.children.iter().map(room).fold((0, 0, own), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
+            }
+        }
+    }
+
+    #[test]
+    fn leaves_fill_and_never_outgrow_their_places() {
+        // No leaf past MAX places; random scores fill leaves to about 70%,
+        // scores that only grow or only shrink to all but the last one.
+        // The bytes of tree a member costs (an entry of 16 bytes, as a
+        // sorted set's) printed (cargo test -- --nocapture).
+        for (order, least) in [("random", 0.6), ("ascending", 0.95), ("descending", 0.95)] {
+            let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+            let mut tree: Tree<T> = Tree::default();
+            let n = 200_000u64;
+            let members: Vec<&'static [u8]> = (0..n).map(member).collect();
+            for i in 0..n {
+                let score = match order {
+                    "random" => rng.below(n) as f64,
+                    "ascending" => i as f64,
+                    _ => (n - i) as f64,
+                };
+                tree.insert(T(score, members[i as usize]));
+            }
+            tree.check();
+            let (len, places, inner) = room(&tree.root);
+            assert_eq!(len as u64, n);
+            assert!(fn_max_places(&tree.root) <= MAX, "a leaf past {MAX} places");
+            let fill = len as f64 / places as f64;
+            assert!(fill >= least, "{order}: leaves {:.0}% full", 100.0 * fill);
+            let per = (places * 16 + inner * 16 / std::mem::size_of::<T>()) as f64 / n as f64;
+            println!("{order}: leaves {:.0}% full, {per:.1} bytes of tree a member", 100.0 * fill);
+            // And back down: every other entry out, in order.
+            let all: Vec<T> = tree.iter(0, usize::MAX, false).collect();
+            for e in all.iter().step_by(2) {
+                assert!(tree.remove(e.0, e.1).is_some());
+            }
+            tree.check();
+            assert_eq!(tree.len() as u64, n / 2);
+        }
+    }
+
+    /// The most places of any leaf.
+    fn fn_max_places<E>(n: &Node<E>) -> usize {
+        match n {
+            Node::Leaf(v) => v.capacity(),
+            Node::Inner(i) => i.children.iter().map(fn_max_places).max().unwrap_or(0),
         }
     }
 
