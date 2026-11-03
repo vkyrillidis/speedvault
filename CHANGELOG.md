@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Sorted sets: a fifth type, packed while Redis keeps a listpack (128
+  members of 64 bytes), a counted B+ tree beside a member table past that;
+  the single-key commands (`ZADD` with every option, `ZRANGE` by rank,
+  score and member, `ZRANGESTORE`, `ZPOPMIN`, `ZRANDMEMBER`, `ZSCAN`...);
+  scores read and written as Redis 8.10.2 does (its `fast_float` and
+  `fpconv` ported), compared byte for byte.
+- `HSCAN ... NOVALUES`.
+
 ## 0.1.0 (2026-10-31)
 
 The first public release.

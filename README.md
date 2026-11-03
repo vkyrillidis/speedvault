@@ -32,11 +32,12 @@ and their keys move between them while clients keep reading and writing.
 Redis-compatible stores today need someone to reshard them, and stores that
 rebalance themselves don't speak Redis. SpeedVault does both.
 
-**A good fit** for a cache or session store, counters, queues on lists, or
-any data set that has to grow and shrink with its load, where the data can
-live in memory and survive as replicas rather than on disk. **Not a fit
-(yet)** if you need sorted sets, pub/sub, Lua scripts or TLS, or the data
-must outlive every copy of it in memory: there are no RDB or AOF files.
+**A good fit** for a cache or session store, counters, queues on lists,
+leaderboards on sorted sets, or any data set that has to grow and shrink
+with its load, where the data can live in memory and survive as replicas
+rather than on disk. **Not a fit (yet)** if you need pub/sub, Lua scripts
+or TLS, or the data must outlive every copy of it in memory: there are no
+RDB or AOF files.
 
 ## Quick start
 
@@ -89,7 +90,8 @@ From code, use any Redis client: redis-py's `redis.Redis(port=7000)`, or
 | Strings, integers, floats | Yes; not yet `GETRANGE SETRANGE GETEX GETSET SETEX PSETEX MSETNX` |
 | Keys and expiry | Yes; not yet `RENAME UNLINK COPY TOUCH RANDOMKEY` |
 | Hashes, sets, lists | Yes, packed as Redis packs them; not yet blocking pops (`BLPOP`...), hash field expiry (`HEXPIRE`...) |
-| Sorted sets, streams, bitmaps, HyperLogLog, geo | Not yet |
+| Sorted sets | Yes, packed as Redis packs them; not yet `ZUNION ZINTER ZDIFF` (and `STORE`), `ZINTERCARD ZMPOP`, blocking pops (`BZPOPMIN`...) |
+| Streams, bitmaps, HyperLogLog, geo | Not yet (geo next) |
 | Transactions (`MULTI EXEC WATCH`) | Yes |
 | Pub/sub, scripting (`EVAL`, functions) | Not yet |
 | `requirepass` and `AUTH` | Yes; ACL users not yet |
@@ -115,12 +117,18 @@ also lists the few deliberate differences.
   EXPIRETIME PEXPIRETIME PERSIST SCAN KEYS DBSIZE FLUSHDB FLUSHALL`,
   `OBJECT ENCODING`.
 - **Hashes:** `HSET HMSET HSETNX HGET HMGET HDEL HEXISTS HLEN HSTRLEN HKEYS
-  HVALS HGETALL HINCRBY HINCRBYFLOAT HRANDFIELD HSCAN`.
+  HVALS HGETALL HINCRBY HINCRBYFLOAT HRANDFIELD HSCAN` (with `NOVALUES`).
 - **Sets:** `SADD SREM SISMEMBER SMISMEMBER SCARD SMEMBERS SPOP SRANDMEMBER
   SMOVE SUNION SINTER SDIFF SUNIONSTORE SINTERSTORE SDIFFSTORE SINTERCARD
   SUNIONCARD SDIFFCARD SSCAN`.
 - **Lists:** `LPUSH RPUSH LPUSHX RPUSHX LPOP RPOP LLEN LRANGE LINDEX LSET
   LINSERT LREM LTRIM LPOS LMOVE LMOVEM RPOPLPUSH LMPOP`.
+- **Sorted sets:** `ZADD` (`NX XX GT LT CH INCR`) `ZINCRBY ZREM ZCARD ZSCORE
+  ZMSCORE ZRANK ZREVRANK ZCOUNT ZLEXCOUNT ZRANGE` (`BYSCORE BYLEX REV LIMIT
+  WITHSCORES`) `ZRANGESTORE ZREVRANGE ZRANGEBYSCORE ZREVRANGEBYSCORE
+  ZRANGEBYLEX ZREVRANGEBYLEX ZREMRANGEBYRANK ZREMRANGEBYSCORE ZREMRANGEBYLEX
+  ZPOPMIN ZPOPMAX ZRANDMEMBER ZSCAN` (scores read and written as Redis 8
+  does, digit for digit).
 - **Connection and server:** `PING ECHO HELLO AUTH SELECT 0 QUIT CLIENT
   COMMAND INFO`, `CONFIG GET` and `SET`.
 - **Transactions:** `MULTI EXEC DISCARD WATCH UNWATCH`, as Redis's: the
