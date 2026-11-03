@@ -24,7 +24,7 @@
 # Results (tools/bench/results/<date>-<commit>/):
 #   suite.md        Redis vs speedvault (and the --also servers):
 #                   ping,set,get,incr,mset, -P 1, 16, 64
-#   types.md        with --types: lpush,rpush,lpop,rpop,sadd,hset,spop,
+#   types.md        with --types: lpush,rpush,lpop,rpop,sadd,hset,spop,zadd,zpopmin,
 #                   lrange_100..600, -P 1, 16
 #   compat.json     tools/compat/difftest.py, our node against Redis
 #   cargo-bench.txt cargo bench -p fiber and -p reactor
@@ -108,7 +108,7 @@ BENCH_RAW_DIR="$OUT/raw/suite" "$HERE/bench.sh" -n "$N" -P "1 16 64" -o "$OUT/su
 if [ "$TYPES" = 1 ]; then
   echo ">> data types: Redis vs speedvault${ALSO_NAMES[*]:+ vs ${ALSO_NAMES[*]}}" >&2
   BENCH_RAW_DIR="$OUT/raw/types" "$HERE/bench.sh" -n "$N" -P "1 16" -o "$OUT/types.md" \
-    -t lpush,rpush,lpop,rpop,sadd,hset,spop,lrange_100,lrange_300,lrange_500,lrange_600 \
+    -t lpush,rpush,lpop,rpop,sadd,hset,spop,zadd,zpopmin,lrange_100,lrange_300,lrange_500,lrange_600 \
     --title "Data types: Redis 7.0.15 vs speedvault $(git -C "$ROOT" rev-parse --short HEAD)${ALSO_NAMES[*]:+ vs ${ALSO_NAMES[*]}}" \
     redis=127.0.0.1:6393 speedvault=127.0.0.1:7000 "${EXTRA[@]}" >/dev/null
 fi

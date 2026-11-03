@@ -9,7 +9,9 @@
 #   -P "LIST"       pipeline depths, space separated ["1 16"]
 #   -d N            value size in bytes [3, redis-benchmark's default]
 #   -r N            random keys out of N (redis-benchmark -r) [none: one key]
-#   -t LIST         tests [ping,set,get,incr,mset]
+#   -t LIST         tests [ping,set,get,incr,mset]; "" for none (--command only)
+#   --command ARGS  also this command as a test of its own (repeatable; words
+#                   split on spaces, __rand_int__ as redis-benchmark has it)
 #   --threads N     redis-benchmark threads [1; more was slower on WSL2]
 #   --server-cpus L pin the server's threads (taskset -a -p) to CPU list L [2]
 #   --bench-cpus L  run redis-benchmark under taskset -c L [4-7]
@@ -31,7 +33,7 @@
 set -u
 N=1000000; C=50; PIPES="1 16"; D=3; TESTS="ping,set,get,incr,mset"; THREADS=1; R=
 SERVER_CPUS=2; BENCH_CPUS=4-7; PIN=1; TMO=600; OUT=""; TITLE=""
-SERVERS=()
+SERVERS=(); COMMANDS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     -n) N="$2"; shift 2;;
@@ -40,6 +42,7 @@ while [ $# -gt 0 ]; do
     -d) D="$2"; shift 2;;
     -r) R="$2"; shift 2;;
     -t) TESTS="$2"; shift 2;;
+    --command) COMMANDS+=("$2"); shift 2;;
     --threads) THREADS="$2"; shift 2;;
     --server-cpus) SERVER_CPUS="$2"; shift 2;;
     --bench-cpus) BENCH_CPUS="$2"; shift 2;;
@@ -75,8 +78,13 @@ if [ "$(clock watch 7)" -gt 0 ]; then
   echo "warning: the wall clock steps (unsynced host clock under WSL2? see clockguard.py);" \
     "starting each test right after a step, rerunning on a step" >&2
 fi
-IFS=, read -r -a TEST_LIST <<<"${TESTS//ping,/ping_inline,ping_mbulk,}"
-[ "${TEST_LIST[-1]}" = ping ] && TEST_LIST=("${TEST_LIST[@]:0:${#TEST_LIST[@]}-1}" ping_inline ping_mbulk)
+TEST_LIST=()
+if [ -n "$TESTS" ]; then
+  IFS=, read -r -a TEST_LIST <<<"${TESTS//ping,/ping_inline,ping_mbulk,}"
+  [ "${TEST_LIST[-1]}" = ping ] && TEST_LIST=("${TEST_LIST[@]:0:${#TEST_LIST[@]}-1}" ping_inline ping_mbulk)
+fi
+# A command runs as a test named "cmd:<its words>".
+for c in "${COMMANDS[@]}"; do TEST_LIST+=("cmd:$c"); done
 
 for s in "${SERVERS[@]}"; do
   name="${s%%=*}"; addr="${s#*=}"; cpus="$SERVER_CPUS"
@@ -100,8 +108,9 @@ for s in "${SERVERS[@]}"; do
     for t in "${TEST_LIST[@]}"; do
       for try in $(seq "$TRIES"); do
         if [ "$STEPPING" = 1 ]; then before=$(clock wait 12); else before=$(clock offset); fi
+        if [ "${t#cmd:}" != "$t" ]; then read -r -a what <<<"${t#cmd:}"; else what=(-t "$t"); fi
         timeout "$TMO" "${BENCH_PREFIX[@]}" redis-benchmark -h "$host" -p "$port" -n "$N" -c "$C" -P "$p" -d "$D" ${R:+-r "$R"} \
-          -t "$t" --threads "$THREADS" --csv >"$RAW/try.csv" 2>>"$RAW/$name.P$p.err"
+          --threads "$THREADS" --csv "${what[@]}" >"$RAW/try.csv" 2>>"$RAW/$name.P$p.err"
         trc=$?
         after=$(clock offset)
         step=$(python3 -c "print(round($after - $before))")

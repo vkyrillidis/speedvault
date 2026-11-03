@@ -1,12 +1,13 @@
-"""Memory per element of hashes, sets and lists, ours against Redis and
-Valkey (phase 7 milestone 7): used_memory growth divided by the elements,
+"""Memory per element of hashes, sets, lists and sorted sets, ours against
+Redis and Valkey (phase 7 milestone 7, sorted sets since phase 9): used_memory growth divided by the elements,
 for 10000 small collections of 100 elements (within Redis's listpack
 limits; sets of non-integers, which Redis 7.2+ also packs, and of
 integers, an intset while small) and for one of 1M. Elements: 8-byte
-strings (a hash: field and value of 8 bytes each; integers up to 7 digits).
+strings (a hash: field and value of 8 bytes each; integers up to 7 digits;
+a sorted set: a member of 9 bytes, `m` and 8 digits, scored by its number).
 Each server must be running on 127.0.0.1 at its port; it's flushed.
 
-    python3 tools/bench/collections_memory.py NAME=PORT ...
+    python3 tools/bench/collections_memory.py [--kinds=zset,hash] NAME=PORT ...
 
 Needs redis-py (pip, or ~/venvs/redis-py/site).
 """
@@ -30,6 +31,8 @@ def fill(r, kind, keys, n):
                 p.sadd(key, *[f"m{i}" for i in items])  # not integers: no intset
             elif kind == "intset":
                 p.sadd(key, *[str(int(i)) for i in items])
+            elif kind == "zset":
+                p.zadd(key, {f"m{i}": int(i) for i in items})
             else:
                 p.rpush(key, *items)
             queued += len(items)
@@ -52,12 +55,16 @@ def flush(r):
     time.sleep(0.2)
 
 
-servers = [a.split("=") for a in sys.argv[1:]]
+KINDS = ["hash", "set", "intset", "list", "zset"]
+for a in sys.argv[1:]:
+    if a.startswith("--kinds="):
+        KINDS = a.split("=", 1)[1].split(",")
+servers = [a.split("=") for a in sys.argv[1:] if not a.startswith("--")]
 rows = {}
 for name, port in servers:
     r = redis.Redis(port=int(port))
     for shape, keys, n in SHAPES:
-        for kind in ["hash", "set", "intset", "list"]:
+        for kind in KINDS:
             flush(r)
             before = r.info("memory")["used_memory"]
             fill(r, kind, keys, n)
