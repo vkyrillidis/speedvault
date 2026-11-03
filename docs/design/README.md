@@ -16,6 +16,7 @@ repository and aren't published: the counts are what those runs found.
 | 6 | Kubernetes autoscaling (the HPA) | [autoscaling.md](autoscaling.md) |
 | 7 | Hashes, sets, lists, `SCAN`; compact encodings | [data-types.md](data-types.md) |
 | 8 | Replicas and failover | [replicas.md](replicas.md) |
+| 9 | Sorted sets and geo (planned) | [sorted-sets-and-geo.md](sorted-sets-and-geo.md) |
 
 Multi-core nodes were considered and dropped: on Kubernetes, more one-core
 pods scale out instead.
