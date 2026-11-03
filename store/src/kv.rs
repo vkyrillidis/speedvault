@@ -450,7 +450,6 @@ impl Kv {
         self.ptr_of(LIST).map(|p| unsafe { &mut *p.cast::<List>() })
     }
 
-    #[allow(dead_code, reason = "for the sorted set commands, phase 9 milestone 2")]
     pub fn as_zset_mut(&mut self) -> Result<&mut ZSet, Error> {
         // SAFETY: as in `as_hash_mut`.
         self.ptr_of(ZSET).map(|p| unsafe { &mut *p.cast::<ZSet>() })

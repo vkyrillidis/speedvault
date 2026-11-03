@@ -55,6 +55,7 @@ pub enum Error {
     ValueInfinite,
     AppliedInfinite,
     AppliedOverflow,
+    ScoreNan,
 }
 
 impl fmt::Display for Error {
@@ -88,6 +89,7 @@ impl fmt::Display for Error {
             Error::ValueInfinite => f.write_str("ERR value cannot be Infinity"),
             Error::AppliedInfinite => f.write_str("ERR applied increment would be Infinity"),
             Error::AppliedOverflow => f.write_str("ERR applied increment would overflow"),
+            Error::ScoreNan => f.write_str("ERR resulting score is not a number (NaN)"),
         }
     }
 }

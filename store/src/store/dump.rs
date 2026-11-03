@@ -209,7 +209,7 @@ impl Store {
     pub fn restore_staged(&mut self, key: &[u8], staged: Staged, ttl: Option<i64>) {
         self.remove(key);
         let at = ttl.map(|ttl| self.now.saturating_add(ttl));
-        self.insert_value(key, staged.value, at);
+        self.insert_value(key, staged.finish(), at);
     }
 
     /// Replaces `key` with the value built in `staged`, expiring at `at`
@@ -217,7 +217,7 @@ impl Store {
     /// own clock says.
     pub fn restore_staged_at(&mut self, key: &[u8], staged: Staged, at: Option<i64>) {
         self.remove(key);
-        self.insert_value(key, staged.value, at);
+        self.insert_value(key, staged.finish(), at);
     }
 
     /// A live key's expiry, absolute unix ms: `Some(None)` without one,
@@ -336,7 +336,9 @@ impl Staged {
             Kind::Hash => Value::Hash(Box::default()),
             Kind::Set => Value::Set(Box::default()),
             Kind::List => Value::List(Box::default()),
-            Kind::ZSet => Value::ZSet(Box::default()),
+            // Built large, as Redis loads a sorted set, and packed at the
+            // end if it fits (`finish`): so a large set's `-0` scores stay.
+            Kind::ZSet => Value::ZSet(Box::new(ZSet::with_hint(usize::MAX, 0))),
         };
         Staged { value, count: 0 }
     }
@@ -348,6 +350,18 @@ impl Staged {
             Value::Set(_) => Kind::Set,
             Value::List(_) => Kind::List,
             Value::ZSet(_) => Kind::ZSet,
+        }
+    }
+
+    /// The value, complete: a sorted set packed if it fits, as Redis's
+    /// `zsetConvertToListpackIfNeeded` after a load.
+    fn finish(self) -> Value {
+        match self.value {
+            Value::ZSet(mut z) => {
+                z.shrink_if_fits();
+                Value::ZSet(z)
+            }
+            value => value,
         }
     }
 

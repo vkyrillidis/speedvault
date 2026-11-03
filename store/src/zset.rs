@@ -131,7 +131,6 @@ impl ZSet {
 
     /// An empty set for about `size` members of about `member_len` bytes,
     /// as Redis's `zsetTypeCreate` makes it: packed if they'd fit.
-    #[allow(dead_code, reason = "for the sorted set commands, phase 9 milestone 2")]
     pub(crate) fn with_hint(size: usize, member_len: usize) -> ZSet {
         if size <= ZSET_MAX_LISTPACK_ENTRIES && member_len <= ZSET_MAX_LISTPACK_VALUE {
             ZSet::default()
@@ -142,11 +141,26 @@ impl ZSet {
 
     /// Converts ahead of `size` members if they couldn't be packed
     /// (Redis's `zsetTypeMaybeConvert`: `ZADD` counts its pairs, new or not).
-    #[allow(dead_code, reason = "for the sorted set commands, phase 9 milestone 2")]
     pub(crate) fn expect(&mut self, size: usize) {
         if matches!(self.repr, Repr::Packed(_)) && size > ZSET_MAX_LISTPACK_ENTRIES {
             self.convert();
         }
+    }
+
+    /// Back to the packed encoding if it fits (Redis's
+    /// `zsetConvertToListpackIfNeeded`, after a load or a `STORE`
+    /// command): `-0` scores become `0` there.
+    pub(crate) fn shrink_if_fits(&mut self) {
+        let fits = self.len() <= ZSET_MAX_LISTPACK_ENTRIES && self.iter(0, usize::MAX, false).all(|(m, _)| m.len() <= ZSET_MAX_LISTPACK_VALUE);
+        if !self.is_big() || !fits {
+            return;
+        }
+        let mut p = Packed::default();
+        for (m, s) in self.iter(0, usize::MAX, false) {
+            p.push(m);
+            p.push(&score_bytes(if s == 0.0 { 0.0 } else { s }));
+        }
+        self.repr = Repr::Packed(p);
     }
 
     /// To the large encoding.
@@ -158,6 +172,25 @@ impl ZSet {
             big.order.insert(Entry { score, block });
         }
         self.repr = Repr::Big(Box::new(big));
+    }
+
+    /// Whether it's past the packed encoding (`skiplist`): `ZSCAN` then
+    /// walks its table, a part at a time.
+    pub fn is_big(&self) -> bool {
+        matches!(self.repr, Repr::Big(_))
+    }
+
+    /// The member at `pos` (below the length) of a large set's table, and
+    /// its score: the order `ZSCAN` walks, which a removal changes only by
+    /// moving the last member into the hole.
+    pub(crate) fn table_at(&self, pos: usize) -> (&[u8], f64) {
+        match &self.repr {
+            Repr::Packed(_) => self.get(pos).expect("a position below the length"),
+            Repr::Big(b) => {
+                let (m, s) = b.members.get_index(pos).expect("a position below the length");
+                (m, read_score(s))
+            }
+        }
     }
 
     /// The score of `member`.
@@ -213,6 +246,9 @@ impl ZSet {
 
     /// Inserts a new pair at its place in a packed set.
     fn insert_packed(p: &mut Packed, member: &[u8], score: f64) {
+        // A listpack keeps an integral score as an integer: `-0` is `0` there
+        // (Redis's `zzlInsertAt`), while a skiplist keeps `-0`.
+        let score = if score == 0.0 { 0.0 } else { score };
         let at = pairs(p).find(|(_, m, s)| cmp(&(*s, *m), score, member) == Ordering::Greater).map(|(at, ..)| at.whole().start);
         let at = at.unwrap_or(p.bytes());
         p.insert_at(at, member);
@@ -221,7 +257,6 @@ impl ZSet {
     }
 
     /// Removes `member`; its score if it was there.
-    #[allow(dead_code, reason = "for the sorted set commands, phase 9 milestone 2")]
     pub(crate) fn remove(&mut self, member: &[u8]) -> Option<f64> {
         match &mut self.repr {
             Repr::Packed(p) => {
@@ -243,7 +278,6 @@ impl ZSet {
 
     /// Removes the member at `rank` (below the length), and returns it
     /// with its score.
-    #[allow(dead_code, reason = "for the sorted set commands, phase 9 milestone 2")]
     pub(crate) fn remove_at(&mut self, rank: usize) -> (Box<[u8]>, f64) {
         match &mut self.repr {
             Repr::Packed(p) => {
@@ -326,6 +360,150 @@ impl ZSet {
             self.repr = Repr::Packed(Packed::default());
         }
         done
+    }
+}
+
+/// A range of a sorted set, by score or by member (Redis's `zrangespec`,
+/// `zlexrangespec`).
+pub trait Bounds {
+    /// Empty whatever the set holds: the minimum past the maximum.
+    fn empty(&self) -> bool;
+    fn gte_min(&self, score: f64, member: &[u8]) -> bool;
+    fn lte_max(&self, score: f64, member: &[u8]) -> bool;
+}
+
+/// `ZRANGEBYSCORE`'s range: `(` makes an end exclusive.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScoreRange {
+    pub min: f64,
+    pub max: f64,
+    pub minex: bool,
+    pub maxex: bool,
+}
+
+impl Bounds for ScoreRange {
+    fn empty(&self) -> bool {
+        self.min > self.max || (self.min == self.max && (self.minex || self.maxex))
+    }
+
+    fn gte_min(&self, score: f64, _: &[u8]) -> bool {
+        if self.minex { score > self.min } else { score >= self.min }
+    }
+
+    fn lte_max(&self, score: f64, _: &[u8]) -> bool {
+        if self.maxex { score < self.max } else { score <= self.max }
+    }
+}
+
+/// An end of a `ZRANGEBYLEX` range: `-`, `+`, or a member.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LexBound {
+    /// `-`: before every member (Redis's `shared.minstring`).
+    Min,
+    /// `+`: after every member.
+    Max,
+    Value(Vec<u8>),
+}
+
+/// `ZRANGEBYLEX`'s range; `-` and `+` are exclusive, as in Redis.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LexRange {
+    pub min: LexBound,
+    pub max: LexBound,
+    pub minex: bool,
+    pub maxex: bool,
+}
+
+/// Redis's `sdscmplex`: `-` and `+` below and above everything, and equal
+/// only to themselves.
+fn cmp_lex(a: &LexBound, b: &LexBound) -> Ordering {
+    match (a, b) {
+        (LexBound::Min, LexBound::Min) | (LexBound::Max, LexBound::Max) => Ordering::Equal,
+        (LexBound::Min, _) | (_, LexBound::Max) => Ordering::Less,
+        (LexBound::Max, _) | (_, LexBound::Min) => Ordering::Greater,
+        (LexBound::Value(a), LexBound::Value(b)) => a.cmp(b),
+    }
+}
+
+/// A member against a bound.
+fn cmp_member(member: &[u8], bound: &LexBound) -> Ordering {
+    match bound {
+        LexBound::Min => Ordering::Greater,
+        LexBound::Max => Ordering::Less,
+        LexBound::Value(b) => member.cmp(b),
+    }
+}
+
+impl Bounds for LexRange {
+    fn empty(&self) -> bool {
+        let c = cmp_lex(&self.min, &self.max);
+        c == Ordering::Greater || (c == Ordering::Equal && (self.minex || self.maxex))
+    }
+
+    fn gte_min(&self, _: f64, member: &[u8]) -> bool {
+        let c = cmp_member(member, &self.min);
+        if self.minex { c == Ordering::Greater } else { c != Ordering::Less }
+    }
+
+    fn lte_max(&self, _: f64, member: &[u8]) -> bool {
+        let c = cmp_member(member, &self.max);
+        if self.maxex { c == Ordering::Less } else { c != Ordering::Greater }
+    }
+}
+
+impl ZSet {
+    /// Whether anything can be in `b` (Redis's `zslIsInRange`): the last
+    /// member not below it, the first not above it.
+    fn may_hold(&self, b: &impl Bounds) -> bool {
+        if b.empty() || self.is_empty() {
+            return false;
+        }
+        let (lm, ls) = self.get(self.len() - 1).expect("not empty");
+        let (fm, fs) = self.get(0).expect("not empty");
+        b.gte_min(ls, lm) && b.lte_max(fs, fm)
+    }
+
+    /// The rank of the first member in `b`, from the front (Redis's
+    /// `zzlFirstInRange`, `zzlFirstInLexRange`): the first not below its
+    /// minimum, if it isn't above its maximum.
+    pub fn range_first(&self, b: &impl Bounds) -> Option<usize> {
+        if !self.may_hold(b) {
+            return None;
+        }
+        let rank = match &self.repr {
+            // A walk, as in a listpack: the same answer even where a lex
+            // range meets members of different scores.
+            Repr::Packed(p) => pairs(p).position(|(_, m, s)| b.gte_min(s, m))?,
+            Repr::Big(t) => Some(t.order.first_where(|e| b.gte_min(e.score, e.member()))).filter(|&r| r < self.len())?,
+        };
+        let (m, s) = self.get(rank).expect("a rank below the length");
+        b.lte_max(s, m).then_some(rank)
+    }
+
+    /// The rank of the last member in `b`, from the back (Redis's
+    /// `zzlLastInRange`): the last not above its maximum, if it isn't below
+    /// its minimum.
+    pub fn range_last(&self, b: &impl Bounds) -> Option<usize> {
+        if !self.may_hold(b) {
+            return None;
+        }
+        let rank = match &self.repr {
+            Repr::Packed(p) => self.len() - 1 - pairs(p).rev().position(|(_, m, s)| b.lte_max(s, m))?,
+            Repr::Big(t) => t.order.first_where(|e| !b.lte_max(e.score, e.member())).checked_sub(1)?,
+        };
+        let (m, s) = self.get(rank).expect("a rank below the length");
+        b.gte_min(s, m).then_some(rank)
+    }
+
+    /// How many members are in `b` (`ZCOUNT`, `ZLEXCOUNT`): from the first
+    /// on while not above the maximum (a walk while packed, as Redis's
+    /// listpack; from the ranks of the first and the last once large).
+    pub fn range_count(&self, b: &impl Bounds) -> usize {
+        let Some(first) = self.range_first(b) else { return 0 };
+        match &self.repr {
+            Repr::Packed(_) => self.iter(first, usize::MAX, false).take_while(|(m, s)| b.lte_max(*s, m)).count(),
+            Repr::Big(_) => self.range_last(b).map_or(0, |last| (last + 1).saturating_sub(first)),
+        }
     }
 }
 
@@ -450,9 +628,12 @@ mod tests {
                 match rng.below(10) {
                     0..=5 => {
                         let new = !model.contains_key(&m);
-                        // An equal score keeps the old one, -0 or 0.
+                        // An equal score keeps the old one, -0 or 0; a set
+                        // still packed after this insert keeps -0 as 0.
+                        let packed_after = !z.is_big() && (!new || z.len() < ZSET_MAX_LISTPACK_ENTRIES) && m.len() <= ZSET_MAX_LISTPACK_VALUE;
+                        let kept = if packed_after && score == 0.0 { 0.0 } else { score };
                         if model.get(&m).is_none_or(|&old: &f64| old != score) {
-                            model.insert(m.clone(), score);
+                            model.insert(m.clone(), kept);
                         }
                         assert_eq!(z.insert(&m, score), new);
                     }
@@ -527,10 +708,57 @@ mod tests {
             z.insert(b"x", f64::INFINITY);
             let order: Vec<&[u8]> = z.iter(0, 100, false).map(|(m, _)| m).collect();
             assert_eq!(order, [&b"y"[..], b"z", b"", b"B", b"a", b"ab", b"b", b"\xff", b"x"], "big: {big}");
-            assert_eq!(z.score(b"z").unwrap().to_bits(), (-0.0f64).to_bits());
-            z.insert(b"z", 0.0);
-            assert_eq!(z.score(b"z").unwrap().to_bits(), (-0.0f64).to_bits(), "0 equals -0: no update");
+            // A listpack keeps an integral score as an integer: -0 is 0.
+            let zero = if big { -0.0f64 } else { 0.0 };
+            assert_eq!(z.score(b"z").unwrap().to_bits(), zero.to_bits());
+            z.insert(b"z", if big { 0.0 } else { -0.0 });
+            assert_eq!(z.score(b"z").unwrap().to_bits(), zero.to_bits(), "0 equals -0: no update");
         }
+    }
+
+    #[test]
+    fn ranges_find_their_ends() {
+        for big in [false, true] {
+            let mut z = if big { ZSet::with_hint(1000, 1) } else { ZSet::default() };
+            for (m, s) in [(&b"a"[..], 1.0), (b"b", 2.0), (b"c", 2.0), (b"d", 5.0)] {
+                z.insert(m, s);
+            }
+            let r = |min, max, minex, maxex| ScoreRange { min, max, minex, maxex };
+            assert_eq!((z.range_first(&r(2.0, 3.0, false, false)), z.range_last(&r(2.0, 3.0, false, false))), (Some(1), Some(2)));
+            // A gap between members: nothing, from either end.
+            assert_eq!((z.range_first(&r(3.0, 4.0, false, false)), z.range_last(&r(3.0, 4.0, false, false))), (None, None));
+            assert_eq!(z.range_count(&r(3.0, 4.0, false, false)), 0);
+            assert_eq!((z.range_first(&r(2.0, 5.0, true, true)), z.range_last(&r(2.0, 5.0, true, true))), (None, None));
+            assert_eq!((z.range_first(&r(2.0, 2.0, false, true)), z.range_count(&r(2.0, 2.0, false, false))), (None, 2));
+            assert_eq!(z.range_count(&r(f64::NEG_INFINITY, f64::INFINITY, false, false)), 4);
+            let lex = |min: LexBound, max: LexBound| LexRange { min, max, minex: false, maxex: false };
+            let v = |s: &[u8]| LexBound::Value(s.to_vec());
+            assert_eq!(z.range_last(&lex(v(b"bb"), v(b"bc"))), None, "between b and c");
+            assert_eq!(z.range_last(&LexRange { min: LexBound::Min, max: LexBound::Max, minex: true, maxex: true }), Some(3));
+        }
+    }
+
+    #[test]
+    fn shrinks_back_when_it_fits() {
+        let mut z = ZSet::with_hint(1000, 0);
+        z.insert(b"a", -0.0);
+        z.insert(&[b'x'; 65], 1.0);
+        z.shrink_if_fits();
+        assert_eq!(z.encoding(), "skiplist", "a member too long");
+        z.remove(&[b'x'; 65]);
+        z.shrink_if_fits();
+        assert_eq!(z.encoding(), "listpack");
+        assert_eq!(z.score(b"a").map(f64::to_bits), Some(0f64.to_bits()), "-0 is 0 once packed");
+        let mut z = ZSet::with_hint(1000, 0);
+        for i in 0..129 {
+            z.insert(format!("{i}").as_bytes(), 1.0);
+        }
+        z.shrink_if_fits();
+        assert_eq!(z.encoding(), "skiplist", "too many");
+        z.remove(b"0");
+        z.shrink_if_fits();
+        assert_eq!((z.encoding(), z.len()), ("listpack", 128));
+        assert_eq!(z.get(0), Some((&b"1"[..], 1.0)));
     }
 
     #[test]

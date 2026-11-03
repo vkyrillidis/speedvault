@@ -1347,6 +1347,7 @@ pub use list::{End, LposOptions};
 mod dump;
 mod scan;
 mod zset;
+pub use zset::{Scored, ZaddFlags, Zadded};
 pub use dump::{check as check_dump, decode as decode_dump, Dump, Garbage, Kind, Part, Staged};
 #[cfg(test)]
 mod tests;

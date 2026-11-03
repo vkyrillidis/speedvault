@@ -126,7 +126,6 @@ impl<E: Ranked> Node<E> {
     }
 
     /// Removes the entry at `rank` (below the count).
-    #[allow(dead_code, reason = "for the sorted set commands, phase 9 milestone 2")]
     fn remove_at(&mut self, rank: usize) -> E {
         match self {
             Node::Leaf(v) => v.remove(rank),
@@ -276,7 +275,6 @@ impl<E: Ranked> Tree<E> {
     }
 
     /// Removes the entry at `rank` (below [`len`](Self::len)).
-    #[allow(dead_code, reason = "for the sorted set commands, phase 9 milestone 2")]
     pub(crate) fn remove_at(&mut self, rank: usize) -> E {
         assert!(rank < self.len, "a rank below the length");
         let removed = self.root.remove_at(rank);

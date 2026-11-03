@@ -132,6 +132,27 @@ impl Store {
     }
 }
 
+impl Store {
+    /// `ZSCAN key cursor [MATCH pattern] [COUNT count]`: the next cursor,
+    /// the members with their scores, and whether the set is large (Redis
+    /// writes the scores of a large one as `%.17Lg`, of a packed one as
+    /// they're packed). (0, nothing) without the key.
+    #[allow(clippy::type_complexity)]
+    pub fn zscan(&mut self, key: &[u8], cursor: u64, count: usize, pattern: Option<&[u8]>) -> Result<(u64, Vec<(Vec<u8>, f64)>, bool), Error> {
+        let Some(e) = self.live(key) else { return Ok((0, Vec::new(), false)) };
+        let Val::ZSet(z) = e.value() else { return Err(Error::WrongType) };
+        let keep = |(m, _): &(Vec<u8>, f64)| matching(pattern, m);
+        if !z.is_big() {
+            return Ok((0, z.iter(0, usize::MAX, false).map(|(m, s)| (m.to_vec(), s)).filter(keep).collect(), false));
+        }
+        let (left, picked) = walk(z.len(), cursor_left(cursor), count, |i| {
+            let (m, s) = z.table_at(i);
+            (m.to_vec(), s)
+        });
+        Ok((left, picked.into_iter().filter(keep).collect(), true))
+    }
+}
+
 /// A collection's cursor: how many positions are left; 0 starts afresh.
 fn cursor_left(cursor: u64) -> u64 {
     if cursor == 0 {

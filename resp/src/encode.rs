@@ -401,6 +401,25 @@ impl std::fmt::Write for Cursor {
 mod tests {
     use super::*;
 
+    /// Compares with glibc's `printf("%.17Lg")` (Redis's `ld2string` of a
+    /// large sorted set's score): `SPEEDVAULT_G17_ORACLE` names a file of
+    /// lines `bits TAB text`.
+    #[test]
+    #[ignore]
+    fn format_double_against_glibc() {
+        let Ok(path) = std::env::var("SPEEDVAULT_G17_ORACLE") else { return };
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut n = 0;
+        for line in text.lines() {
+            let (bits, want) = line.split_once('\t').unwrap();
+            let d = f64::from_bits(u64::from_str_radix(bits, 16).unwrap());
+            let mut buf = [0; 32];
+            assert_eq!(std::str::from_utf8(format_double(d, &mut buf)).unwrap(), want, "{bits}");
+            n += 1;
+        }
+        eprintln!("{n} doubles as glibc");
+    }
+
     fn both(f: impl Fn(&mut Encoder)) -> (Vec<u8>, Vec<u8>) {
         let mut two = Encoder::new(Protocol::Resp2);
         let mut three = Encoder::new(Protocol::Resp3);
