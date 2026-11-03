@@ -171,6 +171,23 @@ def requests(keys: List[bytes]) -> List[Tuple]:
                    ("ZINTERSTORE", z2, "1", z, "WEIGHTS", "2"), ("ZDIFFSTORE", z2, "x", z), ("ZDIFFSTORE", z2, "3", z, z2),
                    ("ZUNION", "2", z, z2, "WITHSCORES"), ("ZINTER", "2", z, other), ("ZINTERCARD", "2", z, z2),
                    ("ZMPOP", "2", z, z2, "MIN", "COUNT", "2"), ("ZMPOP", "2", z, other, "MAX"), ("ZDIFF", "0", z)]
+    # Geo (phase 9 milestone 5): GEORADIUS's STORE key, after a keyword,
+    # routed too (the last one), GEOSEARCHSTORE's two keys.
+    for i, k in enumerate(keys):
+        other = keys[(i + len(keys) // 3) % len(keys)]
+        g, g2 = b"{" + k + b"}:g", b"{" + k + b"}:g2"
+        probes += [("GEOADD", g, "13.361389", "38.115556", "Palermo", "15.087269", "37.502669", "Catania"),
+                   ("GEOPOS", g, "Palermo", "nope"), ("GEODIST", g, "Palermo", "Catania", "km"), ("GEOHASH", g, "Catania"),
+                   ("GEOSEARCH", g, "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "ASC", "WITHDIST"),
+                   ("GEOSEARCHSTORE", g2, g, "FROMMEMBER", "Palermo", "BYRADIUS", "300", "km"), ("ZRANGE", g2, "0", "-1"),
+                   ("GEOSEARCHSTORE", other, g, "FROMMEMBER", "Palermo", "BYRADIUS", "300", "km"),
+                   ("GEORADIUS", g, "15", "37", "200", "km", "STORE", g2), ("GEORADIUS", g, "15", "37", "200", "km", "STORE", other),
+                   ("GEORADIUS", g, "15", "37", "200", "km", "STORE", other, "STOREDIST", g2), ("ZRANGE", g2, "0", "-1", "WITHSCORES"),
+                   ("GEORADIUS", g, "15", "37", "200", "km", "STOREDIST", g2, "STORE", other),
+                   ("GEORADIUSBYMEMBER", g, "Palermo", "300", "km", "STOREDIST", g2), ("GEORADIUSBYMEMBER", g, "Palermo", "300", "km", "STORE", other),
+                   ("GEORADIUS", other, "15", "37", "200", "km", "STORE", g2), ("GEORADIUS", g, "15", "37", "200", "km", "STORE"),
+                   ("GEORADIUS_RO", g, "15", "37", "200", "km", "STORE", other), ("GEORADIUS", g, "15", "37", "200", "km", "WITHCOORD"),
+                   ("GEORADIUSBYMEMBER_RO", g, "Palermo", "300", "km")]
     # Transactions: each command checked as queued (MOVED aborts it), EXEC
     # as one command of all their keys (CROSSSLOT, MOVED).
     for i, k in enumerate(keys[::2]):

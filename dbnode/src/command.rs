@@ -12,6 +12,7 @@ use crate::client::Client;
 use crate::multi;
 use crate::cluster_mode::{self, ReplicaRead, Route};
 
+mod geo;
 mod hash;
 mod list;
 mod scan;
@@ -48,6 +49,11 @@ pub(crate) struct Command {
     /// `args[2]` (`ZUNIONSTORE dst numkeys key ...`). `keys` is then
     /// `(1, 1, 1)`, what `COMMAND` shows, as Redis.
     pub(crate) dest: bool,
+    /// Redis's `georadiusGetKeys` (`GEORADIUS ... STORE key`): from
+    /// `args[store_from]` on, the key after a `STORE` or `STOREDIST` is a
+    /// key too, the last one if there are several; 0 if not. `keys` is the
+    /// source alone, what `COMMAND` shows.
+    pub(crate) store_from: usize,
     run: Run,
     /// Redis's `denyoom` flag: refused while the node uses more than
     /// `maxmemory` (the commands that may add memory).
@@ -73,7 +79,7 @@ const KEY: (i32, i32, i32) = (1, 1, 1);
 const ALL_KEYS: (i32, i32, i32) = (1, -1, 1);
 
 const fn data(name: &'static str, arity: i32, keys: (i32, i32, i32), run: fn(&Args, &mut Store, &mut Encoder) -> Flow) -> Command {
-    Command { name, arity, keys, run: Run::Data(run), denyoom: false, write: false, movable: 0, dest: false, subcommands: &[] }
+    Command { name, arity, keys, run: Run::Data(run), denyoom: false, write: false, movable: 0, dest: false, store_from: 0, subcommands: &[] }
 }
 
 /// A data command whose keys follow a count at `args[1]`.
@@ -84,6 +90,12 @@ const fn movable(name: &'static str, arity: i32, run: fn(&Args, &mut Store, &mut
 /// [`movable`] after a destination key (`ZUNIONSTORE dst numkeys key ...`).
 const fn movable_dest(name: &'static str, arity: i32, run: fn(&Args, &mut Store, &mut Encoder) -> Flow) -> Command {
     Command { movable: 1, dest: true, ..data(name, arity, KEY, run) }
+}
+
+/// A data command reading `args[1]` that may write into a key named after
+/// a keyword, `STORE` or `STOREDIST`, from `args[store_from]` on.
+const fn store_keyword(name: &'static str, arity: i32, store_from: usize, run: fn(&Args, &mut Store, &mut Encoder) -> Flow) -> Command {
+    Command { store_from, ..data(name, arity, KEY, run) }
 }
 
 /// [`movable`], each key followed by a value.
@@ -106,7 +118,7 @@ pub(crate) const fn conn(
     arity: i32,
     run: fn(&Args, &Node, &Client, &mut Encoder) -> Flow,
 ) -> Command {
-    Command { name, arity, keys: NO_KEYS, run: Run::Conn(run), denyoom: false, write: false, movable: 0, dest: false, subcommands: &[] }
+    Command { name, arity, keys: NO_KEYS, run: Run::Conn(run), denyoom: false, write: false, movable: 0, dest: false, store_from: 0, subcommands: &[] }
 }
 
 /// A container command. `run` handles it without a subcommand, where its
@@ -117,7 +129,7 @@ const fn container(
     run: fn(&Args, &Node, &Client, &mut Encoder) -> Flow,
     subcommands: &'static [Command],
 ) -> Command {
-    Command { name, arity, keys: NO_KEYS, run: Run::Conn(run), denyoom: false, write: false, movable: 0, dest: false, subcommands }
+    Command { name, arity, keys: NO_KEYS, run: Run::Conn(run), denyoom: false, write: false, movable: 0, dest: false, store_from: 0, subcommands }
 }
 
 /// Looked up front to back: the hot commands first.
@@ -263,6 +275,17 @@ pub(crate) const COMMANDS: &[Command] = &[
     denyoom(movable_dest("zdiffstore", -4, |args, store, out| zset::combine(args, store, out, SetOp::Diff, Some("zdiffstore")))),
     movable("zintercard", -3, zset::zintercard),
     write(movable("zmpop", -4, zset::zmpop)),
+    denyoom(data("geoadd", -5, KEY, geo::geoadd)),
+    data("geopos", -2, KEY, geo::geopos),
+    data("geodist", -4, KEY, geo::geodist),
+    data("geohash", -2, KEY, geo::geohash),
+    data("geosearch", -7, KEY, |args, store, out| geo::search(args, store, out, geo::Form::Search, false)),
+    denyoom(data("geosearchstore", -8, (1, 2, 1), |args, store, out| geo::search(args, store, out, geo::Form::SearchStore, false))),
+    // Write commands, whether they store or not, as in Redis.
+    denyoom(store_keyword("georadius", -6, 5, |args, store, out| geo::search(args, store, out, geo::Form::Radius, false))),
+    denyoom(store_keyword("georadiusbymember", -5, 5, |args, store, out| geo::search(args, store, out, geo::Form::ByMember, false))),
+    data("georadius_ro", -6, KEY, |args, store, out| geo::search(args, store, out, geo::Form::Radius, true)),
+    data("georadiusbymember_ro", -5, KEY, |args, store, out| geo::search(args, store, out, geo::Form::ByMember, true)),
 ];
 
 /// Runs the request `args` (not empty) of `client` and appends its reply to
@@ -428,13 +451,21 @@ pub(crate) fn routed<'a>(
     }
 }
 
-/// `cmd`'s keys in `args`; `None` without any. A destination comes first,
-/// as Redis's key specs list it (none either if the count isn't one).
-fn keys_in<'a>(cmd: &Command, args: Args<'a>) -> Option<impl Iterator<Item = &'a [u8]> + Clone> {
-    let (first, last, step) = cmd.key_range(&args)?;
+/// Where `cmd`'s keys are in `args`; `None` without any. In Redis's order:
+/// a destination before a count first, as its key specs list it (none
+/// either if the count isn't one), a `STORE` key last, as
+/// `georadiusGetKeys` lists it.
+pub(crate) fn key_positions(cmd: &Command, args: &Args) -> Option<impl Iterator<Item = usize> + Clone> {
+    let (first, last, step) = cmd.key_range(args)?;
     let last = if last < 0 { args.len() as i32 + last } else { last };
     let dest = cmd.dest.then_some(1);
-    Some(dest.into_iter().chain((first..=last).step_by(step as usize)).map(move |i| args.get(i as usize).expect("in range")))
+    let stored = cmd.stored_key(args);
+    Some(dest.into_iter().chain((first..=last).step_by(step as usize).map(|i| i as usize)).chain(stored))
+}
+
+/// `cmd`'s keys in `args` (see [`key_positions`]).
+fn keys_in<'a>(cmd: &Command, args: Args<'a>) -> Option<impl Iterator<Item = &'a [u8]> + Clone> {
+    Some(key_positions(cmd, &args)?.map(move |i| args.get(i).expect("in range")))
 }
 
 /// `cmd`'s keys in `args`, none if it has none.
@@ -491,6 +522,27 @@ impl Command {
         // The last key must be an argument (Redis's keynum key spec).
         let last = n.checked_sub(1).and_then(|k| k.checked_mul(step)).and_then(|k| k.checked_add(first));
         last.filter(|&last| n >= 1 && last < args.len() as i64).map(|last| (first as i32, last as i32, step as i32))
+    }
+
+    /// Where the key after a `STORE` or `STOREDIST` is (see
+    /// [`store_from`](Self::store_from)), as `georadiusGetKeys` reads it:
+    /// each such keyword (a C string to `strcasecmp`) with an argument
+    /// after it, that argument skipped, the last one kept.
+    fn stored_key(&self, args: &Args) -> Option<usize> {
+        if self.store_from == 0 {
+            return None;
+        }
+        let mut stored = None;
+        let mut i = self.store_from;
+        while i < args.len() {
+            let arg = c_str(&args[i], usize::MAX);
+            if (arg.eq_ignore_ascii_case(b"store") || arg.eq_ignore_ascii_case(b"storedist")) && i + 1 < args.len() {
+                stored = Some(i + 1);
+                i += 1;
+            }
+            i += 1;
+        }
+        stored
     }
 
     /// Whether `name` is this command's short name (after the `|` of a
@@ -1082,6 +1134,25 @@ mod tests {
         assert_eq!(keys, [b"d".to_vec(), b"a".to_vec(), b"b".to_vec()], "as COMMAND GETKEYS lists them");
         let keys = keys_of_words("zinterstore", &["zinterstore", "d", "x", "a"]);
         assert!(keys.is_empty(), "no keys at all, the destination neither");
+    }
+
+    #[test]
+    fn a_store_key_after_a_keyword() {
+        let keys = |words: &[&str]| keys_of_words(words[0], words);
+        let k = |names: &[&str]| names.iter().map(|n| n.as_bytes().to_vec()).collect::<Vec<_>>();
+        assert_eq!(keys(&["georadius", "src", "1", "2", "3", "m"]), k(&["src"]));
+        assert_eq!(keys(&["georadius", "src", "1", "2", "3", "m", "STORE", "d"]), k(&["src", "d"]));
+        // The last one wins, STORE or STOREDIST, as georadiusGetKeys.
+        assert_eq!(keys(&["georadius", "src", "1", "2", "3", "m", "store", "a", "STOREDIST", "b", "count", "1"]), k(&["src", "b"]));
+        assert_eq!(keys(&["georadius", "src", "1", "2", "3", "m", "STORE"]), k(&["src"]), "a keyword at the end names nothing");
+        // From args[5] on, the unit too: as Redis reads it.
+        assert_eq!(keys(&["georadius", "src", "1", "2", "3", "store", "x"]), k(&["src", "x"]));
+        assert_eq!(keys(&["georadiusbymember", "src", "m", "3", "km", "STORE", "store"]), k(&["src", "store"]));
+        // A keyword's argument is skipped: STORE store d names "store".
+        assert_eq!(keys(&["georadiusbymember", "src", "m", "3", "km", "STORE", "store", "d"]), k(&["src", "store"]));
+        assert_eq!(keys(&["georadius_ro", "src", "1", "2", "3", "m", "STORE", "d"]), k(&["src"]), "not a key there");
+        assert_eq!(keys(&["geosearchstore", "d", "src", "FROMMEMBER", "m", "BYRADIUS", "1", "m"]), k(&["d", "src"]));
+        assert_eq!(find(COMMANDS, b"georadius").unwrap().keys, KEY, "COMMAND shows 1 1 1, as Redis");
     }
 
     #[test]

@@ -11,11 +11,11 @@ use store::{parse_i64, Aggregate, Bounds, Combine, LexBound, LexRange, ScoreRang
 
 /// Redis's `strcasecmp` of an argument with an option's name: a C string,
 /// so it ends at a NUL.
-fn is(arg: &[u8], name: &[u8]) -> bool {
+pub(super) fn is(arg: &[u8], name: &[u8]) -> bool {
     c_str(arg, usize::MAX).eq_ignore_ascii_case(name)
 }
 
-fn score(out: &mut Encoder, s: f64) {
+pub(super) fn score(out: &mut Encoder, s: f64) {
     out.double_text(&store::double_to_bytes(s));
 }
 
@@ -46,7 +46,7 @@ fn long(arg: &[u8], out: &mut Encoder) -> Option<i64> {
 }
 
 /// The sorted set at `key`, or the reply for a key of another type.
-fn zset<'s>(key: &[u8], store: &'s mut Store, out: &mut Encoder) -> Result<Option<&'s ZSet>, ()> {
+pub(super) fn zset<'s>(key: &[u8], store: &'s mut Store, out: &mut Encoder) -> Result<Option<&'s ZSet>, ()> {
     store.zset_at(key).map_err(|e| store_error(e, out))
 }
 

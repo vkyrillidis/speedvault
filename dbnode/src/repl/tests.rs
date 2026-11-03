@@ -152,6 +152,34 @@ fn writes_go_in_as_their_effects() {
 }
 
 #[test]
+fn a_geo_search_goes_in_only_if_it_stores() {
+    // GEORADIUS is a write, as in Redis, which propagates it only when it
+    // stored something (or deleted its destination).
+    let a = node(BACKLOG_SIZE);
+    let c = client();
+    a.store.borrow_mut().set_now(T0);
+    a.repl.start(&mut a.store.borrow_mut());
+    let commands: &[&[&[u8]]] = &[
+        &[b"GEOADD", b"g", b"13.361389", b"38.115556", b"Palermo"],
+        &[b"GEORADIUS", b"g", b"15", b"37", b"200", b"km"],
+        &[b"GEORADIUSBYMEMBER", b"g", b"Palermo", b"10", b"km", b"WITHDIST"],
+        &[b"GEORADIUS", b"nokey", b"15", b"37", b"200", b"km"],
+        &[b"GEORADIUS", b"g", b"15", b"37", b"1", b"km"],
+        &[b"GEORADIUS", b"g", b"15", b"37", b"200", b"km", b"STORE", b"d"],
+        &[b"GEOSEARCHSTORE", b"d2", b"g", b"FROMMEMBER", b"Palermo", b"BYRADIUS", b"1", b"km"],
+        &[b"GEORADIUS", b"g", b"15", b"37", b"200", b"km", b"STORE", b"d", b"WITHDIST"],
+    ];
+    for args in commands {
+        run(&a, &c, &request(args));
+    }
+    assert_eq!(text(&a.repl.since(0).unwrap()), [
+        "GEOADD g 13.361389 38.115556 Palermo",
+        "GEORADIUS g 15 37 200 km STORE d",
+        "GEOSEARCHSTORE d2 g FROMMEMBER Palermo BYRADIUS 1 km",
+    ]);
+}
+
+#[test]
 fn a_command_from_the_primary_sees_its_keys() {
     // The replica's clock says the key expired; its primary hasn't said
     // so yet: its INCR goes to the key it has, which keeps its TTL.
@@ -211,7 +239,8 @@ fn write_flags_are_redis_s() {
                  persist flushall flushdb hset hdel hmset hincrby hsetnx hincrbyfloat sadd srem spop smove sunionstore \
                  sinterstore sdiffstore lpush rpush lpop rpop lset linsert lrem ltrim lpushx rpushx lmove rpoplpush lmpop \
                  delex increx lmovem msetex zadd zincrby zrem zrangestore zremrangebyrank zremrangebyscore \
-                 zremrangebylex zpopmin zpopmax zunionstore zinterstore zdiffstore zmpop";
+                 zremrangebylex zpopmin zpopmax zunionstore zinterstore zdiffstore zmpop geoadd georadius \
+                 georadiusbymember geosearchstore";
     let ours: BTreeSet<&str> = COMMANDS.iter().filter(|c| c.write).map(|c| c.name).collect();
     assert_eq!(ours, redis.split_whitespace().collect());
     assert!(COMMANDS.iter().all(|c| c.subcommands.iter().all(|s| !s.write)));
@@ -252,7 +281,7 @@ fn random_request(rng: &mut Rng, now: i64) -> Vec<Vec<u8>> {
     };
     let many = |rng: &mut Rng| if rng.below(20) == 0 { 140 } else { 1 + rng.below(4) as usize };
     let k = key(rng);
-    let mut r: Vec<String> = match rng.below(56) {
+    let mut r: Vec<String> = match rng.below(58) {
         0..=3 => {
             let mut r = vec!["SET".into(), k, value(rng)];
             match rng.below(7) {
@@ -397,6 +426,42 @@ fn random_request(rng: &mut Rng, now: i64) -> Vec<Vec<u8>> {
         }
         53 => vec!["ZMPOP".into(), "2".into(), k, key(rng), rng.pick(&["MIN", "MAX"]).into(), "COUNT".into(), (rng.below(3) + 1).to_string()],
         54 => vec![rng.pick(&["ZCARD", "ZRANDMEMBER", "ZSCAN"]).into(), k, "0".into()],
+        // Geo (phase 9 milestone 5): points into sorted sets, and the
+        // searches that store, GEORADIUS's key after a keyword.
+        55 => {
+            let mut r = vec!["GEOADD".into(), k];
+            for _ in 0..many(rng) {
+                let lon = rng.below(36_000) as f64 / 100.0 - 180.0;
+                let lat = rng.below(17_000) as f64 / 100.0 - 85.0;
+                r.extend([lon.to_string(), lat.to_string(), format!("m{}", rng.below(300))]);
+            }
+            r
+        }
+        56 => {
+            let (lon, lat) = ((rng.below(360) as i64 - 180).to_string(), (rng.below(170) as i64 - 85).to_string());
+            let radius = rng.pick(&["100", "3000", "20000"]).to_string();
+            match rng.below(3) {
+                0 => {
+                    let mut r = vec!["GEOSEARCHSTORE".into(), k, key(rng), "FROMLONLAT".into(), lon, lat, "BYRADIUS".into(), radius, "km".into()];
+                    if rng.below(2) == 0 {
+                        r.push("STOREDIST".into());
+                    }
+                    r
+                }
+                1 => vec!["GEORADIUS".into(), key(rng), lon, lat, radius, "km".into(), rng.pick(&["STORE", "STOREDIST"]).into(), k],
+                _ => vec![
+                    "GEORADIUSBYMEMBER".into(),
+                    key(rng),
+                    format!("m{}", rng.below(300)),
+                    radius,
+                    "km".into(),
+                    "COUNT".into(),
+                    "5".into(),
+                    rng.pick(&["STORE", "STOREDIST"]).into(),
+                    k,
+                ],
+            }
+        }
         _ if rng.below(40) == 0 => vec!["FLUSHALL".into()],
         _ => vec!["DBSIZE".into()],
     };
@@ -529,15 +594,9 @@ fn tagged(rng: &mut Rng, now: i64, group: Option<u64>) -> Vec<Vec<u8>> {
     let Ok(Parsed::Complete { .. }) = parser.parse(&bytes) else { panic!() };
     let args = parser.args(&bytes);
     let cmd = crate::command::find(COMMANDS, &req[0]);
-    let positions: Vec<usize> = match cmd.and_then(|c| c.key_range(&args)) {
-        None => Vec::new(),
-        Some((first, last, step)) => {
-            let last = if last < 0 { args.len() as i32 + last } else { last };
-            // A destination before the count (ZUNIONSTORE) is a key too.
-            let dest = cmd.is_some_and(|c| c.dest).then_some(1);
-            dest.into_iter().chain((first..=last).step_by(step as usize).map(|i| i as usize)).collect()
-        }
-    };
+    // A destination before the count (ZUNIONSTORE), a STORE key
+    // (GEORADIUS) too.
+    let positions: Vec<usize> = cmd.and_then(|c| crate::command::key_positions(c, &args)).into_iter().flatten().collect();
     for i in positions {
         req[i] = [format!("{{g{group}}}").into_bytes(), req[i].clone()].concat();
     }
@@ -794,6 +853,26 @@ fn a_store_into_a_sent_key_sends_it_again() {
     };
     assert!(!sent.is_empty() && !unsent.is_empty(), "the slot half sent: {} sent", sent.len());
     run(&a, &client(), &request(&[b"ZUNIONSTORE", &sent[0], b"1", &unsent[0], b"WEIGHTS", b"10"]));
+    finish(&a, &b, &feed, pending, &mut crate::repl::replica::Staging::new());
+    assert_eq!(views(&a, false), views(&b, false));
+}
+
+#[test]
+fn a_geo_store_into_a_sent_key_sends_it_again() {
+    // The same through GEORADIUS's key after a keyword.
+    let (a, b) = copy_pair();
+    for i in 0..10 {
+        run(&a, &client(), &request(&[b"GEOADD", format!("{{t}}g{i}").as_bytes(), b"13.36", b"38.11", b"a", b"15.08", b"37.5", format!("m{i}").as_bytes()]));
+    }
+    let (feed, pending) = attach(&a);
+    crate::repl::primary::fill(&a, &feed);
+    let (sent, unsent): (Vec<Vec<u8>>, Vec<Vec<u8>>) = {
+        let copy = feed.copy.borrow();
+        let c = copy.as_ref().unwrap();
+        (0..10).map(|i| format!("{{t}}g{i}").into_bytes()).partition(|k| c.sent.contains(k))
+    };
+    assert!(!sent.is_empty() && !unsent.is_empty(), "the slot half sent: {} sent", sent.len());
+    run(&a, &client(), &request(&[b"GEORADIUS", &unsent[0], b"15", b"37", b"500", b"km", b"STORE", b"x", b"STOREDIST", &sent[0]]));
     finish(&a, &b, &feed, pending, &mut crate::repl::replica::Staging::new());
     assert_eq!(views(&a, false), views(&b, false));
 }

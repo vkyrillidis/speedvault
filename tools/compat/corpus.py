@@ -819,6 +819,273 @@ seq("zset_multikey_resp3", ("HELLO", "3"), *ZSRC, ("ZUNION", "2", "a", "b", "WIT
 seq("zset_expiry_and_keys", ("ZADD", "z", "1", "a"), ("EXPIRE", "z", "100"), ("TTL", "z"), ("ZADD", "z", "2", "b"), ("TTL", "z"),
     ("ZREM", "z", "a", "b"), ("TTL", "z"), ("ZADD", "z", "1", "a"), ("TTL", "z"), ("PEXPIRE", "z", "-1"), ("EXISTS", "z"),
     ("ZADD", "z", "1", "a"), ("DEL", "z"), ("ZCARD", "z"), ("ZADD", "z", "1", "a"), ("ZPOPMIN", "z"), ("EXISTS", "z"))
+# --- geo ---------------------------------------------------------------
+# A geo key is a sorted set of geohash scores. Without ASC or DESC a search
+# replies in Redis's scan order (the centre's cell, then its neighbours,
+# each by score), compared as it is; so are distances (4 decimals) and
+# positions (the shortest round-trip form).
+SICILY = ("GEOADD", "Sicily", "13.361389", "38.115556", "Palermo", "15.087269", "37.502669", "Catania",
+          "12.758489", "38.788135", "edge1", "17.241510", "38.788135", "edge2", "13.583333", "37.316667", "Agrigento")
+
+
+def _geo_points(seed: int, n: int, lon=(-180.0, 180.0), lat=(-85.05112878, 85.05112878), dup_every=0):
+    """n members m0.. at random points (the same each run), every
+    dup_every-th one at the point before it."""
+    import random
+    rng = random.Random(seed)
+    out, last = [], None
+    for i in range(n):
+        if dup_every and i % dup_every == 1 and last:
+            p = last
+        else:
+            p = (repr(rng.uniform(*lon)), repr(rng.uniform(*lat)))
+        last = p
+        out += [p[0], p[1], f"m{i}"]
+    return out
+
+
+seq("geo_geoadd", SICILY, ("GEOADD", "Sicily", "13.361389", "38.115556", "Palermo"), ("ZRANGE", "Sicily", "0", "-1", "WITHSCORES"),
+    ("TYPE", "Sicily"), ("OBJECT", "ENCODING", "Sicily"), ("ZCARD", "Sicily"),
+    ("GEOADD", "Sicily", "CH", "13.361389", "38.115556", "Palermo", "13.5", "38.1", "Catania", "1", "2", "new"),
+    ("GEOADD", "Sicily", "NX", "0", "0", "Palermo", "0", "0", "nx"), ("GEOADD", "Sicily", "XX", "0", "0", "Palermo", "0", "0", "xx"),
+    ("GEOADD", "Sicily", "XX", "CH", "1", "1", "Palermo"), ("GEOADD", "Sicily", "ch", "nx", "ch", "5", "5", "c2"),
+    ("GEOPOS", "Sicily", "Palermo", "nx", "xx", "c2"),
+    ("GEOADD", "g", "-180", "-85.05112878", "sw", "180", "85.05112878", "ne", "0", "0", "o", "-0", "-0", "negzero"),
+    ("ZRANGE", "g", "0", "-1", "WITHSCORES"), ("GEOPOS", "g", "sw", "ne", "o", "negzero"))
+seq("geo_geoadd_errors", ("GEOADD", "g", "1", "2"), ("GEOADD", "g", "1", "2", "a", "3"), ("GEOADD", "g", "NX", "XX", "1", "2", "a"),
+    ("GEOADD", "g", "ch", "ch", "ch"), ("GEOADD", "g", "nx", "1", "2", "a", "b"), ("GEOADD", "g", "GT", "1", "2", "a"),
+    ("GEOADD", "g", "INCR", "1", "2", "a"), ("GEOADD", "g", "x", "2", "a"), ("GEOADD", "g", "1", "y", "a"), ("GEOADD", "g", "1", "", "a"),
+    ("GEOADD", "g", "nan", "1", "a"), ("GEOADD", "g", "181", "0", "a"), ("GEOADD", "g", "-180.0000001", "0", "a"),
+    ("GEOADD", "g", "0", "85.05112879", "a"), ("GEOADD", "g", "0", "-85.051128781", "a"), ("GEOADD", "g", "1e300", "0", "a"),
+    ("GEOADD", "g", "-0", "100", "a"), ("GEOADD", "g", "1.0000005", "100.0000005", "a"), ("GEOADD", "g", "inf", "0", "a"),
+    ("GEOADD", "g", "0", "-inf", "a"), ("GEOADD", "g", "2.5e-7", "-1e-7", "a"), ("GEOADD", "g", "1", "2", "ok", "200", "0", "bad"),
+    ("EXISTS", "g"), ("GEOADD", "g", "0x10", "0", "hex"), ("GEOADD", "g", " 1", "0", "sp"), ("GEOADD", "g", "1\x00", "0", "nul"),
+    ("GEOADD", "g", "nx\x00junk", "1", "2", "a"), ("ZRANGE", "g", "0", "-1", "WITHSCORES"),
+    ("SET", "s", "v"), ("GEOADD", "s", "1", "2", "a"), ("GEOADD", "s", "1", "x", "a"), ("GEOADD", "s", "1", "2"),
+    ("GEOADD", "g"), ("GEOADD", "g", "1", "2"), ("GEOADD",))
+seq("geo_pos_hash_dist", SICILY, ("GEOPOS", "Sicily", "Palermo", "Catania", "nope", "edge2"), ("GEOPOS", "Sicily"),
+    ("GEOPOS", "nokey", "a", "b"), ("GEOPOS", "nokey"), ("GEOHASH", "Sicily", "Palermo", "Catania", "nope", "Agrigento"),
+    ("GEOHASH", "Sicily"), ("GEOHASH", "nokey", "x"), ("GEODIST", "Sicily", "Palermo", "Catania"),
+    ("GEODIST", "Sicily", "Palermo", "Catania", "km"), ("GEODIST", "Sicily", "Palermo", "Catania", "MI"),
+    ("GEODIST", "Sicily", "Palermo", "Catania", "Ft"), ("GEODIST", "Sicily", "Palermo", "Catania", "m"),
+    ("GEODIST", "Sicily", "Palermo", "Palermo"), ("GEODIST", "Sicily", "Palermo", "nope"), ("GEODIST", "Sicily", "nope", "Palermo"),
+    ("GEODIST", "nokey", "a", "b"), ("GEODIST", "nokey", "a", "b", "parsec"), ("GEODIST", "Sicily", "Palermo", "Catania", "parsec"),
+    ("GEODIST", "Sicily", "Palermo", "Catania", "km\x00x"), ("GEODIST", "Sicily", "Palermo", "Catania", "km", "x"),
+    ("GEODIST", "Sicily", "Palermo"), ("SET", "s", "v"), ("GEOPOS", "s", "a"), ("GEOHASH", "s", "a"), ("GEODIST", "s", "a", "b"),
+    ("GEODIST", "s", "a", "b", "yd"), ("GEOPOS", "s"))
+seq("geo_odd_scores", ("ZADD", "z", "-1", "neg1", "-0.5", "neghalf", "-9.3e18", "huge_neg", "-inf", "ninf", "inf", "pinf",
+                       "1e19", "e19", "2e19", "two_e19", "4503599627370495.5", "half", "9007199254740992", "two53", "0.9", "frac",
+                       "3471579339700058", "real", "1e300", "big"),
+    ("GEOPOS", "z", "neg1", "neghalf", "huge_neg", "ninf", "pinf", "e19", "two_e19", "half", "two53", "frac", "real", "big"),
+    ("GEOHASH", "z", "neg1", "neghalf", "huge_neg", "ninf", "pinf", "e19", "two_e19", "half", "two53", "frac", "real", "big"),
+    ("GEODIST", "z", "neg1", "ninf"), ("GEODIST", "z", "real", "half", "km"), ("GEODIST", "z", "two53", "neg1"),
+    ("GEOSEARCH", "z", "FROMLONLAT", "0", "0", "BYRADIUS", "30000", "km", "WITHHASH", "WITHCOORD", "WITHDIST"),
+    ("GEOSEARCH", "z", "FROMMEMBER", "neg1", "BYBOX", "1000", "1000", "km", "WITHHASH", "ASC"),
+    ("GEOSEARCH", "z", "FROMMEMBER", "big", "BYRADIUS", "0", "m", "WITHHASH"),
+    ("GEORADIUSBYMEMBER", "z", "ninf", "500", "km", "WITHHASH", "WITHCOORD"),
+    ("GEOSEARCHSTORE", "d", "z", "FROMMEMBER", "real", "BYRADIUS", "40000", "km"), ("ZRANGE", "d", "0", "-1", "WITHSCORES"))
+seq("geo_georadius", SICILY,
+    ("GEORADIUS", "Sicily", "15", "37", "200", "km"), ("GEORADIUS", "Sicily", "15", "37", "200", "km", "WITHDIST"),
+    ("GEORADIUS", "Sicily", "15", "37", "200", "km", "WITHCOORD"), ("GEORADIUS", "Sicily", "15", "37", "200", "km", "WITHHASH"),
+    ("GEORADIUS", "Sicily", "15", "37", "200", "km", "WITHDIST", "WITHCOORD", "WITHHASH", "ASC"),
+    ("GEORADIUS", "Sicily", "15", "37", "200", "km", "withhash", "withcoord", "withdist", "DESC"),
+    ("GEORADIUS", "Sicily", "15", "37", "200", "km", "COUNT", "1"), ("GEORADIUS", "Sicily", "15", "37", "200", "km", "COUNT", "2", "DESC"),
+    ("GEORADIUS", "Sicily", "15", "37", "200", "km", "COUNT", "1", "ANY"), ("GEORADIUS", "Sicily", "15", "37", "200", "km", "ANY", "COUNT", "2", "ASC"),
+    ("GEORADIUS", "Sicily", "15", "37", "200", "km", "COUNT", "10"), ("GEORADIUS", "Sicily", "15", "37", "200", "km", "ASC", "DESC"),
+    ("GEORADIUS", "Sicily", "15", "37", "200000", "m"), ("GEORADIUS", "Sicily", "15", "37", "124.274", "mi", "WITHDIST"),
+    ("GEORADIUS", "Sicily", "15", "37", "656168", "ft", "WITHDIST"), ("GEORADIUS", "Sicily", "15", "37", "0", "km"),
+    ("GEORADIUS", "Sicily", "15", "37", "1", "km"), ("GEORADIUS", "Sicily", "13.361389", "38.115556", "0", "m", "WITHDIST"),
+    ("GEORADIUS", "Sicily", "15", "37", "200", "km", "STORE", "d"), ("ZRANGE", "d", "0", "-1", "WITHSCORES"),
+    ("GEORADIUS", "Sicily", "15", "37", "200", "km", "STOREDIST", "d"), ("ZRANGE", "d", "0", "-1", "WITHSCORES"),
+    ("GEORADIUS", "Sicily", "15", "37", "200", "km", "STORE", "a", "STOREDIST", "b", "COUNT", "2"), ("EXISTS", "a"),
+    ("ZRANGE", "b", "0", "-1", "WITHSCORES"), ("GEORADIUS", "Sicily", "15", "37", "200", "km", "STOREDIST", "c", "STORE", "e"),
+    ("EXISTS", "c"), ("ZRANGE", "e", "0", "-1", "WITHSCORES"),
+    ("GEORADIUS", "Sicily", "15", "37", "1", "km", "STORE", "d"), ("EXISTS", "d"),
+    ("GEORADIUS", "nokey", "15", "37", "200", "km", "STORE", "e"), ("EXISTS", "e"), ("GEORADIUS", "nokey", "15", "37", "200", "km"),
+    ("GEORADIUS_RO", "Sicily", "15", "37", "200", "km", "WITHDIST", "ASC"), ("GEORADIUS_RO", "Sicily", "15", "37", "200", "km", "STORE", "d"),
+    ("GEORADIUS_RO", "Sicily", "15", "37", "200", "km", "STOREDIST", "d"))
+seq("geo_georadius_errors", SICILY, ("GEORADIUS", "Sicily", "x", "37", "200", "km"), ("GEORADIUS", "Sicily", "15", "95", "200", "km"),
+    ("GEORADIUS", "Sicily", "15", "37", "x", "km"), ("GEORADIUS", "Sicily", "15", "37", "-1", "km"), ("GEORADIUS", "Sicily", "15", "37", "1", "yd"),
+    ("GEORADIUS", "Sicily", "15", "37", "200", "km", "COUNT"), ("GEORADIUS", "Sicily", "15", "37", "200", "km", "COUNT", "0"),
+    ("GEORADIUS", "Sicily", "15", "37", "200", "km", "COUNT", "-3"), ("GEORADIUS", "Sicily", "15", "37", "200", "km", "COUNT", "x"),
+    ("GEORADIUS", "Sicily", "15", "37", "200", "km", "COUNT", "1.5"), ("GEORADIUS", "Sicily", "15", "37", "200", "km", "ANY"),
+    ("GEORADIUS", "Sicily", "15", "37", "200", "km", "STORE"), ("GEORADIUS", "Sicily", "15", "37", "200", "km", "STORE", "d", "WITHDIST"),
+    ("GEORADIUS", "Sicily", "15", "37", "200", "km", "WITHHASH", "STOREDIST", "d"), ("GEORADIUS", "Sicily", "15", "37", "200", "km", "nope"),
+    ("GEORADIUS", "Sicily", "15", "37", "200", "km", "FROMMEMBER", "Palermo"), ("GEORADIUS", "Sicily", "15", "37", "200", "km", "BYBOX", "1", "1", "km"),
+    ("GEORADIUS", "Sicily", "15", "37", "200", "km", "COUNT", "0", "nope"), ("GEORADIUS", "Sicily", "15", "37", "200", "km", "nope", "COUNT", "0"),
+    ("GEORADIUS", "nokey", "x", "37", "200", "km"), ("GEORADIUS", "nokey", "15", "37", "200", "km", "nope"),
+    ("GEORADIUS", "nokey", "15", "37", "200", "km", "ANY"), ("GEORADIUS", "Sicily", "15", "37", "200"), ("GEORADIUS", "Sicily", "15", "37"),
+    ("SET", "s", "v"), ("GEORADIUS", "s", "x", "y", "z", "w"), ("GEORADIUS", "s", "15", "37", "200", "km", "STORE", "d"),
+    ("GEORADIUS", "Sicily", "15", "37", "200", "km", "STORE", "s"), ("TYPE", "s"), ("GEORADIUS", "Sicily", "15", "37", "200", "km\x00", "COUNT\x00", "1"),
+    ("GEORADIUS", "Sicily", "15", "37", "200", "km", "COUNT", "9223372036854775807"), ("GEORADIUS", "Sicily", "15", "37", "200", "km", "COUNT", "9223372036854775808"))
+seq("geo_georadiusbymember", SICILY, ("GEORADIUSBYMEMBER", "Sicily", "Agrigento", "100", "km"),
+    ("GEORADIUSBYMEMBER", "Sicily", "Agrigento", "100", "km", "WITHDIST", "WITHCOORD", "WITHHASH"),
+    ("GEORADIUSBYMEMBER", "Sicily", "Palermo", "300", "km", "ASC", "WITHDIST"), ("GEORADIUSBYMEMBER", "Sicily", "Palermo", "300", "km", "COUNT", "3", "DESC"),
+    ("GEORADIUSBYMEMBER", "Sicily", "Palermo", "0", "km"), ("GEORADIUSBYMEMBER", "Sicily", "nope", "100", "km"),
+    ("GEORADIUSBYMEMBER", "Sicily", "nope", "x", "km"), ("GEORADIUSBYMEMBER", "Sicily", "Palermo", "x", "km"),
+    ("GEORADIUSBYMEMBER", "Sicily", "Palermo", "1", "x"), ("GEORADIUSBYMEMBER", "Sicily", "Palermo", "300", "km", "STORE", "d"),
+    ("ZRANGE", "d", "0", "-1", "WITHSCORES"), ("GEORADIUSBYMEMBER", "Sicily", "Palermo", "300", "km", "STOREDIST", "d", "ASC", "COUNT", "2"),
+    ("ZRANGE", "d", "0", "-1", "WITHSCORES"),
+    # Without the key the radius isn't read, only the options.
+    ("GEORADIUSBYMEMBER", "nokey", "m", "x", "parsec"), ("GEORADIUSBYMEMBER", "nokey", "m", "x", "parsec", "STORE", "d"), ("EXISTS", "d"),
+    ("GEORADIUSBYMEMBER", "nokey", "m", "x", "parsec", "nope"), ("GEORADIUSBYMEMBER", "nokey", "m", "1", "km", "ANY"),
+    ("GEORADIUSBYMEMBER", "nokey", "m", "1", "km", "COUNT", "0"), ("GEORADIUSBYMEMBER", "nokey", "m", "1", "km", "STORE", "d", "WITHDIST"),
+    ("GEORADIUSBYMEMBER_RO", "Sicily", "Agrigento", "100", "km", "WITHDIST"), ("GEORADIUSBYMEMBER_RO", "Sicily", "Agrigento", "100", "km", "STORE", "d"),
+    ("GEORADIUSBYMEMBER_RO", "nokey", "m", "1", "km"), ("GEORADIUSBYMEMBER", "Sicily", "Palermo"), ("GEORADIUSBYMEMBER_RO", "Sicily", "a", "1"))
+seq("geo_geosearch", SICILY,
+    ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "ASC"),
+    ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYBOX", "400", "400", "km", "ASC", "WITHCOORD", "WITHDIST"),
+    ("GEOSEARCH", "Sicily", "FROMMEMBER", "Palermo", "BYBOX", "400", "400", "km", "WITHHASH"),
+    ("GEOSEARCH", "Sicily", "FROMMEMBER", "Palermo", "BYRADIUS", "100", "km", "WITHDIST"),
+    ("GEOSEARCH", "Sicily", "BYRADIUS", "100", "km", "FROMMEMBER", "Palermo", "DESC", "COUNT", "2"),
+    ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYBOX", "400", "10", "km"), ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYBOX", "10", "400", "km"),
+    ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYBOX", "0", "0", "km"), ("GEOSEARCH", "Sicily", "FROMMEMBER", "Palermo", "BYBOX", "0", "0", "m"),
+    ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "COUNT", "2", "ANY"),
+    ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "FROMLONLAT", "13", "38", "BYRADIUS", "100", "km"),
+    ("GEOSEARCH", "Sicily", "FROMMEMBER", "Palermo", "FROMMEMBER", "Catania", "BYRADIUS", "1", "m", "BYRADIUS", "10", "m"),
+    ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYBOX", "1", "1", "mi", "BYBOX", "800", "800", "km", "ASC"),
+    ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYRADIUS", "656168", "FT", "WITHDIST", "ASC"))
+seq("geo_geosearch_errors", SICILY,
+    ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "FROMMEMBER", "Palermo", "BYRADIUS", "1", "km"),
+    ("GEOSEARCH", "Sicily", "FROMMEMBER", "Palermo", "FROMLONLAT", "15", "37", "BYRADIUS", "1", "km"),
+    ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYRADIUS", "1", "km", "BYBOX", "1", "1", "km"),
+    ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYBOX", "1", "1", "km", "BYRADIUS", "1", "km"),
+    ("GEOSEARCH", "Sicily", "BYRADIUS", "1", "km", "WITHDIST"), ("GeoSearch", "Sicily", "BYRADIUS", "1", "km", "COUNT", "1"),
+    ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "WITHDIST", "ASC"), ("GEOsearch", "Sicily", "FROMLONLAT", "15", "37", "ASC", "DESC"),
+    ("GEOSEARCH", "Sicily", "FROMMEMBER", "nope", "BYRADIUS", "1", "km"), ("GEOSEARCH", "Sicily", "FROMMEMBER", "nope", "BYRADIUS", "x", "km"),
+    ("GEOSEARCH", "Sicily", "BYRADIUS", "x", "km", "FROMMEMBER", "nope"), ("GEOSEARCH", "Sicily", "FROMLONLAT", "x", "37", "BYRADIUS", "1", "km"),
+    ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "86", "BYRADIUS", "1", "km"), ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYRADIUS", "-1", "km"),
+    ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYBOX", "x", "y", "km"), ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYBOX", "1", "y", "km"),
+    ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYBOX", "-1", "1", "km"), ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYBOX", "1", "-1", "nope"),
+    ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYBOX", "1", "1", "nope"), ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYBOX", "1", "1"),
+    ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYRADIUS", "1"), ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "BYRADIUS", "1", "km"),
+    ("GEOSEARCH", "Sicily", "FROMMEMBER", "Palermo", "BYRADIUS", "1", "km", "ANY"), ("GEOSEARCH", "Sicily", "FROMMEMBER", "Palermo", "BYRADIUS", "1", "km", "COUNT", "0"),
+    ("GEOSEARCH", "Sicily", "FROMMEMBER", "Palermo", "BYRADIUS", "1", "km", "STORE", "d"), ("GEOSEARCH", "Sicily", "FROMMEMBER", "Palermo", "BYRADIUS", "1", "km", "STOREDIST"),
+    ("GEOSEARCH", "Sicily", "FROMMEMBER", "Palermo", "BYRADIUS", "1", "km", "STOREDIST", "d"),
+    ("GEOSEARCH", "nokey", "FROMMEMBER", "x", "BYRADIUS", "1", "km"), ("GEOSEARCH", "nokey", "FROMMEMBER", "x"),
+    ("GEOSEARCH", "nokey", "BYRADIUS", "1", "km", "FROMLONLAT", "x", "y"), ("GEOSEARCH", "nokey", "FROMMEMBER", "x", "BYRADIUS", "1", "km", "ANY"),
+    ("GEOSEARCH", "nokey", "FROMMEMBER", "x", "BYBOX", "1", "1", "x"), ("GEOSEARCH", "Sicily", "FROMMEMBER", "Palermo", "BYRADIUS", "1", "km\x00", "withdist\x00z"),
+    ("SET", "s", "v"), ("GEOSEARCH", "s", "a", "b", "c", "d", "e"), ("GEOSEARCH", "Sicily", "FROMMEMBER", "Palermo"), ("GEOSEARCH", "Sicily"))
+seq("geo_geosearchstore", SICILY,
+    ("GEOSEARCHSTORE", "d", "Sicily", "FROMLONLAT", "15", "37", "BYBOX", "400", "400", "km", "ASC", "COUNT", "3"),
+    ("ZRANGE", "d", "0", "-1", "WITHSCORES"), ("TYPE", "d"), ("OBJECT", "ENCODING", "d"),
+    ("GEOSEARCHSTORE", "d", "Sicily", "FROMLONLAT", "15", "37", "BYBOX", "400", "400", "km", "ASC", "COUNT", "3", "STOREDIST"),
+    ("ZRANGE", "d", "0", "-1", "WITHSCORES"),
+    ("GEOSEARCHSTORE", "d", "Sicily", "STOREDIST", "FROMMEMBER", "Catania", "BYRADIUS", "500", "mi", "storedist"), ("ZRANGE", "d", "0", "-1", "WITHSCORES"),
+    ("GEOSEARCHSTORE", "d", "Sicily", "FROMLONLAT", "15", "37", "BYRADIUS", "1", "m"), ("EXISTS", "d"),
+    ("SET", "str", "v"), ("GEOSEARCHSTORE", "str", "Sicily", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km"), ("TYPE", "str"),
+    ("GEOSEARCHSTORE", "str", "nokey", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km"), ("EXISTS", "str"),
+    ("GEOSEARCHSTORE", "Sicily", "Sicily", "FROMMEMBER", "Palermo", "BYRADIUS", "100", "km"), ("ZRANGE", "Sicily", "0", "-1", "WITHSCORES"),
+    ("GEOSEARCHSTORE", "d", "Sicily", "FROMMEMBER", "Palermo", "BYRADIUS", "1", "km", "WITHDIST"),
+    ("GEOSEARCHSTORE", "d", "Sicily", "FROMMEMBER", "Palermo", "BYRADIUS", "1", "km", "WITHCOORD", "WITHHASH"),
+    ("GEOSEARCHSTORE", "d", "nokey", "FROMMEMBER", "Palermo", "BYRADIUS", "1", "km", "WITHHASH"),
+    ("GEOSEARCHSTORE", "d", "Sicily", "FROMMEMBER", "Palermo", "BYRADIUS", "1", "km", "STORE", "x"),
+    ("GEOSEARCHSTORE", "d", "nokey", "FROMMEMBER", "x"), ("GEOSEARCHSTORE", "d", "nokey", "BYRADIUS", "1", "km"),
+    ("GEOSEARCHSTORE", "d", "Sicily", "FROMMEMBER", "nope", "BYRADIUS", "1", "km"), ("SET", "s", "v"),
+    ("GEOSEARCHSTORE", "d", "s", "FROMMEMBER", "Palermo", "BYRADIUS", "1", "km"), ("GEOSEARCHSTORE", "d", "Sicily", "FROMMEMBER", "Palermo", "BYRADIUS"),
+    ("geosearchSTORE", "d", "Sicily", "FROMMEMBER", "Palermo", "ASC", "DESC"))
+seq("geo_edges", ("GEOADD", "g", "-180", "-85.05112878", "sw", "180", "85.05112878", "ne", "-180", "85.05112878", "nw", "180", "-85.05112878", "se",
+                  "179.9", "0", "east", "-179.9", "0", "west", "179.99999", "10", "e2", "-179.99999", "10", "w2", "0", "85", "north", "0", "-85", "south",
+                  "90", "84.9", "n2", "-90", "-84.9", "s2", "0", "0", "o"),
+    ("GEOPOS", "g", "sw", "ne", "nw", "se", "east", "west"), ("GEOHASH", "g", "sw", "ne", "nw", "se", "east", "west", "north", "south"),
+    ("GEODIST", "g", "east", "west"), ("GEODIST", "g", "e2", "w2", "km"), ("GEODIST", "g", "sw", "ne"), ("GEODIST", "g", "north", "south", "mi"),
+    ("GEODIST", "g", "nw", "se"), ("GEODIST", "g", "o", "ne", "ft"),
+    # Across the antimeridian, around the poles' limits.
+    ("GEOSEARCH", "g", "FROMLONLAT", "180", "0", "BYRADIUS", "50", "km", "WITHDIST"), ("GEOSEARCH", "g", "FROMLONLAT", "-180", "0", "BYRADIUS", "50", "km", "ASC"),
+    ("GEOSEARCH", "g", "FROMMEMBER", "east", "BYRADIUS", "50", "km", "WITHDIST"), ("GEOSEARCH", "g", "FROMMEMBER", "w2", "BYBOX", "10", "10", "km", "WITHDIST"),
+    ("GEOSEARCH", "g", "FROMLONLAT", "179.95", "0", "BYBOX", "40", "40", "km", "WITHCOORD"),
+    ("GEOSEARCH", "g", "FROMLONLAT", "0", "85.05112878", "BYRADIUS", "100", "km", "WITHDIST"),
+    ("GEOSEARCH", "g", "FROMLONLAT", "0", "-85.05112878", "BYRADIUS", "1000", "km", "WITHDIST"),
+    ("GEOSEARCH", "g", "FROMLONLAT", "180", "85.05112878", "BYRADIUS", "10", "km", "WITHDIST"),
+    ("GEOSEARCH", "g", "FROMLONLAT", "-180", "-85.05112878", "BYBOX", "5000", "5000", "km", "WITHDIST"),
+    ("GEOSEARCH", "g", "FROMMEMBER", "north", "BYRADIUS", "3000", "km", "WITHDIST"), ("GEOSEARCH", "g", "FROMMEMBER", "n2", "BYRADIUS", "500", "km"),
+    ("GEOSEARCH", "g", "FROMLONLAT", "0", "67", "BYRADIUS", "2000", "km"), ("GEOSEARCH", "g", "FROMLONLAT", "0", "-81", "BYRADIUS", "1000", "km"),
+    # Whole earth: the coarsest steps, neighbours the same cell.
+    ("GEOSEARCH", "g", "FROMLONLAT", "0", "0", "BYRADIUS", "20000", "km", "WITHDIST"), ("GEOSEARCH", "g", "FROMLONLAT", "0", "0", "BYRADIUS", "40000", "km"),
+    ("GEOSEARCH", "g", "FROMLONLAT", "100", "50", "BYRADIUS", "100000", "km", "WITHDIST"), ("GEOSEARCH", "g", "FROMLONLAT", "0", "0", "BYRADIUS", "1e300", "km"),
+    ("GEOSEARCH", "g", "FROMLONLAT", "0", "0", "BYRADIUS", "inf", "km", "WITHDIST"), ("GEOSEARCH", "g", "FROMLONLAT", "0", "0", "BYBOX", "inf", "inf", "km"),
+    ("GEOSEARCH", "g", "FROMLONLAT", "0", "0", "BYBOX", "40000", "40000", "km", "WITHDIST"), ("GEOSEARCH", "g", "FROMLONLAT", "0", "0", "BYBOX", "100000", "1", "km"),
+    ("GEOSEARCH", "g", "FROMLONLAT", "0", "0", "BYBOX", "1", "100000", "km"), ("GEOSEARCH", "g", "FROMLONLAT", "170", "-80", "BYRADIUS", "15000", "km", "DESC"),
+    ("GEOSEARCH", "g", "FROMLONLAT", "0", "0", "BYRADIUS", "0", "m"), ("GEOSEARCH", "g", "FROMMEMBER", "o", "BYRADIUS", "0", "m", "WITHDIST"),
+    ("GEOSEARCH", "g", "FROMMEMBER", "ne", "BYRADIUS", "0", "km", "WITHDIST", "WITHHASH"), ("GEOSEARCH", "g", "FROMMEMBER", "sw", "BYBOX", "0", "0", "km"),
+    ("GEOSEARCH", "g", "FROMLONLAT", "45", "45", "BYRADIUS", "1", "km"), ("GEOSEARCH", "g", "FROMLONLAT", "45", "45", "BYBOX", "1", "1", "m"),
+    ("GEORADIUS", "g", "180", "85.05112878", "20000", "km", "WITHDIST", "ASC"), ("GEORADIUS", "g", "-180", "-85.05112878", "1", "m", "WITHCOORD"))
+GEO_BIG = _geo_points(1, 300)
+GEO_NEAR = _geo_points(2, 400, lon=(9.0, 11.0), lat=(44.0, 46.0), dup_every=7)
+seq("geo_large", ("GEOADD", "big", *GEO_BIG), ("OBJECT", "ENCODING", "big"), ("ZCARD", "big"),
+    ("GEOSEARCH", "big", "FROMLONLAT", "0", "0", "BYRADIUS", "3000", "km", "WITHDIST"),
+    ("GEOSEARCH", "big", "FROMLONLAT", "100", "40", "BYBOX", "4000", "2000", "km", "WITHCOORD"),
+    ("GEOSEARCH", "big", "FROMMEMBER", "m7", "BYRADIUS", "5000", "km", "COUNT", "10", "WITHDIST"),
+    ("GEOSEARCH", "big", "FROMMEMBER", "m7", "BYRADIUS", "5000", "km", "COUNT", "10", "ANY", "WITHDIST"),
+    ("GEOSEARCH", "big", "FROMMEMBER", "m7", "BYRADIUS", "5000", "km", "COUNT", "10", "ANY", "DESC", "WITHDIST"),
+    ("GEOSEARCH", "big", "FROMLONLAT", "-120", "-30", "BYRADIUS", "8000", "km", "DESC", "COUNT", "7"),
+    ("GEOSEARCH", "big", "FROMLONLAT", "0", "0", "BYRADIUS", "20000", "km", "COUNT", "300", "WITHDIST"),
+    ("GEOSEARCH", "big", "FROMLONLAT", "0", "0", "BYRADIUS", "20000", "km"),
+    ("GEOSEARCHSTORE", "dst", "big", "FROMLONLAT", "0", "0", "BYRADIUS", "20000", "km"), ("OBJECT", "ENCODING", "dst"), ("ZCARD", "dst"),
+    ("GEOSEARCHSTORE", "dst", "big", "FROMLONLAT", "0", "0", "BYRADIUS", "5000", "km", "STOREDIST"), ("OBJECT", "ENCODING", "dst"),
+    ("ZRANGE", "dst", "0", "-1", "WITHSCORES"), ("GEORADIUS", "big", "30", "30", "4000", "km", "WITHHASH"),
+    ("GEOADD", "near", *GEO_NEAR), ("GEOSEARCH", "near", "FROMLONLAT", "10", "45", "BYRADIUS", "40", "km"),
+    ("GEOSEARCH", "near", "FROMLONLAT", "10", "45", "BYRADIUS", "40", "km", "COUNT", "25", "WITHDIST"),
+    ("GEOSEARCH", "near", "FROMLONLAT", "10", "45", "BYRADIUS", "40", "km", "COUNT", "25", "DESC", "WITHDIST"),
+    ("GEOSEARCH", "near", "FROMMEMBER", "m3", "BYRADIUS", "80", "km", "COUNT", "60", "ASC"),
+    ("GEOSEARCH", "near", "FROMMEMBER", "m3", "BYRADIUS", "80", "km", "ASC"),
+    ("GEOSEARCH", "near", "FROMLONLAT", "10", "45", "BYBOX", "60", "30", "km", "COUNT", "3", "ANY"),
+    ("GEOSEARCH", "near", "FROMLONLAT", "10.5", "44.5", "BYBOX", "20", "50", "km", "WITHDIST"),
+    ("GEORADIUSBYMEMBER", "near", "m100", "15", "km", "WITHDIST", "COUNT", "5"))
+seq("geo_resp3", ("HELLO", "3"), SICILY, ("GEOPOS", "Sicily", "Palermo", "nope"), ("GEOHASH", "Sicily", "Palermo", "nope"),
+    ("GEODIST", "Sicily", "Palermo", "Catania"), ("GEODIST", "Sicily", "Palermo", "nope"), ("GEODIST", "nokey", "a", "b"),
+    ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "WITHDIST", "WITHCOORD", "WITHHASH", "ASC"),
+    ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km"), ("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYRADIUS", "1", "km"),
+    ("GEOSEARCH", "nokey", "FROMLONLAT", "15", "37", "BYRADIUS", "1", "km"), ("GEORADIUS", "Sicily", "15", "37", "200", "km", "WITHCOORD"),
+    ("GEOSEARCHSTORE", "d", "Sicily", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km"), ("GEOPOS", "nokey", "a"), norm=[at(0, mask_hello)])
+seq("geo_zset_commands", SICILY, ("ZREM", "Sicily", "edge1"), ("ZSCORE", "Sicily", "Palermo"), ("ZRANK", "Sicily", "Catania"),
+    ("ZADD", "Sicily", "3471579339700058", "z"), ("GEOPOS", "Sicily", "z"), ("ZINCRBY", "Sicily", "1", "z"), ("GEOHASH", "Sicily", "z"),
+    ("ZUNIONSTORE", "u", "1", "Sicily"), ("GEODIST", "u", "Palermo", "z"), ("SADD", "set", "Palermo"), ("ZINTERSTORE", "i", "2", "Sicily", "set"),
+    ("GEOPOS", "i", "Palermo"), ("EXPIRE", "Sicily", "100"), ("GEOADD", "Sicily", "1", "1", "q"), ("TTL", "Sicily"),
+    ("GEORADIUS", "Sicily", "15", "37", "300", "km", "STORE", "Sicily"), ("TTL", "Sicily"), ("ZRANGE", "Sicily", "0", "-1"))
+# A stored result is built large, then packed if it fits: a -0 score stays
+# only in a set too large to pack.
+# The -0 only reaches a large set by a ZADD once it's large (a new one is
+# built packed); found before the long member, it must stay -0.
+seq("geo_store_negative_zero", ("ZADD", "z", "3377699720527872", "o", "3377699720527873", "x" * 65), ("ZADD", "z", "-0", "neg"),
+    ("OBJECT", "ENCODING", "z"), ("ZRANGE", "z", "0", "-1", "WITHSCORES"),
+    ("GEOSEARCHSTORE", "d", "z", "FROMLONLAT", "-180", "-85.05112878", "BYRADIUS", "20000", "km"), ("ZRANGE", "d", "0", "-1", "WITHSCORES"),
+    ("OBJECT", "ENCODING", "d"), ("GEORADIUS", "z", "-180", "-85.05112878", "20000", "km", "STORE", "d"), ("ZRANGE", "d", "0", "-1", "WITHSCORES"),
+    ("GEOSEARCHSTORE", "d", "z", "FROMLONLAT", "-180", "-85.05112878", "BYRADIUS", "1", "km"), ("ZRANGE", "d", "0", "-1", "WITHSCORES"),
+    ("OBJECT", "ENCODING", "d"), ("ZADD", "d", "1", "x" * 65), ("ZRANGE", "d", "0", "-1", "WITHSCORES"),
+    ("ZADD", "small", "-0", "neg", "3377699720527872", "o"),
+    ("GEOSEARCHSTORE", "d", "z", "FROMLONLAT", "0", "0", "BYRADIUS", "20000", "km"), ("ZRANGE", "d", "0", "-1", "WITHSCORES"),
+    ("OBJECT", "ENCODING", "d"), ("GEOSEARCHSTORE", "d", "small", "FROMLONLAT", "0", "0", "BYRADIUS", "20000", "km"),
+    ("ZRANGE", "d", "0", "-1", "WITHSCORES"), ("OBJECT", "ENCODING", "d"),
+    ("GEORADIUS", "z", "0", "0", "20000", "km", "STORE", "d"), ("ZRANGE", "d", "0", "-1", "WITHSCORES"),
+    ("GEOSEARCHSTORE", "d", "z", "FROMLONLAT", "0", "0", "BYRADIUS", "20000", "km", "COUNT", "2"), ("ZRANGE", "d", "0", "-1", "WITHSCORES"),
+    ("GEOSEARCH", "z", "FROMLONLAT", "0", "0", "BYRADIUS", "20000", "km", "WITHHASH"))
+# High latitudes, where a box's edges bend most, the antimeridian and the
+# latitude limits: dense grids, searched by boxes and circles of many sizes.
+# Redis's cells don't wrap over the limits, and a point at longitude 180 or
+# latitude 85.05112878 is in no cell (its offset of 2^26 is past the 52
+# bits): Redis misses such points, and so must we.
+def _geo_grid(lon0, lat0, n, dlon, dlat, prefix):
+    out = []
+    for i in range(-n, n + 1):
+        for j in range(-n, n + 1):
+            lon = lon0 + i * dlon
+            lon = lon - 360 if lon > 180 else lon + 360 if lon < -180 else lon
+            lat = max(-85.05112878, min(85.05112878, lat0 + j * dlat))
+            out += [repr(lon), repr(lat), f"{prefix}{i}_{j}"]
+    return out
+
+
+GEO_LIMIT_SEARCHES = []
+for (x, y) in [("10", "75"), ("10.3", "80.5"), ("-120", "-78"), ("-119.6", "-82.2"), ("178.12070207197291", "79.90217444554206"),
+               ("-179.7", "-80"), ("180", "84"), ("0", "85.05112878"), ("172.7883544923677", "-85.05112878")]:
+    for size in ("20", "75", "160", "400", "900"):
+        GEO_LIMIT_SEARCHES += [("GEOSEARCH", "g", "FROMLONLAT", x, y, "BYRADIUS", size, "km"),
+                               ("GEOSEARCH", "g", "FROMLONLAT", x, y, "BYBOX", size, str(int(size) // 2), "km"),
+                               ("GEOSEARCH", "g", "FROMLONLAT", x, y, "BYBOX", str(int(size) // 3), size, "km")]
+seq("geo_limits", ("GEOADD", "g", *_geo_grid(10, 78, 12, 0.4, 0.25, "n")), ("GEOADD", "g", *_geo_grid(-120, -80, 12, 0.5, 0.2, "s")),
+    ("GEOADD", "g", *_geo_grid(179.5, 80, 10, 0.15, 0.1, "a")), ("GEOADD", "g", *_geo_grid(0, 84.9, 8, 1.0, 0.03, "p")),
+    ("GEOADD", "g", *_geo_grid(175, -84.9, 8, 1.0, 0.03, "q")), ("ZCARD", "g"), *GEO_LIMIT_SEARCHES)
 # --- SCAN, KEYS --------------------------------------------------------
 # Small keyspaces come whole with a large COUNT; their order is the dict's:
 # compared sorted. Compact hashes and intsets come whole, in their order.
@@ -1419,6 +1686,22 @@ WATCHES = [
     ("zinterstore_empty_missing", [], ("ZINTERSTORE", "k", "1", "nosuch")),
     ("zdiffstore_empty_existing", [("ZADD", "k", "1", "a")], ("ZDIFFSTORE", "k", "2", "k", "k")),
     ("zunion_read", [("ZADD", "k", "1", "a")], ("ZUNION", "1", "k")),
+    # Geo (phase 9 milestone 5): GEOADD as ZADD; a search's destination
+    # written, or deleted when nothing's found.
+    ("geoadd", [], ("GEOADD", "k", "1", "2", "a")),
+    ("geoadd_same", [("GEOADD", "k", "1", "2", "a")], ("GEOADD", "k", "1", "2", "a")),
+    ("geoadd_nx_fails", [("GEOADD", "k", "1", "2", "a")], ("GEOADD", "k", "NX", "3", "4", "a")),
+    ("geoadd_bad_point", [("GEOADD", "k", "1", "2", "a")], ("GEOADD", "k", "3", "4", "b", "200", "0", "c")),
+    ("geosearchstore", [("GEOADD", "s", "1", "2", "a")], ("GEOSEARCHSTORE", "k", "s", "FROMLONLAT", "1", "2", "BYRADIUS", "1", "km")),
+    ("geosearchstore_empty_existing", [("SET", "k", "v"), ("GEOADD", "s", "1", "2", "a")],
+     ("GEOSEARCHSTORE", "k", "s", "FROMLONLAT", "50", "50", "BYRADIUS", "1", "km")),
+    ("geosearchstore_empty_missing", [("GEOADD", "s", "1", "2", "a")], ("GEOSEARCHSTORE", "k", "s", "FROMLONLAT", "50", "50", "BYRADIUS", "1", "km")),
+    ("geosearchstore_no_source", [("SET", "k", "v")], ("GEOSEARCHSTORE", "k", "nosuch", "FROMLONLAT", "1", "2", "BYRADIUS", "1", "km")),
+    ("geosearchstore_from", [("GEOADD", "k", "1", "2", "a")], ("GEOSEARCHSTORE", "d", "k", "FROMLONLAT", "1", "2", "BYRADIUS", "1", "km")),
+    ("georadius_store", [("GEOADD", "s", "1", "2", "a")], ("GEORADIUS", "s", "1", "2", "1", "km", "STORE", "k")),
+    ("georadius_store_last", [("GEOADD", "s", "1", "2", "a")], ("GEORADIUS", "s", "1", "2", "1", "km", "STOREDIST", "k", "STORE", "d")),
+    ("georadius_read", [("GEOADD", "k", "1", "2", "a")], ("GEORADIUS", "k", "1", "2", "1", "km")),
+    ("georadiusbymember_storedist", [("GEOADD", "s", "1", "2", "a")], ("GEORADIUSBYMEMBER", "s", "a", "1", "km", "STOREDIST", "k")),
 ]
 for name, setup, command in WATCHES:
     steps(f"tx_watch_{name}", *on(0, *setup, ("WATCH", "k")), *on(1, command), *on(0, ("MULTI",), ("PING",), ("EXEC",)),
