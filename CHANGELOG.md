@@ -7,7 +7,9 @@
   the single-key commands (`ZADD` with every option, `ZRANGE` by rank,
   score and member, `ZRANGESTORE`, `ZPOPMIN`, `ZRANDMEMBER`, `ZSCAN`...);
   scores read and written as Redis 8.10.2 does (its `fast_float` and
-  `fpconv` ported), compared byte for byte.
+  `fpconv` ported), compared byte for byte; the multi-key ones (`ZUNION`
+  `ZINTER` `ZDIFF` and their `STORE` forms with `WEIGHTS` and `AGGREGATE`,
+  `ZINTERCARD`, `ZMPOP`), routed by all their keys in a cluster.
 - `HSCAN ... NOVALUES`.
 
 ## 0.1.0 (2026-10-31)

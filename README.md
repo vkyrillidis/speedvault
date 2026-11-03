@@ -90,7 +90,7 @@ From code, use any Redis client: redis-py's `redis.Redis(port=7000)`, or
 | Strings, integers, floats | Yes; not yet `GETRANGE SETRANGE GETEX GETSET SETEX PSETEX MSETNX` |
 | Keys and expiry | Yes; not yet `RENAME UNLINK COPY TOUCH RANDOMKEY` |
 | Hashes, sets, lists | Yes, packed as Redis packs them; not yet blocking pops (`BLPOP`...), hash field expiry (`HEXPIRE`...) |
-| Sorted sets | Yes, packed as Redis packs them; not yet `ZUNION ZINTER ZDIFF` (and `STORE`), `ZINTERCARD ZMPOP`, blocking pops (`BZPOPMIN`...) |
+| Sorted sets | Yes, packed as Redis packs them; not yet blocking pops (`BZPOPMIN BZPOPMAX BZMPOP`) |
 | Streams, bitmaps, HyperLogLog, geo | Not yet (geo next) |
 | Transactions (`MULTI EXEC WATCH`) | Yes |
 | Pub/sub, scripting (`EVAL`, functions) | Not yet |
@@ -127,8 +127,10 @@ also lists the few deliberate differences.
   ZMSCORE ZRANK ZREVRANK ZCOUNT ZLEXCOUNT ZRANGE` (`BYSCORE BYLEX REV LIMIT
   WITHSCORES`) `ZRANGESTORE ZREVRANGE ZRANGEBYSCORE ZREVRANGEBYSCORE
   ZRANGEBYLEX ZREVRANGEBYLEX ZREMRANGEBYRANK ZREMRANGEBYSCORE ZREMRANGEBYLEX
-  ZPOPMIN ZPOPMAX ZRANDMEMBER ZSCAN` (scores read and written as Redis 8
-  does, digit for digit).
+  ZPOPMIN ZPOPMAX ZRANDMEMBER ZSCAN ZUNION ZINTER ZDIFF ZUNIONSTORE
+  ZINTERSTORE ZDIFFSTORE` (`WEIGHTS`, `AGGREGATE SUM|MIN|MAX|COUNT`)
+  `ZINTERCARD ZMPOP` (scores read and written as Redis 8 does, digit for
+  digit, and summed in its order).
 - **Connection and server:** `PING ECHO HELLO AUTH SELECT 0 QUIT CLIENT
   COMMAND INFO`, `CONFIG GET` and `SET`.
 - **Transactions:** `MULTI EXEC DISCARD WATCH UNWATCH`, as Redis's: the
