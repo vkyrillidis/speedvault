@@ -17,8 +17,13 @@ member bytes, so unlike hashes and sets the encoding changes no reply,
 only `OBJECT ENCODING` and memory. `ZADD` and the `STORE` commands size the
 new key up front (`zsetTypeCreate`, `zsetTypeMaybeConvert`): to be copied.
 
-**Scores.** Doubles. Read by `string2d` (`strtod`, no leading space, every
-byte read, NaN refused, `inf`/`-inf`/`+inf` taken). Written by `d2string`:
+**Scores.** Doubles. Read by `string2d` (no leading space, every byte read,
+NaN refused, `inf`/`-inf`/`+inf` taken) through `fast_float_strtod`: a port
+of fast_float for up to 19 significant digits and a decimal exponent in
+[-342, 308], glibc's `strtod` for the rest (hex floats among them). Only
+`strtod` reports a range error, so `ZADD z 9e308 m` stores `inf` and
+`ZADD z 1e400 m` is refused. A range bound (`zslParseRange`) is read up to
+its first NUL byte, after white space, and an empty one is 0. Written by `d2string`:
 `nan`, `inf`, `-inf`, `-0`, integers in the `long long` range as integers,
 everything else by `fpconv_dtoa` (Grisu2: round-trips but isn't always the
 shortest, and has its own exponent format), so `fpconv_dtoa` is ported
@@ -72,7 +77,7 @@ as it is, not replaced by Rust's `{}`. RESP3 sends a double (`,`).
 
 | # | Milestone | Content | State |
 |---|-----------|---------|-------|
-| 1 | Groundwork | `Value::ZSet` (boxed, `Entry` stays its size); the packed small encoding and the large one (decision 1), tested against a `BTreeMap` model through conversion and removals; `string2d` and `d2string` with `fpconv_dtoa` ported, fuzzed against Redis 8 (`ZADD`/`ZSCORE` of random doubles, byte for byte); the generic commands type aware (`TYPE zset`, `OBJECT ENCODING`, `WRONGTYPE`, an emptied key deleted); the dump kind `zset` | planned |
+| 1 | Groundwork | `Value::ZSet` (boxed, `Entry` stays its size); the packed small encoding and the large one (decision 1), tested against a `BTreeMap` model through conversion and removals; `string2d` and `d2string` with `fpconv_dtoa` ported, fuzzed against Redis 8 (`ZADD`/`ZSCORE` of random doubles, byte for byte); the generic commands type aware (`TYPE zset`, `OBJECT ENCODING`, `WRONGTYPE`, an emptied key deleted); the dump kind `zset` | done (2026-11-03): `store::double` (`string2d`, the range-bound reading, `d2string` with night-shift's `fpconv_dtoa` ported as it is), compared with Redis 8.10.2's own C (`fast_float_strtod.c`, `fpconv_dtoa.c`) on 2.3M generated inputs (decimal near fast_float's limits, hex floats, junk, NUL bytes, random doubles printed every way): every refusal, value and printed digit the same. Found: fast_float reports no range error, so `9e308` is a score (`inf`) and `1e400` isn't; `2^63` prints as `9223372036854776000`; a range bound of `""` is 0. `store::ztree`, the counted B+ tree (64 wide), tested against a sorted model through four levels and back to empty; `store::zset` (`listpack`: member and 8-byte score in turn; `skiplist`: the ordered table beside the tree, the tree's entries pointing at the table's blocks), against a `HashMap` model through the conversion; Miri on the pointer paths. A fifth value kind (the kind takes 3 bits of a key's flags); `TYPE`, `OBJECT ENCODING`, `WRONGTYPE`, `SCAN TYPE zset`, expiry, `DEL` checked in the store; dumps (scores as their 8 bytes, NaN refused), whole and in parts. Commands come in milestone 2, so nothing a client can reach yet. 30 injected bugs: 29 caught (one after a test was added: the sticky bit of a hex float past 16 digits), the 30th equivalent (a leading-space check the grammar made redundant, removed) |
 | 2 | Single-key commands | `ZADD` (`NX XX GT LT CH INCR`) `ZINCRBY ZREM ZCARD ZSCORE ZMSCORE ZRANK ZREVRANK` (`WITHSCORE`) `ZCOUNT ZLEXCOUNT ZRANGE` (`BYSCORE BYLEX REV LIMIT WITHSCORES`) `ZREVRANGE ZRANGEBYSCORE ZREVRANGEBYSCORE ZRANGEBYLEX ZREVRANGEBYLEX ZRANGESTORE ZREMRANGEBYRANK ZREMRANGEBYSCORE ZREMRANGEBYLEX ZPOPMIN ZPOPMAX ZRANDMEMBER ZSCAN`; range syntax (`(`, `-inf`, `[`, `-`, `+`) and its errors as Redis; RESP2 and RESP3 | planned |
 | 3 | Multi-key commands | `ZUNION ZINTER ZDIFF ZUNIONSTORE ZINTERSTORE ZDIFFSTORE ZINTERCARD ZMPOP` (`WEIGHTS AGGREGATE WITHSCORES`, sets taken as scores of 1 as Redis does); the `movable` kind extended to a count after a destination (`ZUNIONSTORE dest numkeys ...`); `CROSSSLOT` in cluster mode | planned |
 | 4 | Migration, replication, transactions | Sorted sets in `CLUSTER IMPORT` and `IMPORTPART` (chunks, hidden until whole), the per-element import estimate measured; replication of the new writes and parts; `WATCH` touches where Redis signals; `migrate_check` with a `ZADD`/`ZINCRBY` writer and sorted sets of 200000 moving under load | planned |
