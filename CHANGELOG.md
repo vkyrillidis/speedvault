@@ -9,7 +9,9 @@
   scores read and written as Redis 8.10.2 does (its `fast_float` and
   `fpconv` ported), compared byte for byte; the multi-key ones (`ZUNION`
   `ZINTER` `ZDIFF` and their `STORE` forms with `WEIGHTS` and `AGGREGATE`,
-  `ZINTERCARD`, `ZMPOP`), routed by all their keys in a cluster.
+  `ZINTERCARD`, `ZMPOP`), routed by all their keys in a cluster; sorted
+  sets move between nodes and reach the replicas like the other types,
+  checked under load with sets of 200000 members.
 - `HSCAN ... NOVALUES`.
 
 ## 0.1.0 (2026-10-31)
