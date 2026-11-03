@@ -400,6 +400,18 @@ impl Store {
         n
     }
 
+    /// A geo search's `STORE` into `dst` (`georadiusGeneric`): `members`
+    /// put into a large set, as Redis builds it, then packed if it fits
+    /// (so a `-0` score stays `-0` only in a set too large to pack), or
+    /// `dst` deleted if there are none. Its size.
+    pub fn zstore_large(&mut self, dst: &[u8], members: &[(&[u8], f64)]) -> usize {
+        let mut z = ZSet::with_hint(usize::MAX, 0);
+        for &(m, s) in members {
+            z.insert(m, s);
+        }
+        self.zstore_set(dst, z)
+    }
+
     /// `ZMPOP`: from the first of `keys` that exists (a key of another type
     /// before it is an error), up to `count` members from one end; which key
     /// it was and what came out, `None` if none exists.

@@ -465,6 +465,13 @@ impl Store {
         self.effects.as_ref().is_some_and(|e| !e.is_empty())
     }
 
+    /// Says that the write command being run changed nothing and needs no
+    /// replicating (`GEORADIUS` without `STORE`, flagged a write as in
+    /// Redis, which doesn't propagate it either).
+    pub fn wrote_nothing(&mut self) {
+        self.effect(|| Effect::Nothing);
+    }
+
     /// Records `effect` if recording.
     fn effect(&mut self, effect: impl FnOnce() -> Effect) {
         if let Some(effects) = &mut self.effects {

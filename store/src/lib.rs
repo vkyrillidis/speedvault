@@ -9,6 +9,7 @@ mod collections;
 mod double;
 mod error;
 mod float;
+pub mod geohash;
 mod glob;
 mod hll;
 mod int;
