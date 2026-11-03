@@ -139,13 +139,15 @@ Then the scenario moves slots:
                and their replicas
 
 With --collection N (default 20000), each hot slot (below) also holds a
-hash, a set and a list of N elements, so that they move in parts
-(--migrate-chunk), and one more redis-py writer works on them throughout:
-HINCRBY on four counter fields of each hash, SADD and RPUSH of members
+hash, a set, a list and a sorted set of N elements, so that they move in
+parts (--migrate-chunk), and one more redis-py writer works on them
+throughout: HINCRBY on four counter fields of each hash and ZINCRBY on four
+counter members of each sorted set, SADD, RPUSH and ZADD of members
 numbered in the order sent. At the end every element must be there, in
-order for the lists: the original ones, every acknowledged SADD and RPUSH
-(one in doubt may be there or not, an RPUSH retried twice), each counter
-field within its INCRs as above.
+order for the lists: the original ones (the sorted set's with their
+scores, one of them -0 byte for byte), every acknowledged SADD, RPUSH and
+ZADD (one in doubt may be there or not, an RPUSH retried twice), each
+counter within its INCRs as above.
 
 With replicas, the replicas are left out of that and checked against
 their primaries instead: once caught up, the same number of keys.
@@ -166,6 +168,7 @@ prometheus_client there.
 
 from __future__ import annotations
 
+import math
 import argparse
 import os
 import re
@@ -758,18 +761,19 @@ COLLECTION = 0
 COUNTER_FIELDS = 4
 
 
-def collection_keys(slot: int) -> Tuple[str, str, str]:
+def collection_keys(slot: int) -> Tuple[str, str, str, str]:
     tag = tag_for(slot)
-    return f"{{{tag}}}ch", f"{{{tag}}}cs", f"{{{tag}}}cl"
+    return f"{{{tag}}}ch", f"{{{tag}}}cs", f"{{{tag}}}cl", f"{{{tag}}}cz"
 
 
 def fill_collections(cluster: "Cluster", owners: Dict[int, int], n: int):
-    """A hash (f<i>: v<i>), a set (m<i>) and a list (e<i>, in order) of n
-    elements in each hot slot, straight to its owner."""
+    """A hash (f<i>: v<i>), a set (m<i>), a list (e<i>, in order) and a
+    sorted set (m<i> scoring i, m7 scoring -0) of n elements in each hot
+    slot, straight to its owner."""
     if not n:
         return
     for slot in HOT_SLOTS:
-        h, st, l = collection_keys(slot)
+        h, st, l, z = collection_keys(slot)
         r = cluster.node(owners[slot])
         for start in range(0, n, 5000):
             ids = range(start, min(n, start + 5000))
@@ -777,20 +781,27 @@ def fill_collections(cluster: "Cluster", owners: Dict[int, int], n: int):
             p.hset(h, mapping={f"f{i}": f"v{i}" for i in ids})
             p.sadd(st, *[f"m{i}" for i in ids])
             p.rpush(l, *[f"e{i}" for i in ids])
+            p.execute_command("ZADD", z, *[x for i in ids for x in (zscore_of(i), f"m{i}")])
             p.execute()
+
+
+def zscore_of(i: int) -> str:
+    """The original score of a sorted set's m<i>, as ZSCORE writes it."""
+    return "-0" if i == 7 else str(i)
 
 
 class CollectionWriter(Writer):
     """A RedisCluster on the hot slots' collections, round and round:
-    HINCRBY of a counter field, SADD and RPUSH of w<seq>. Its counts are
-    its own (the counters' are zero), checked by check_collections."""
+    HINCRBY of a counter field and ZINCRBY of a counter member, SADD, RPUSH
+    and ZADD of w<seq>. Its counts are its own (the counters' are zero),
+    checked by check_collections."""
     name = "redis-py (collections)"
 
     def __init__(self, names: List[str], seed_port: int):
         super().__init__(names, seed_port, [])
-        # (slot, field) -> [acknowledged, in doubt]; seq -> True if
+        # (slot, field, kind) -> [acknowledged, in doubt]; seq -> True if
         # acknowledged, False in doubt, per (slot, kind).
-        self.fields: Dict[Tuple[int, int], List[int]] = {}
+        self.fields: Dict[Tuple[int, int, str], List[int]] = {}
         self.sent: Dict[Tuple[int, str], Dict[int, bool]] = {}
 
     def run(self):
@@ -799,11 +810,13 @@ class CollectionWriter(Writer):
         while not self.stopping.is_set():
             seq += 1
             slot = HOT_SLOTS[seq % len(HOT_SLOTS)]
-            h, st, l = collection_keys(slot)
+            h, st, l, z = collection_keys(slot)
             field = seq % COUNTER_FIELDS
             ops = [("hincrby", lambda: rc.hincrby(h, f"c{field}", 1)),
+                   ("zincrby", lambda: rc.zincrby(z, 1, f"c{field}")),
                    ("sadd", lambda: rc.sadd(st, f"w{seq}")),
-                   ("rpush", lambda: rc.rpush(l, f"w{seq}"))]
+                   ("rpush", lambda: rc.rpush(l, f"w{seq}")),
+                   ("zadd", lambda: rc.zadd(z, {f"w{seq}": seq}))]
             for kind, op in ops:
                 try:
                     op()
@@ -815,8 +828,8 @@ class CollectionWriter(Writer):
                     if len(self.errors) < 1000:
                         self.errors.append(f"{kind} {slot}: {type(e).__name__}: {e}")
                     self.collection_failures += 1
-                if kind == "hincrby":
-                    self.fields.setdefault((slot, field), [0, 0])[0 if ok else 1] += 1
+                if kind in ("hincrby", "zincrby"):
+                    self.fields.setdefault((slot, field, kind), [0, 0])[0 if ok else 1] += 1
                 else:
                     self.sent.setdefault((slot, kind), {})[seq] = ok
                 self.ops += 1
@@ -832,14 +845,14 @@ def check_collections(cluster: "Cluster", w: CollectionWriter, lossy: Set[int]) 
     for slot in HOT_SLOTS:
         if slot in lossy:
             continue
-        h, st, l = collection_keys(slot)
+        h, st, l, z = collection_keys(slot)
         r = cluster.node(owners[slot])
         got_h = {k.decode(): v.decode() for k, v in r.hgetall(h).items()}
         missing = sum(got_h.get(f"f{i}") != f"v{i}" for i in range(n))
         if missing:
             problems.append(f"{h}: {missing} of its {n} fields missing or wrong")
         for f in range(COUNTER_FIELDS):
-            acked, doubt = w.fields.get((slot, f), [0, 0])
+            acked, doubt = w.fields.get((slot, f, "hincrby"), [0, 0])
             v = int(got_h.get(f"c{f}", 0))
             if not acked <= v <= acked + RETRIES * doubt:
                 problems.append(f"{h} c{f} = {v}, {acked} HINCRBYs acknowledged, {doubt} in doubt")
@@ -868,8 +881,27 @@ def check_collections(cluster: "Cluster", w: CollectionWriter, lossy: Set[int]) 
         unknown = [q for q in rest if q not in pushed]
         if bad or lost or unknown:
             problems.append(f"{l}: out of order {bad[:5]}, acknowledged RPUSHes lost {lost[:5]}, pushes nobody sent {unknown[:5]}")
+
+        # The sorted set and its scores (redis-py reads them as floats:
+        # -0 by its sign).
+        got_z = {m.decode(): sc for m, sc in r.zrange(z, 0, -1, withscores=True)}
+        want = lambda i: -0.0 if i == 7 else float(i)  # noqa: E731
+        wrong = [i for i in range(n) if f"m{i}" not in got_z or got_z[f"m{i}"] != want(i)
+                 or math.copysign(1, got_z[f"m{i}"]) != math.copysign(1, want(i))]
+        if wrong:
+            problems.append(f"{z}: {len(wrong)} of its {n} original members missing or with another score, e.g. {wrong[:5]}")
+        for f in range(COUNTER_FIELDS):
+            acked, doubt = w.fields.get((slot, f, "zincrby"), [0, 0])
+            v = float(got_z.get(f"c{f}", 0))
+            if not acked <= v <= acked + RETRIES * doubt:
+                problems.append(f"{z} c{f} = {v}, {acked} ZINCRBYs acknowledged, {doubt} in doubt")
+        added = w.sent.get((slot, "zadd"), {})
+        lost = [q for q, ok in added.items() if ok and got_z.get(f"w{q}") != q]
+        unknown = [m for m in got_z if not m.startswith(("m", "c")) and not (m.startswith("w") and int(m[1:]) in added)]
+        if lost or unknown:
+            problems.append(f"{z}: acknowledged ZADDs lost {lost[:5]}, members nobody added {unknown[:5]}")
     acked = sum(a for a, _ in w.fields.values()) + sum(ok for d in w.sent.values() for ok in d.values())
-    print(f"  checked {3 * len(HOT_SLOTS)} collections of {n}: {acked} writes to them acknowledged, {w.collection_failures} failed")
+    print(f"  checked {4 * len(HOT_SLOTS)} collections of {n}: {acked} writes to them acknowledged, {w.collection_failures} failed")
     return problems
 
 
