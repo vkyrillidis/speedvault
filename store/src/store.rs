@@ -1084,7 +1084,7 @@ impl Store {
         }
     }
 
-    /// `TYPE`: `"string"`, `"hash"`, `"set"`, `"list"`, or `"none"` for a
+    /// `TYPE`: `"string"`, `"hash"`, `"set"`, `"list"`, `"zset"`, or `"none"` for a
     /// missing key.
     pub fn type_of(&mut self, key: &[u8]) -> &'static str {
         self.live(key).map_or("none", |e| e.type_name())
@@ -1346,6 +1346,7 @@ mod list;
 pub use list::{End, LposOptions};
 mod dump;
 mod scan;
+mod zset;
 pub use dump::{check as check_dump, decode as decode_dump, Dump, Garbage, Kind, Part, Staged};
 #[cfg(test)]
 mod tests;

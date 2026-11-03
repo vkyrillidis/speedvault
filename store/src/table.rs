@@ -336,6 +336,26 @@ impl Table {
         true
     }
 
+    /// Adds `key`, which isn't there, at the end; where its block is (see
+    /// [`Block::as_raw`]).
+    pub(crate) fn push_new(&mut self, key: &[u8], value: &[u8]) -> std::ptr::NonNull<u8> {
+        let block = Block::new(self.hash(key), key, value);
+        let raw = block.as_raw();
+        self.inner.push(block);
+        raw
+    }
+
+    /// The value at position `pos`.
+    pub(crate) fn value_at(&self, pos: usize) -> &[u8] {
+        self.inner.entries[pos].value()
+    }
+
+    /// Writes `value` over the value at `pos`, which is as long: in place,
+    /// the block stays where it is.
+    pub(crate) fn overwrite_at(&mut self, pos: usize, value: &[u8]) {
+        self.inner.entries[pos].overwrite_value(value);
+    }
+
     /// Removes `key`; the last entry takes its place (O(1)). True if it
     /// was there.
     pub fn remove_swap(&mut self, key: &[u8]) -> bool {

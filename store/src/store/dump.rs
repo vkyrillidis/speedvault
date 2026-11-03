@@ -2,13 +2,15 @@
 //! (`CLUSTER IMPORT`).
 //!
 //! A string travels as it is. A collection travels as its elements in
-//! order (a hash's fields and values in turn), each as a 4-byte
+//! order (a hash's fields and values in turn, a sorted set's members and
+//! scores, a score as its 8 bytes, little-endian), each as a 4-byte
 //! little-endian length and its bytes. The receiving node builds it again
 //! from empty, so the encoding comes out of the contents, as it does when
 //! Redis loads a value with `RESTORE`.
 
 use super::{Store, Value};
 use crate::kv::Val;
+use crate::zset::ZSet;
 
 /// A value's type on the wire: what `TYPE` says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,6 +19,7 @@ pub enum Kind {
     Hash,
     Set,
     List,
+    ZSet,
 }
 
 impl Kind {
@@ -26,11 +29,12 @@ impl Kind {
             Kind::Hash => b"hash",
             Kind::Set => b"set",
             Kind::List => b"list",
+            Kind::ZSet => b"zset",
         }
     }
 
     pub fn from_name(name: &[u8]) -> Option<Kind> {
-        [Kind::Str, Kind::Hash, Kind::Set, Kind::List].into_iter().find(|k| k.name() == name)
+        [Kind::Str, Kind::Hash, Kind::Set, Kind::List, Kind::ZSet].into_iter().find(|k| k.name() == name)
     }
 }
 
@@ -92,14 +96,44 @@ pub fn decode(mut bytes: &[u8]) -> Option<Vec<&[u8]>> {
     Some(items)
 }
 
+/// A sorted set's members and scores, encoded.
+fn encode_zset(z: &ZSet, from: usize) -> (Vec<u8>, usize) {
+    let mut out = Vec::new();
+    let mut n = 0;
+    for (m, s) in z.iter(from, usize::MAX, false) {
+        push_pair(&mut out, m, s);
+        n += 2;
+    }
+    (out, n)
+}
+
+fn push_pair(out: &mut Vec<u8>, member: &[u8], score: f64) {
+    out.extend_from_slice(&(member.len() as u32).to_le_bytes());
+    out.extend_from_slice(member);
+    out.extend_from_slice(&8u32.to_le_bytes());
+    out.extend_from_slice(&score.to_bits().to_le_bytes());
+}
+
+/// A sorted set's score, as encoded; `None` unless 8 bytes of a number.
+fn decode_score(bytes: &[u8]) -> Option<f64> {
+    let score = f64::from_bits(u64::from_le_bytes(bytes.try_into().ok()?));
+    (!score.is_nan()).then_some(score)
+}
+
 /// Whether `payload` is a valid value of `kind`: a collection's elements
-/// decode, a hash's pair up, and none is empty.
+/// decode, a hash's and a sorted set's pair up (a sorted set's with a
+/// score in each pair), and none is empty.
 pub fn check(kind: Kind, payload: &[u8]) -> bool {
     if kind == Kind::Str {
         return true;
     }
     match decode(payload) {
-        Some(items) => !items.is_empty() && (kind != Kind::Hash || items.len().is_multiple_of(2)),
+        Some(items) if items.is_empty() => false,
+        Some(items) if kind == Kind::Hash => items.len().is_multiple_of(2),
+        Some(items) if kind == Kind::ZSet => {
+            items.len().is_multiple_of(2) && items.chunks(2).all(|pair| decode_score(pair[1]).is_some())
+        }
+        Some(_) => true,
         None => false,
     }
 }
@@ -126,6 +160,10 @@ impl Store {
                 let (bytes, n) = encode(l.iter());
                 Dump::Elements(Kind::List, bytes, n)
             }
+            Val::ZSet(z) => {
+                let (bytes, n) = encode_zset(z, 0);
+                Dump::Elements(Kind::ZSet, bytes, n)
+            }
         };
         Some((dump, ttl))
     }
@@ -149,6 +187,10 @@ impl Store {
             Val::List(l) => {
                 let (bytes, n) = encode(l.iter());
                 Dump::Elements(Kind::List, bytes, n)
+            }
+            Val::ZSet(z) => {
+                let (bytes, n) = encode_zset(z, 0);
+                Dump::Elements(Kind::ZSet, bytes, n)
             }
         };
         Some((dump, at, e.encoding()))
@@ -194,6 +236,7 @@ impl Store {
             Val::Hash(h) => h.len(),
             Val::Set(s) => s.len(),
             Val::List(l) => l.len(),
+            Val::ZSet(z) => z.len(),
         })
     }
 
@@ -243,6 +286,14 @@ impl Store {
                     }
                 }
             }
+            Val::ZSet(z) => {
+                (part.kind, part.total) = (Kind::ZSet, z.len());
+                for (m, s) in z.iter(from, usize::MAX, false) {
+                    if !add(&mut part, &[m, &s.to_bits().to_le_bytes()]) {
+                        break;
+                    }
+                }
+            }
         }
         Some(part)
     }
@@ -285,6 +336,7 @@ impl Staged {
             Kind::Hash => Value::Hash(Box::default()),
             Kind::Set => Value::Set(Box::default()),
             Kind::List => Value::List(Box::default()),
+            Kind::ZSet => Value::ZSet(Box::default()),
         };
         Staged { value, count: 0 }
     }
@@ -295,6 +347,7 @@ impl Staged {
             Value::Hash(_) => Kind::Hash,
             Value::Set(_) => Kind::Set,
             Value::List(_) => Kind::List,
+            Value::ZSet(_) => Kind::ZSet,
         }
     }
 
@@ -334,6 +387,13 @@ impl Staged {
                     l.push_back(item);
                 }
             }
+            Value::ZSet(z) => {
+                let items = decode(payload).expect("checked");
+                for pair in items.chunks(2) {
+                    z.insert(pair[0], decode_score(pair[1]).expect("checked"));
+                }
+                self.count += items.len() / 2;
+            }
         }
     }
 }
@@ -354,6 +414,7 @@ impl Garbage {
             Value::Hash(h) => h.free_last(n),
             Value::Set(s) => s.free_last(n),
             Value::List(l) => l.free_last(n),
+            Value::ZSet(z) => z.free_last(n),
         }
     }
 }
@@ -496,6 +557,6 @@ mod tests {
         assert!(!check(Kind::Hash, b"\x01\0\0\0a"), "a field without a value");
         assert!(check(Kind::Hash, b"\x01\0\0\0a\0\0\0\0"));
         assert_eq!(Kind::from_name(b"set"), Some(Kind::Set));
-        assert_eq!(Kind::from_name(b"zset"), None);
+        assert_eq!(Kind::from_name(b"stream"), None);
     }
 }

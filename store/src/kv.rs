@@ -18,7 +18,7 @@
 //! [`EMBED_MAX`] bytes sits in the block (`embstr`, or `int` if it reads as
 //! one); a longer one, or one `APPEND` grew, sits in a `Vec` of its own,
 //! with room to grow (`raw`), and the block holds a pointer to it, as it
-//! does to a hash, a set or a list; `vlen` is then left out. The expiry
+//! does to a hash, a set, a list or a sorted set; `vlen` is then left out. The expiry
 //! (absolute unix ms, and the key's place in the store's expiry index) is
 //! there only for a key with a TTL: setting the first one, or removing it,
 //! makes a new block.
@@ -31,6 +31,7 @@
 //! module, as in [`block`](crate::block).
 
 use crate::collections::{Hash, List, Set};
+use crate::zset::ZSet;
 use crate::int::parse_i64;
 use crate::table::Hashed;
 use crate::Error;
@@ -53,18 +54,19 @@ pub(crate) const EMBED_MAX: usize = 4096;
 const EMBSTR_KEY_AND_VALUE: usize = 64 - 16 - 3 - 4;
 
 /// The kind of value, in the low bits of the flags.
-const KIND: u8 = 0b11;
+const KIND: u8 = 0b111;
 const STR: u8 = 0;
 const HASH: u8 = 1;
 const SET: u8 = 2;
 const LIST: u8 = 3;
+const ZSET: u8 = 4;
 /// A string in a `Vec` of its own: the block holds a pointer.
-const RAW: u8 = 1 << 2;
+const RAW: u8 = 1 << 3;
 /// The expiry is in the header.
-const TTL: u8 = 1 << 3;
+const TTL: u8 = 1 << 4;
 /// A string `INCRBYFLOAT` wrote: never `int` to `OBJECT ENCODING`, even if
 /// it reads as one, as in Redis. A string written otherwise loses it.
-const FLOAT: u8 = 1 << 4;
+const FLOAT: u8 = 1 << 5;
 
 const HASH_AT: usize = 1;
 const EXPIRE_AT: usize = 5;
@@ -80,6 +82,7 @@ pub(crate) enum Value {
     Hash(Box<Hash>),
     Set(Box<Set>),
     List(Box<List>),
+    ZSet(Box<ZSet>),
 }
 
 /// A value in the store, borrowed.
@@ -89,6 +92,7 @@ pub(crate) enum Val<'a> {
     Hash(&'a Hash),
     Set(&'a Set),
     List(&'a List),
+    ZSet(&'a ZSet),
 }
 
 /// What a new block holds after its key.
@@ -149,6 +153,7 @@ impl Kv {
             Value::Hash(h) => (HASH, Box::into_raw(h) as usize),
             Value::Set(s) => (SET, Box::into_raw(s) as usize),
             Value::List(l) => (LIST, Box::into_raw(l) as usize),
+            Value::ZSet(z) => (ZSET, Box::into_raw(z) as usize),
         };
         Kv::build(kind, hash, ttl, key, Body::Ptr(body))
     }
@@ -353,7 +358,8 @@ impl Kv {
                 STR => Val::Str(&*p.cast::<Vec<u8>>()),
                 HASH => Val::Hash(&*p.cast::<Hash>()),
                 SET => Val::Set(&*p.cast::<Set>()),
-                _ => Val::List(&*p.cast::<List>()),
+                LIST => Val::List(&*p.cast::<List>()),
+                _ => Val::ZSet(&*p.cast::<ZSet>()),
             }
         }
     }
@@ -372,7 +378,8 @@ impl Kv {
             STR => "string",
             HASH => "hash",
             SET => "set",
-            _ => "list",
+            LIST => "list",
+            _ => "zset",
         }
     }
 
@@ -389,6 +396,7 @@ impl Kv {
             Val::Hash(h) => h.encoding(),
             Val::Set(s) => s.encoding(),
             Val::List(l) => l.encoding(),
+            Val::ZSet(z) => z.encoding(),
         }
     }
 
@@ -420,6 +428,13 @@ impl Kv {
         }
     }
 
+    pub fn as_zset(&self) -> Result<&ZSet, Error> {
+        match self.value() {
+            Val::ZSet(z) => Ok(z),
+            _ => Err(Error::WrongType),
+        }
+    }
+
     pub fn as_hash_mut(&mut self) -> Result<&mut Hash, Error> {
         // SAFETY: as in `value`; `&mut self` makes the borrow unique.
         self.ptr_of(HASH).map(|p| unsafe { &mut *p.cast::<Hash>() })
@@ -433,6 +448,12 @@ impl Kv {
     pub fn as_list_mut(&mut self) -> Result<&mut List, Error> {
         // SAFETY: as in `as_hash_mut`.
         self.ptr_of(LIST).map(|p| unsafe { &mut *p.cast::<List>() })
+    }
+
+    #[allow(dead_code, reason = "for the sorted set commands, phase 9 milestone 2")]
+    pub fn as_zset_mut(&mut self) -> Result<&mut ZSet, Error> {
+        // SAFETY: as in `as_hash_mut`.
+        self.ptr_of(ZSET).map(|p| unsafe { &mut *p.cast::<ZSet>() })
     }
 
     /// Makes the value the string `value`, whatever it was: written over
@@ -501,7 +522,8 @@ impl Kv {
                     STR => Value::Str(*Box::from_raw(p.cast::<Vec<u8>>())),
                     HASH => Value::Hash(Box::from_raw(p.cast::<Hash>())),
                     SET => Value::Set(Box::from_raw(p.cast::<Set>())),
-                    _ => Value::List(Box::from_raw(p.cast::<List>())),
+                    LIST => Value::List(Box::from_raw(p.cast::<List>())),
+                    _ => Value::ZSet(Box::from_raw(p.cast::<ZSet>())),
                 }
             }
         } else {
@@ -608,6 +630,21 @@ mod tests {
         assert_eq!(kv.as_hash().unwrap().len(), 2);
         assert_eq!(kv.as_str(), Err(Error::WrongType));
         assert_eq!(kv.type_name(), "hash");
+
+        // The fifth kind: the flags' kind bits don't run into RAW, TTL or FLOAT.
+        let mut z = Box::<ZSet>::default();
+        z.insert(b"m", 1.5);
+        let mut kv = Kv::new(7, b"key", Value::ZSet(z), None);
+        assert_eq!((kv.type_name(), kv.encoding(), kv.has_ttl()), ("zset", "listpack", false));
+        kv.set_ttl(Some((5, 0)));
+        assert!(kv.has_ttl());
+        kv.as_zset_mut().unwrap().insert(b"n", -1.0);
+        kv.set_ttl(None);
+        assert_eq!(kv.as_zset().unwrap().iter(0, 9, false).collect::<Vec<_>>(), [(&b"n"[..], -1.0), (b"m", 1.5)]);
+        assert_eq!((kv.as_str(), kv.as_hash().err(), kv.as_list().err()), (Err(Error::WrongType), Some(Error::WrongType), Some(Error::WrongType)));
+        assert_eq!(kv.as_set_mut().err(), Some(Error::WrongType));
+        let Value::ZSet(z) = kv.into_value() else { panic!("a sorted set") };
+        assert_eq!(z.len(), 2);
     }
 
     #[test]

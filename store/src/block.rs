@@ -112,6 +112,26 @@ impl Block {
         self.parts().1
     }
 
+    /// Where the block is: the same for as long as it lives, wherever the
+    /// `Block` (the pointer) moves.
+    pub(crate) fn as_raw(&self) -> NonNull<u8> {
+        self.0
+    }
+
+    /// The key of the block at `p`.
+    ///
+    /// # Safety
+    ///
+    /// `p` came from [`as_raw`](Self::as_raw) of a block that lives, and
+    /// isn't written to, for as long as the key is used.
+    pub(crate) unsafe fn key_at<'a>(p: NonNull<u8>) -> &'a [u8] {
+        let b = std::mem::ManuallyDrop::new(Block(p));
+        let key = b.key();
+        // SAFETY: the key's bytes are in the block, which the caller keeps
+        // alive and unchanged for 'a.
+        unsafe { std::slice::from_raw_parts(key.as_ptr(), key.len()) }
+    }
+
     /// Writes `value` over the value, which must be as long.
     pub(crate) fn overwrite_value(&mut self, value: &[u8]) {
         let (at, k, v) = self.header();
