@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (2026-11-06)
+
+Sorted sets and geo.
 
 - Sorted sets: a fifth type, packed while Redis keeps a listpack (128
   members of 64 bytes), a counted B+ tree beside a member table past that;
