@@ -27,6 +27,9 @@ fn float(arg: &[u8], msg: Option<&[u8]>, out: &mut Encoder) -> Option<f64> {
 }
 
 /// `extractLongLatOrReply`: both read, then checked against the limits.
+// Redis's comparisons as written: `!(a..=b).contains(&x)` would take a NaN
+// as out of range, these don't.
+#[allow(clippy::manual_range_contains)]
 fn long_lat(lon: &[u8], lat: &[u8], out: &mut Encoder) -> Option<[f64; 2]> {
     let x = float(lon, None, out)?;
     let y = float(lat, None, out)?;

@@ -67,6 +67,8 @@ public class LettuceLoad {
         client.setOptions(ClusterClientOptions.builder().topologyRefreshOptions(topology.build()).build());
         StatefulRedisClusterConnection<String, String> connection = client.connect();
         RedisAdvancedClusterCommands<String, String> commands = connection.sync();
+        // migrate_check waits for this before it starts a scenario.
+        System.err.println("lettuce " + args[3] + ": ready");
 
         AtomicBoolean stop = new AtomicBoolean();
         Thread stdin = new Thread(() -> {

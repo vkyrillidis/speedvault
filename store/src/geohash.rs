@@ -124,6 +124,9 @@ fn deinterleave64(interleaved: u64) -> u64 {
 
 /// `geohashEncode`: the cell of `step` bits holding the point, `None` for
 /// a point outside the ranges or Redis's limits.
+// Redis's comparisons as written: `!(a..=b).contains(&x)` would take a NaN
+// as out of range, these don't.
+#[allow(clippy::manual_range_contains)]
 pub fn encode(long_range: Range, lat_range: Range, longitude: f64, latitude: f64, step: u8) -> Option<HashBits> {
     if step > 32 || step == 0 || lat_range.is_zero() || long_range.is_zero() {
         return None;
@@ -297,6 +300,8 @@ fn neighbors(hash: HashBits) -> Neighbors {
 
 /// `geohashEstimateStepsByRadius`: the bits per coordinate of the cells a
 /// search of `range_meters` around latitude `lat` scans.
+// Redis's comparisons as written (a NaN latitude widens nothing).
+#[allow(clippy::manual_range_contains)]
 fn estimate_steps_by_radius(mut range_meters: f64, lat: f64) -> u8 {
     if range_meters == 0.0 {
         return 26;

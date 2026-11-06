@@ -443,6 +443,10 @@ class Writer:
         self.offset = offset
         self.thread.start()
 
+    def wait_ready(self):
+        """Until it can write (a client started out of process takes a
+        while: a JVM on a busy CI runner well over a second)."""
+
     def stop(self):
         self.stopping.set()
         self.thread.join(60)
@@ -453,6 +457,15 @@ class Writer:
         self.doubt[i] += 1
         if len(self.errors) < 1000:
             self.errors.append(f"{self.names[i]}: {e}")
+
+
+def start_writers(writers: List[Writer], keys: int):
+    """Each from its own offset into the counters; back once all can write,
+    so that what a scenario does next happens under load."""
+    for j, w in enumerate(writers):
+        w.start(j * keys // len(writers))
+    for w in writers:
+        w.wait_ready()
 
 
 class RedisPyWriter(Writer):
@@ -734,7 +747,22 @@ class LettuceWriter(Writer):
         self.proc = subprocess.Popen(["java", "-cp", self.classpath, "LettuceLoad", HOST, str(self.seed_port), str(len(self.indices)), self.mode],
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.stderr: List[str] = []
-        threading.Thread(target=lambda: self.stderr.extend(l.decode(errors="replace") for l in self.proc.stderr), daemon=True).start()
+        self.ready = threading.Event()
+
+        def read():
+            for l in self.proc.stderr:
+                line = l.decode(errors="replace")
+                self.stderr.append(line)
+                if line.startswith(f"lettuce {self.mode}: ready"):
+                    self.ready.set()
+        threading.Thread(target=read, daemon=True).start()
+
+    def wait_ready(self):
+        # Connected, its slot map loaded. If it exits instead, stop() says why.
+        deadline = time.monotonic() + 60
+        while not self.ready.wait(0.1) and self.proc.poll() is None:
+            if time.monotonic() > deadline:
+                raise Fail(f"{self.name} not connected after 60 s")
 
     def stop(self):
         try:
@@ -1243,8 +1271,7 @@ def run_failover(name: str, args) -> List[str]:
         heir_id = text(cluster.node(heir).execute_command("CLUSTER", "MYID"))
         lossy = slots_of(cluster, victim_id)
         probe_key = next(f"{{probe{i}}}" for i in range(100000) if key_slot(f"{{probe{i}}}".encode()) in lossy)
-        for j, w in enumerate(writers):
-            w.start(j * args.keys // len(writers))
+        start_writers(writers, args.keys)
         time.sleep(2)
         probe = None
         t0 = time.monotonic()
@@ -1338,8 +1365,7 @@ def run_move_failover(name: str, args) -> List[str]:
     cluster, ports = setup_replicas(args, ["--moves-per-source", "16", "--max-moves", "64"])
     problems: List[str] = []
     try:
-        for j, w in enumerate(writers):
-            w.start(j * args.keys // len(writers))
+        start_writers(writers, args.keys)
         time.sleep(2)
         t0 = time.monotonic()
         # A fourth primary and its replica: slots move to it from the three.
@@ -1499,8 +1525,7 @@ def run_handover(name: str, args) -> List[str]:
     try:
         syncs = Syncs(cluster)
         moved0, handed0 = stuart_counts()
-        for j, w in enumerate(writers):
-            w.start(j * args.keys // len(writers))
+        start_writers(writers, args.keys)
         time.sleep(2)
         replicas = replica_ports(cluster)
         # Not the first node (Lettuce's seed), except in a rolling restart.
@@ -1625,8 +1650,7 @@ def run_scale(name: str, args) -> List[str]:
 
     try:
         moved0 = one(scrape(stuart_metrics), "stuart_slots_moved_total")
-        for j, w in enumerate(writers):
-            w.start(j * args.keys // len(writers))
+        start_writers(writers, args.keys)
         time.sleep(2)
         t0 = time.monotonic()
         # Nodes joining one by one pair up in join order (7881 and its
@@ -1744,8 +1768,7 @@ def run_scenario(name: str, args) -> List[str]:
     lossy: Set[int] = set()
     keep = False
     try:
-        for j, w in enumerate(writers):
-            w.start(j * args.keys // len(writers))
+        start_writers(writers, args.keys)
         time.sleep(1)
         t0 = time.time()
         first = text(cluster.node(ports[0]).execute_command("CLUSTER", "MYID"))
@@ -1829,8 +1852,7 @@ def run_auto(name: str, args) -> List[str]:
     problems: List[str] = []
     keep = False
     try:
-        for j, w in enumerate(writers):
-            w.start(j * args.keys // len(writers))
+        start_writers(writers, args.keys)
         time.sleep(1)
         t0 = time.time()
         if name == "auto-grow":
@@ -2004,7 +2026,8 @@ def run_redirects(args) -> List[str]:
         cluster, _ = setup(args, 3)
         try:
             w.start(0)
-            time.sleep(2)  # connected, map loaded
+            w.wait_ready()
+            time.sleep(2)  # map loaded
             c0 = redirect_counts(cluster)
             time.sleep(2)
             c1 = redirect_counts(cluster)
@@ -2074,6 +2097,24 @@ def one(metrics: Dict[Series, float], name: str, **labels) -> float:
     return metrics[key]
 
 
+def run_queue_seconds(pid: int) -> float:
+    """The time a process's threads spent runnable but not running
+    (/proc/PID/task/*/schedstat, its second field); 0 where the kernel
+    doesn't say."""
+    try:
+        tids = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return 0.0
+    total = 0
+    for tid in tids:
+        try:
+            with open(f"/proc/{pid}/task/{tid}/schedstat") as f:
+                total += int(f.read().split()[1])
+        except (OSError, IndexError, ValueError):
+            pass  # a thread gone since, or no schedstat
+    return total / 1e9
+
+
 class Scraper(threading.Thread):
     """Scrapes the ports in `ports` (which may grow) every 100 ms, noting
     what doesn't parse and the counters that go down."""
@@ -2120,8 +2161,7 @@ def run_metrics(args) -> List[str]:
         if args.filler:
             cluster.fill(args.filler)
         scraper.start()
-        for j, w in enumerate(writers):
-            w.start(j * args.keys // len(writers))
+        start_writers(writers, args.keys)
         time.sleep(1)
         t0 = time.time()
         cluster.start_node(ports[3], ["--metrics", f"{HOST}:{metrics_port(ports[3])}"])
@@ -2175,8 +2215,13 @@ def run_metrics(args) -> List[str]:
                 if got != want:
                     problems.append(f"node {port}: {name}{want_labels or ''} {got}, not {want}")
             busy, cpu = one(m, "speedvault_busy_seconds_total"), one(m, "speedvault_cpu_seconds_total")
-            if not 0 < busy <= cpu * 1.05 + 0.05:
-                problems.append(f"node {port}: busy {busy} s, CPU {cpu} s")
+            # Busy is wall time: a node descheduled mid-turn stays busy
+            # without using CPU, so on a crowded host (a CI runner of two
+            # cores) busy can pass CPU by the time it spent runnable, not
+            # running. Read after the scrape, that bound only grows.
+            queued = run_queue_seconds(cluster.nodes[port].pid)
+            if not 0 < busy <= (cpu + queued) * 1.05 + 0.05:
+                problems.append(f"node {port}: busy {busy} s, CPU {cpu} s, {queued:.2f} s waiting for a CPU")
             sent += info["migrate_keys_sent"]
             imported += info["migrate_keys_imported"]
             print(f"  node {port}: {slots} slots, {one(m, 'speedvault_keys'):.0f} keys, busy {busy:.2f} s of {cpu:.2f} s CPU, "

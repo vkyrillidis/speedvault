@@ -85,7 +85,7 @@ pub(super) fn zadd(args: &Args, store: &mut Store, out: &mut Encoder, incr: bool
         out.error(b"ERR XX and NX options at the same time are not compatible");
         return Flow::Continue;
     }
-    if (flags.gt && flags.nx) || (flags.lt && flags.nx) || (flags.gt && flags.lt) {
+    if [flags.gt, flags.lt, flags.nx].into_iter().filter(|&on| on).count() > 1 {
         out.error(b"ERR GT, LT, and/or NX options at the same time are not compatible");
         return Flow::Continue;
     }
