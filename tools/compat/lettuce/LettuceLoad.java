@@ -95,16 +95,17 @@ public class LettuceLoad {
                 errors++;
                 lastError = e.toString();
                 int slot = SlotHash.getSlot("k:" + i);
-                RedisClusterNode owner = connection.getPartitions().getPartitionBySlot(slot);
-                String where = owner == null ? "no owner" : owner.getNodeId() + " at " + owner.getUri().getHost() + ":" + owner.getUri().getPort();
-                String resolves;
+                String where;
                 try {
-                    resolves = owner == null ? "-" : InetAddress.getByName(owner.getUri().getHost()).getHostAddress();
+                    RedisClusterNode owner = connection.getPartitions().getPartitionBySlot(slot);
+                    where = owner == null ? "no owner" : owner.getNodeId() + " at " + owner.getUri().getHost() + ":" + owner.getUri().getPort()
+                            + ", which resolves to " + InetAddress.getByName(owner.getUri().getHost()).getHostAddress();
                 } catch (Exception r) {
-                    resolves = r.toString();
+                    // Only a diagnostic: it must not end the run.
+                    where = r.toString();
                 }
                 System.err.println(Instant.now() + " lettuce " + args[3] + ": k:" + i + " failed: " + lastError
-                        + " [slot " + slot + ", Lettuce's map: " + where + ", which resolves to " + resolves + "]");
+                        + " [slot " + slot + ", Lettuce's map: " + where + "]");
             }
             ops++;
             if (System.nanoTime() - last > 1_000_000_000L) {
@@ -120,7 +121,16 @@ public class LettuceLoad {
         }
         System.out.print(out);
         System.out.flush();
-        connection.close();
-        client.shutdown(Duration.ZERO, Duration.ofSeconds(2));
+        // The counts are out; closing can't change them. Closing fails when a
+        // reconnect is still pending (a killed node's address that doesn't
+        // answer): netty fails its connect with ClosedChannelException and
+        // close()/shutdown() rethrow it. That is no failed write.
+        try {
+            connection.close();
+            client.shutdown(Duration.ZERO, Duration.ofSeconds(2));
+        } catch (Exception e) {
+            System.err.println("lettuce " + args[3] + ": closing: " + e);
+        }
+        System.exit(0);
     }
 }

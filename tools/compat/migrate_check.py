@@ -771,7 +771,9 @@ class LettuceWriter(Writer):
             self.proc.kill()
             raise Fail(f"{self.name} didn't stop")
         if self.proc.returncode != 0:
-            raise Fail(f"{self.name} exited with {self.proc.returncode}: {''.join(self.stderr[-20:])}")
+            # A Java stack trace's tail is all "at ..." frames: say what was thrown too.
+            thrown = [l for l in self.stderr if l.startswith(("Exception", "Caused by"))]
+            raise Fail(f"{self.name} exited with {self.proc.returncode}: {''.join(thrown[:5])}{''.join(self.stderr[-20:])}")
         for line in out.decode().splitlines():
             i, acked, doubt = map(int, line.split())
             self.acked[i], self.doubt[i] = acked, doubt
