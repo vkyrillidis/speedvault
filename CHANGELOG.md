@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1 (2026-11-07)
+
+A fix to the test tools; the server and stuart are unchanged from 0.2.0.
+
+- The Lettuce test client (`tools/compat/lettuce/LettuceLoad.java`) no
+  longer fails a run when closing fails: when a reconnect to a killed
+  node was still pending, Lettuce's `close()` rethrew netty's
+  `ClosedChannelException` after the counts were out, which failed
+  `kind-check`'s `worker-stop` on the 0.2.0 tag pipeline. `migrate_check`
+  now shows what a Lettuce client that exits non-zero threw.
+
 ## 0.2.0 (2026-11-06)
 
 Sorted sets and geo.
